@@ -2,6 +2,7 @@ import requests
 import json
 import time
 import os
+import ffmpeg
 from lcu_driver import Connector
 from requests.packages.urllib3.exceptions import InsecureRequestWarning
 requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
@@ -45,11 +46,11 @@ async def connect(connection):
     for i in game_id_list:
         download = await connection.request('post', f'/lol-replays/v1/rofls/{i}/download', data={'gameId': i})
         print(download)
-        time.sleep(10)
+        time.sleep(8)
         play = await connection.request('post', f'/lol-replays/v1/rofls/{i}/watch', data={'gameId' : i})
         print(play)
 
-        time.sleep(30)
+        time.sleep(25)
 
         d = get_gameInfo()
         gameTime = d['length']
@@ -66,6 +67,12 @@ async def connect(connection):
 
         print("Complete")
         os.system('taskkill /f /im "League of Legends.exe"')
+        original_file = f'C:\\Users\\Administrator\\Desktop\\Replays\\11-19_KR-{i}_01.webm'
+        stream = ffmpeg.input(original_file)
+        stream = ffmpeg.crop(stream, 1391, 692, 289, 289)
+        stream = ffmpeg.output(stream, f'C:\\Users\\Administrator\\Desktop\\Replays\\{i}.webm')
+        ffmpeg.run(stream)
+        os.remove(original_file)
 
 
 @connector.close
@@ -75,6 +82,5 @@ async def disconnect(connection):
 
 # r = requests.get(f'{HOST}/replay/render', verify=False)
 # print(r.text)
-
 
 connector.start()
