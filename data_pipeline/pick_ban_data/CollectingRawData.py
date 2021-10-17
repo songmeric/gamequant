@@ -29,7 +29,6 @@ for i in names:
     i = i[:-1]
     num += 1
     x = num % 11
-    x = 0
     api = LolWatcher(config[list(config.keys())[x]])
     summoner_name = i
     try:
