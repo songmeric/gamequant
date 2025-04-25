@@ -2751,8 +2751,7 @@ C++ language version
 
 You’re relying on fold-expressions in the logger, std::span, std::variant—so you must compile with at least C++20.
 
-Once you add those missing includes, point you
-
+Once you add those missing includes, point your compiler at C++20, and drop the library headers (or vendored code) for rigtorp, you’ll get a clean build. But as‐written “out of the box” it’s more of a blueprint than a drop-in codebase.
 
 
 
