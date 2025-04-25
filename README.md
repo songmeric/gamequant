@@ -2719,6 +2719,52 @@ Improved robust shutdown handling
 
 
 
+Missing #includes
+
+Almost every .cpp that calls LOG(…) needs #include "Logger.h".
+
+Any header using std::optional or std::variant must #include <optional> and <variant>.
+
+Span support requires compiling under C++20 (or later) with -std=c++20 (and #include <span>).
+
+Forward‐declare vs. include
+
+In Engine.cpp you do a dynamic_cast<PacketProducer*>, but Engine.cpp only sees the IPacketProducer forward declaration. You must #include "PacketProducer.h" where you do that cast (or—better—move the overflow‐policy setter into the interface so you never need to cast).
+
+Third-party dependency
+
+You’ll need the header‐only rigtorp::MPMCQueue available on your include path.
+
+You’ll also need to link with the platform libs for mmap, madvise, etc. (on Linux that’s just part of -lc).
+
+Clock consistency
+
+Make sure you include <chrono> everywhere you use steady_clock or system_clock.
+
+Decide which clock you really want for timestamps—mixing them can give you type errors if you accidentally subtract a steady_clock::time_point from a system_clock::time_point.
+
+errno and POSIX APIs
+
+Any use of errno needs #include <errno.h>.
+
+C++ language version
+
+You’re relying on fold-expressions in the logger, std::span, std::variant—so you must compile with at least C++20.
+
+Once you add those missing includes, point you
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
