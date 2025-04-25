@@ -1,1330 +1,1898 @@
-# gamequant
-Project gamequant @ Assonant.ai
+Interface Definitions
+IPacketProducer.h
+cppCopy#pragma once
 
-Collection and analysis of 2TB+ league of legends match data to recommend game theory optimal ban&pick decisions.
-Yes, lock-free programming techniques would be possible and potentially beneficial for this packet matching engine. Several key areas could leverage lock-free programming:
-
-Packet Queue Management:
-The current design uses mutex-protected queues for transferring packets between components. This could be replaced with lock-free queue implementations like:
-
-A lock-free ring buffer or SPSC (Single Producer, Single Consumer) queue between the PCAP reader and the processing threads
-MPMC (Multiple Producer, Multiple Consumer) queue like moodycamel::ConcurrentQueue for worker thread task distribution
-
-
-Hash Table Operations:
-The packet correlation logic relies heavily on hash tables. These could be replaced with:
-
-Lock-free hash tables using atomic operations (CAS - Compare And Swap)
-Techniques like read-copy-update (RCU) for the packet correlation maps
-Split hash tables with sharding to minimize contention
-
-
-Packet Processing Pipeline:
-
-Pipeline stages could use atomics to communicate readiness without locks
-A sequence number scheme could ensure proper ordering where needed
-
-
-Atomic Counters for Statistics:
-We already use atomic counters for statistics, but this approach could be expanded to other parts of the system.
-
-Implementation Considerations:
-
-Memory Management:
-Lock-free structures require careful memory management. The ABA problem (where a value changes from A to B and back to A, potentially causing incorrect behavior in lock-free algorithms) must be addressed, possibly with:
-
-Memory barriers and fences
-Hazard pointers
-Epoch-based reclamation
-
-
-Careful Ordering:
-The packet matching relies on proper temporal relationships. Lock-free algorithms would need to maintain correct causal ordering without locks, potentially using:
-
-Memory ordering constraints
-Versioned records
-Timestamp-based ordering
-
-
-Complexity vs Performance:
-While lock-free programming can offer significant performance benefits in high-contention scenarios, it adds considerable complexity. For this engine, the most beneficial targets would be:
-
-The high-throughput packet ingestion path
-The packet matching logic where concurrency is highest
-The packet aging/cleanup logic
-
-
-Platform Considerations:
-Effective lock-free programming depends on hardware memory models. Modern x86/x64 provides strong guarantees, but portable lock-free code needs to consider weaker memory models on other architectures using appropriate memory barriers.
-
-Lock-free programming could significantly improve throughput of this engine, potentially eliminating contention bottlenecks during high packet rates. However, it would require careful design and testing to ensure correctness, particularly for the packet correlation logic where proper ordering and matching is critical.
-The best approach would be to first implement the current design, profile it under realistic loads, and then selectively replace critical bottlenecks with lock-free alternatives rather than attempting to make the entire system lock-free from the start.
-
-How the Components Work Together
-
-Initialization Flow:
-
-The main() function creates and configures a PacketMatchingEngine
-The engine initializes its components: PcapStreamReader, PacketParser, PacketCorrelator, and WorkerPool
-IP ranges are configured to determine inbound vs outbound traffic
-The engine starts components and creates worker threads
-
-
-Data Flow:
-
-PcapStreamReader continuously monitors a directory for new PCAP files
-When files appear, they're read packet by packet in stream fashion
-Packets are placed in a bounded queue for processing
-The main thread pulls packets from the queue and distributes them to worker threads
-Worker threads parse packets using PacketParser and extract 5-tuple keys and other metadata
-Parsed packets are sent to PacketCorrelator
-PacketCorrelator tries to match UDP inbound with TCP outbound packets
-When matches are found, they're stored in a results queue
-The output thread periodically flushes matches to a CSV file
-
-
-Cleanup and Management:
-
-A cleanup thread in PacketCorrelator removes aged packets that didn't find matches
-The main thread periodically logs performance statistics
-Signal handlers ensure graceful shutdown on SIGINT (Ctrl+C) or SIGTERM
-On shutdown, all queues are flushed, remaining matches are written, and threads terminate
-
-
-
-Performance Features
-
-Efficient Memory Usage:
-
-The sliding window approach limits memory consumption
-Packets are processed in a streaming fashion, never loading entire PCAP files
-Custom buffer management with configurable sizes
-
-
-Threading Model:
-
-A dedicated thread monitors filesystem for new PCAP files
-A thread pool processes packets in parallel
-Reader-writer locks (shared_mutex) provide efficient concurrent access
-A dedicated output thread handles result storage
-
-
-Correlation Speed:
-
-Fast hash-based lookup for potential matches
-Efficient matching algorithm using payload signatures
-Early filtering of unlikely matches
-
-
-Reliability Features:
-
-Comprehensive logging with rotation
-Statistical monitoring to detect anomalies
-Graceful handling of overload conditions
-Clear error paths with exception handling
-
-
-
-Optimization Notes
-
-Memory Efficiency:
-
-Packet data is copied only when necessary
-Smart pointer use is minimized to reduce overhead
-Fixed-size buffers preallocated where possible
-
-
-Computational Efficiency:
-
-Custom hash functions optimize 5-tuple key lookups
-Batched processing where appropriate
-Cache-friendly data structures
-
-
-Reliability:
-
-Extensive error checking and logging
-Resilience to malformed packets
-Memory management discipline
-
-
-
-Usage Guide
-To use the packet matching engine:
-
-Compile the code:
-g++ -std=c++17 -o packet_engine main.cpp -lpcap -lpthread
-
-Configure IP ranges:
-
-Edit the IP ranges in main() to match your network setup
-Inbound ranges identify "source" networks
-Outbound ranges identify "destination" networks
-
-
-Run the engine:
-./packet_engine /path/to/pcap/directory /path/to/output.csv
-
-Monitor performance:
-
-The engine prints stats every 10 seconds
-Detailed logs are written to logs/packet_engine.log
-
-
-
-This design focuses on simplicity and clarity while still achieving high performance. I've avoided unnecessary template metaprogramming and complex abstraction patterns, instead opting for straightforward, efficient code. The modular structure makes it easy to extend or modify individual components without affecting the overall system.
-
-
-
-Core Components Design
-1. PCAP Reader Component
-#include <pcap.h>
-#include <atomic>
-#include <mutex>
-#include <condition_variable>
-#include <queue>
-#include <thread>
-#include <filesystem>
-#include <spdlog/spdlog.h>
-
-class PcapStreamReader {
-private:
-    struct PcapPacket {
-        struct pcap_pkthdr header;
-        std::vector<u_char> data;
-    };
-
-    std::atomic<bool> running_{false};
-    std::mutex queue_mutex_;
-    std::condition_variable queue_cv_;
-    std::queue<PcapPacket> packet_queue_;
-    size_t max_queue_size_;
-    std::thread reader_thread_;
-    std::filesystem::path watch_dir_;
-    std::set<std::string> processed_files_;
-    
-    void reader_loop() {
-        while (running_) {
-            // Check directory for new files
-            std::vector<std::string> new_files;
-            for (const auto& entry : std::filesystem::directory_iterator(watch_dir_)) {
-                if (entry.is_regular_file() && 
-                    entry.path().extension() == ".pcap" &&
-                    processed_files_.find(entry.path().string()) == processed_files_.end()) {
-                    new_files.push_back(entry.path().string());
-                }
-            }
-            
-            // Sort by creation time
-            std::sort(new_files.begin(), new_files.end(), [](const std::string& a, const std::string& b) {
-                return std::filesystem::last_write_time(a) < std::filesystem::last_write_time(b);
-            });
-            
-            // Process new files
-            for (const auto& file : new_files) {
-                process_file(file);
-                processed_files_.insert(file);
-                // Limit memory usage by keeping track of only recent files
-                if (processed_files_.size() > 1000) {
-                    processed_files_.erase(processed_files_.begin());
-                }
-            }
-            
-            // Sleep briefly before checking for new files
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
-        }
-    }
-    
-    void process_file(const std::string& filename) {
-        char errbuf[PCAP_ERRBUF_SIZE];
-        pcap_t* handle = pcap_open_offline(filename.c_str(), errbuf);
-        if (!handle) {
-            spdlog::error("Failed to open PCAP file {}: {}", filename, errbuf);
-            return;
-        }
-        
-        spdlog::info("Processing PCAP file: {}", filename);
-        
-        struct pcap_pkthdr header;
-        const u_char* packet;
-        
-        while (running_ && (packet = pcap_next(handle, &header))) {
-            // Create a deep copy of the packet data
-            std::vector<u_char> packet_data(packet, packet + header.caplen);
-            
-            // Wait until queue has space
-            std::unique_lock<std::mutex> lock(queue_mutex_);
-            queue_cv_.wait(lock, [this]() {
-                return packet_queue_.size() < max_queue_size_ || !running_;
-            });
-            
-            if (!running_) break;
-            
-            // Add packet to queue
-            packet_queue_.push({header, std::move(packet_data)});
-            lock.unlock();
-            queue_cv_.notify_one();
-        }
-        
-        pcap_close(handle);
-        spdlog::info("Finished processing file: {}", filename);
-    }
-    
-public:
-    PcapStreamReader(size_t max_queue_size = 10000) 
-        : max_queue_size_(max_queue_size) {}
-    
-    ~PcapStreamReader() {
-        stop();
-    }
-    
-    void start(const std::string& directory_path) {
-        if (running_) return;
-        
-        watch_dir_ = directory_path;
-        running_ = true;
-        reader_thread_ = std::thread(&PcapStreamReader::reader_loop, this);
-        spdlog::info("PCAP reader started, watching directory: {}", directory_path);
-    }
-    
-    void stop() {
-        if (!running_) return;
-        
-        running_ = false;
-        queue_cv_.notify_all();
-        if (reader_thread_.joinable()) {
-            reader_thread_.join();
-        }
-        spdlog::info("PCAP reader stopped");
-    }
-    
-    bool get_next_packet(struct pcap_pkthdr& header, std::vector<u_char>& packet_data) {
-        std::unique_lock<std::mutex> lock(queue_mutex_);
-        queue_cv_.wait_for(lock, std::chrono::milliseconds(100), [this]() {
-            return !packet_queue_.empty() || !running_;
-        });
-        
-        if (packet_queue_.empty()) {
-            return false;
-        }
-        
-        auto packet = std::move(packet_queue_.front());
-        packet_queue_.pop();
-        
-        header = packet.header;
-        packet_data = std::move(packet.data);
-        
-        lock.unlock();
-        queue_cv_.notify_one();  // Notify reader that queue has space
-        
-        return true;
-    }
-    
-    bool is_running() const {
-        return running_;
-    }
-    
-    size_t queue_size() const {
-        std::lock_guard<std::mutex> lock(queue_mutex_);
-        return packet_queue_.size();
-    }
-};
-
-2. Packet Parser and 5-Tuple Key Extractor
-#include <netinet/in.h>
-#include <netinet/ip.h>
-#include <netinet/tcp.h>
-#include <netinet/udp.h>
-#include <net/ethernet.h>
-#include <array>
-#include <cstring>
 #include <functional>
+#include "RawPacket.h"
 
-enum class PacketDirection {
-    Unknown,
-    Inbound,
-    Outbound
+/// Interface for producing raw packets into the engine
+class IPacketProducer {
+public:
+    // Callback type for delivering RawPackets
+    using PacketCallback = std::function<void(RawPacket&&)>;
+
+    // Virtual destructor for derived classes
+    virtual ~IPacketProducer() = default;
+
+    /**
+     * Start producing packets.
+     * @param callback Function to call for each packet
+     */
+    virtual void run(PacketCallback callback) = 0;
+
+    /**
+     * Stop the producer and join any threads.
+     */
+    virtual void stop() = 0;
 };
+IPacketParser.h
+cppCopy#pragma once
 
-struct FiveTupleKey {
-    uint32_t src_ip;
-    uint32_t dst_ip;
-    uint16_t src_port;
-    uint16_t dst_port;
-    uint8_t protocol;
+#include "RawPacket.h"
+#include "ParsedPacket.h"
+
+/// Interface for parsing raw packet bytes into structured data
+class IPacketParser {
+public:
+    virtual ~IPacketParser() = default;
+
+    /**
+     * Parse a RawPacket into a ParsedPacket.
+     * @param raw Raw packet to parse
+     * @return    ParsedPacket with extracted headers and metadata
+     */
+    virtual ParsedPacket parse(const RawPacket& raw) = 0;
+};
+IPacketCorrelator.h
+cppCopy#pragma once
+
+#include "ParsedPacket.h"
+#include "MatchResult.h"
+#include <optional>
+
+/// Interface for correlating packets
+class IPacketCorrelator {
+public:
+    virtual ~IPacketCorrelator() = default;
+
+    /**
+     * Attempt to correlate the given packet with a stored one.
+     * @param packet ParsedPacket to correlate
+     * @return       std::optional<MatchResult>
+     */
+    virtual std::optional<MatchResult>
+    correlate(ParsedPacket&& packet) = 0;
+};
+IUnmatchedStore.h
+cppCopy#pragma once
+
+#include "ParsedPacket.h"
+#include <optional>
+
+/// Interface for storing unmatched packets
+class IUnmatchedStore {
+public:
+    virtual ~IUnmatchedStore() = default;
+
+    /**
+     * Insert a packet for later correlation.
+     * @param packet ParsedPacket to store
+     */
+    virtual void insert(const ParsedPacket& packet) = 0;
+
+    /**
+     * Remove and return a matching packet if found.
+     * @param packet ParsedPacket to match
+     * @return       std::optional<ParsedPacket>
+     */
+    virtual std::optional<ParsedPacket>
+    retrieve(const ParsedPacket& packet) = 0;
+
+    /**
+     * Remove expired packets based on policy.
+     */
+    virtual void cleanupExpired() = 0;
+};
+IOutputWriter.h
+cppCopy#pragma once
+
+#include "MatchResult.h"
+
+/// Interface for writing match results to an output sink
+class IOutputWriter {
+public:
+    virtual ~IOutputWriter() = default;
+
+    /**
+     * Buffer or write a MatchResult.
+     * @param result MatchResult to output
+     */
+    virtual void write(const MatchResult& result) = 0;
+
+    /**
+     * Flush any buffered output.
+     */
+    virtual void flush() = 0;
+};
+Core Data Structures
+RawPacket.h
+cppCopy#pragma once
+
+#include <memory>
+#include <array>
+#include <chrono>
+#include <span>
+
+/// Carries raw bytes and capture timestamp from packet source
+struct RawPacket {
+    // This is a managed buffer from the pool
+    using Buffer = std::array<uint8_t, 2048>;  // 2KB fixed buffer
+    using BufferPtr = std::unique_ptr<Buffer>;
     
-    bool operator==(const FiveTupleKey& other) const {
-        return src_ip == other.src_ip &&
-               dst_ip == other.dst_ip &&
-               src_port == other.src_port &&
-               dst_port == other.dst_port &&
-               protocol == other.protocol;
+    BufferPtr buffer;                               // Owned buffer from pool
+    size_t dataSize = 0;                            // Actual data size in buffer
+    std::chrono::steady_clock::time_point timestamp;// Capture timestamp
+    
+    // Accessor for the data span (no copying, inline for performance)
+    std::span<const uint8_t> data() const { 
+        return buffer ? std::span(buffer->data(), dataSize) : std::span<const uint8_t>{};
     }
+    
+    // Allow only move operations
+    RawPacket() = default;
+    RawPacket(RawPacket&&) noexcept = default;
+    RawPacket& operator=(RawPacket&&) noexcept = default;
+    RawPacket(const RawPacket&) = delete;
+    RawPacket& operator=(const RawPacket&) = delete;
+};
+ParsedPacket.h
+cppCopy#pragma once
+
+#include <array>
+#include <cstdint>
+#include <chrono>
+
+/// Represents whether a packet is inbound or outbound
+enum class PacketDirection {
+    Inbound,  // Packet coming into the system
+    Outbound  // Packet going out of the system
 };
 
-// Custom hash function for FiveTupleKey
-namespace std {
-    template<>
-    struct hash<FiveTupleKey> {
-        size_t operator()(const FiveTupleKey& k) const {
-            // Simple but effective hash combining technique
-            size_t hash = 17;
-            hash = hash * 31 + k.src_ip;
-            hash = hash * 31 + k.dst_ip;
-            hash = hash * 31 + k.src_port;
-            hash = hash * 31 + k.dst_port;
-            hash = hash * 31 + k.protocol;
-            return hash;
-        }
-    };
+/// Holds structured fields extracted from a raw packet
+struct ParsedPacket {
+    std::array<uint8_t, 4> srcIP;                       // Source IPv4 address
+    std::array<uint8_t, 4> dstIP;                       // Destination IPv4 address
+    uint16_t srcPort;                                   // Source port
+    uint16_t dstPort;                                   // Destination port
+    uint8_t protocol;                                   // Transport protocol (TCP=6, UDP=17)
+    PacketDirection direction;                          // Packet direction
+    uint64_t payloadHash;                               // Hash of packet payload
+    std::chrono::steady_clock::time_point timestamp;    // Original capture time
+    
+    // Allow both copy and move operations
+    ParsedPacket() = default;
+    ParsedPacket(const ParsedPacket&) = default;
+    ParsedPacket& operator=(const ParsedPacket&) = default;
+    ParsedPacket(ParsedPacket&&) noexcept = default;
+    ParsedPacket& operator=(ParsedPacket&&) noexcept = default;
+};
+MatchResult.h
+cppCopy#pragma once
+
+#include "ParsedPacket.h"
+#include <chrono>
+
+/// Represents a pair of correlated packets and their latency
+struct MatchResult {
+    ParsedPacket request;                               // The initial packet
+    ParsedPacket response;                              // The matching packet
+    std::chrono::nanoseconds latency;                   // Response - request time
+    
+    // Allow both copy and move operations
+    MatchResult() = default;
+    MatchResult(const MatchResult&) = default;
+    MatchResult& operator=(const MatchResult&) = default;
+    MatchResult(MatchResult&&) noexcept = default;
+    MatchResult& operator=(MatchResult&&) noexcept = default;
+};
+Implementation Files
+BufferPool.h
+cppCopy#pragma once
+
+#include <memory>
+#include <optional>
+#include <array>
+#include <atomic>
+#include "rigtorp/MPMCQueue.h"
+
+/// Memory pool for packet buffers to minimize allocations
+class BufferPool {
+public:
+    // Buffer size optimized for typical packet MTU plus headroom
+    static constexpr size_t BUFFER_SIZE = 2048;
+    
+    // The buffer type that will be used by RawPacket
+    using Buffer = std::array<uint8_t, BUFFER_SIZE>;
+    using BufferPtr = std::unique_ptr<Buffer>;
+
+    explicit BufferPool(size_t poolSize);
+    ~BufferPool();
+    
+    // Get a buffer from the pool (non-blocking)
+    std::optional<BufferPtr> acquire();
+    
+    // Return a buffer to the pool
+    void release(BufferPtr buffer);
+    
+    // Get stats
+    size_t getAvailableBuffers() const;
+    size_t getTotalBuffers() const;
+    
+private:
+    rigtorp::MPMCQueue<BufferPtr> m_bufferQueue;
+    std::atomic<size_t> m_totalBuffers;
+};
+BufferPool.cpp
+cppCopy#include "BufferPool.h"
+
+BufferPool::BufferPool(size_t poolSize) 
+    : m_bufferQueue(poolSize), m_totalBuffers(poolSize) {
+    // Pre-allocate all buffers
+    for (size_t i = 0; i < poolSize; ++i) {
+        auto buffer = std::make_unique<Buffer>();
+        m_bufferQueue.emplace(std::move(buffer));
+    }
 }
 
-struct PacketInfo {
-    uint64_t timestamp_ns;  // Packet timestamp in nanoseconds
-    FiveTupleKey key;       // 5-tuple key
-    PacketDirection direction;
-    size_t packet_size;
-    std::array<uint8_t, 16> payload_hash;  // Store a hash of the payload for verification
-    
-    // Optional fields for protocol-specific matching
-    std::vector<uint8_t> payload_snippet;  // First N bytes of payload for correlation
-};
+BufferPool::~BufferPool() {
+    // Clear all remaining buffers
+    BufferPtr buffer;
+    while (m_bufferQueue.try_pop(buffer)) {
+        // Buffer auto-destroyed
+    }
+}
 
-class PacketParser {
-private:
-    // Configuration
-    std::vector<std::pair<uint32_t, uint32_t>> inbound_ip_ranges_;
-    std::vector<std::pair<uint32_t, uint32_t>> outbound_ip_ranges_;
+std::optional<BufferPool::BufferPtr> BufferPool::acquire() {
+    BufferPtr buffer;
+    if (m_bufferQueue.try_pop(buffer)) {
+        return buffer;
+    }
+    return std::nullopt; // No buffer available
+}
 
-    // Determine packet direction based on IP ranges
-    PacketDirection determine_direction(uint32_t src_ip, uint32_t dst_ip) const {
-        // Check if source is in inbound ranges and destination is in outbound ranges
-        bool src_is_inbound = false;
-        bool dst_is_outbound = false;
-        
-        for (const auto& range : inbound_ip_ranges_) {
-            if (src_ip >= range.first && src_ip <= range.second) {
-                src_is_inbound = true;
-                break;
-            }
+void BufferPool::release(BufferPtr buffer) {
+    if (buffer) { // Only if the buffer is valid
+        // Try to put it back or let it be destroyed if queue is full
+        bool success = m_bufferQueue.try_emplace(std::move(buffer));
+        if (!success) {
+            // Buffer will be deleted by unique_ptr going out of scope
         }
-        
-        for (const auto& range : outbound_ip_ranges_) {
-            if (dst_ip >= range.first && dst_ip <= range.second) {
-                dst_is_outbound = true;
-                break;
-            }
-        }
-        
-        if (src_is_inbound && dst_is_outbound) {
-            return PacketDirection::Inbound;
-        }
-        
-        // Check if source is in outbound ranges and destination is in inbound ranges
-        bool src_is_outbound = false;
-        bool dst_is_inbound = false;
-        
-        for (const auto& range : outbound_ip_ranges_) {
-            if (src_ip >= range.first && src_ip <= range.second) {
-                src_is_outbound = true;
-                break;
-            }
-        }
-        
-        for (const auto& range : inbound_ip_ranges_) {
-            if (dst_ip >= range.first && dst_ip <= range.second) {
-                dst_is_inbound = true;
-                break;
-            }
-        }
-        
-        if (src_is_outbound && dst_is_inbound) {
-            return PacketDirection::Outbound;
-        }
-        
-        return PacketDirection::Unknown;
     }
-    
-    // Calculate a simple hash of the payload
-    std::array<uint8_t, 16> calculate_payload_hash(const uint8_t* payload, size_t length) const {
-        // Simple MD5-like hash function (for demonstration - use a proper hash in production)
-        std::array<uint8_t, 16> hash;
-        std::fill(hash.begin(), hash.end(), 0);
-        
-        // Very basic hash calculation
-        for (size_t i = 0; i < length; i++) {
-            hash[i % 16] ^= payload[i];
-            // Rotate bits
-            if (i % 16 == 15) {
-                for (int j = 0; j < 16; j++) {
-                    hash[j] = (hash[j] << 1) | (hash[(j + 1) % 16] >> 7);
-                }
-            }
-        }
-        
-        return hash;
-    }
-    
-public:
-    PacketParser() {
-        // Default constructor - configure with specific network settings later
-    }
-    
-    void configure_direction_rules(
-        const std::vector<std::pair<uint32_t, uint32_t>>& inbound_ranges,
-        const std::vector<std::pair<uint32_t, uint32_t>>& outbound_ranges) {
-        inbound_ip_ranges_ = inbound_ranges;
-        outbound_ip_ranges_ = outbound_ranges;
-    }
-    
-    std::optional<PacketInfo> parse_packet(const struct pcap_pkthdr& header, const std::vector<u_char>& packet_data) {
-        if (packet_data.size() < sizeof(struct ether_header)) {
-            return std::nullopt;  // Packet too small to be valid
-        }
-        
-        // Get ethernet header
-        const struct ether_header* eth_header = 
-            reinterpret_cast<const struct ether_header*>(packet_data.data());
-        
-        // Verify it's an IP packet
-        if (ntohs(eth_header->ether_type) != ETHERTYPE_IP) {
-            return std::nullopt;  // Not an IP packet
-        }
-        
-        // Get IP header
-        const struct ip* ip_header = 
-            reinterpret_cast<const struct ip*>(packet_data.data() + sizeof(struct ether_header));
-        int ip_header_len = ip_header->ip_hl * 4;
-        
-        // Extract source and destination IPs
-        uint32_t src_ip = ntohl(ip_header->ip_src.s_addr);
-        uint32_t dst_ip = ntohl(ip_header->ip_dst.s_addr);
-        
-        // Initialize packet info structure
-        PacketInfo info;
-        info.timestamp_ns = 
-            static_cast<uint64_t>(header.ts.tv_sec) * 1000000000ULL + header.ts.tv_usec * 1000ULL;
-        info.packet_size = header.len;
-        info.direction = determine_direction(src_ip, dst_ip);
-        
-        // Extract protocol-specific information
-        if (ip_header->ip_p == IPPROTO_TCP) {
-            // TCP packet
-            const struct tcphdr* tcp_header = 
-                reinterpret_cast<const struct tcphdr*>(
-                    packet_data.data() + sizeof(struct ether_header) + ip_header_len);
-            
-            // Fill in 5-tuple key
-            info.key.src_ip = src_ip;
-            info.key.dst_ip = dst_ip;
-            info.key.src_port = ntohs(tcp_header->th_sport);
-            info.key.dst_port = ntohs(tcp_header->th_dport);
-            info.key.protocol = IPPROTO_TCP;
-            
-            // Calculate payload offset and size
-            size_t tcp_header_len = tcp_header->th_off * 4;
-            size_t payload_offset = sizeof(struct ether_header) + ip_header_len + tcp_header_len;
-            
-            // Extract payload snippet if any
-            if (packet_data.size() > payload_offset) {
-                const uint8_t* payload = packet_data.data() + payload_offset;
-                size_t payload_size = packet_data.size() - payload_offset;
-                
-                // Calculate payload hash
-                info.payload_hash = calculate_payload_hash(payload, payload_size);
-                
-                // Store payload snippet (first 64 bytes or less)
-                size_t snippet_size = std::min(payload_size, size_t(64));
-                info.payload_snippet.assign(payload, payload + snippet_size);
-            }
-            
-            return info;
-        } 
-        else if (ip_header->ip_p == IPPROTO_UDP) {
-            // UDP packet
-            const struct udphdr* udp_header = 
-                reinterpret_cast<const struct udphdr*>(
-                    packet_data.data() + sizeof(struct ether_header) + ip_header_len);
-            
-            // Fill in 5-tuple key
-            info.key.src_ip = src_ip;
-            info.key.dst_ip = dst_ip;
-            info.key.src_port = ntohs(udp_header->uh_sport);
-            info.key.dst_port = ntohs(udp_header->uh_dport);
-            info.key.protocol = IPPROTO_UDP;
-            
-            // Calculate payload offset and size
-            size_t payload_offset = sizeof(struct ether_header) + ip_header_len + sizeof(struct udphdr);
-            
-            // Extract payload snippet if any
-            if (packet_data.size() > payload_offset) {
-                const uint8_t* payload = packet_data.data() + payload_offset;
-                size_t payload_size = packet_data.size() - payload_offset;
-                
-                // Calculate payload hash
-                info.payload_hash = calculate_payload_hash(payload, payload_size);
-                
-                // Store payload snippet (first 64 bytes or less)
-                size_t snippet_size = std::min(payload_size, size_t(64));
-                info.payload_snippet.assign(payload, payload + snippet_size);
-            }
-            
-            return info;
-        }
-        
-        // Not a TCP or UDP packet
-        return std::nullopt;
-    }
-};
+}
 
-3. Packet Correlator - Matching Engine Core
-#include <chrono>
-#include <unordered_map>
-#include <optional>
+size_t BufferPool::getAvailableBuffers() const {
+    return m_bufferQueue.size();
+}
+
+size_t BufferPool::getTotalBuffers() const {
+    return m_totalBuffers;
+}
+PacketProducer.h
+cppCopy#pragma once
+
+#include "IPacketProducer.h"
+#include "BufferPool.h"
+#include "rigtorp/MPMCQueue.h"
+#include <string>
 #include <vector>
-#include <mutex>
-#include <shared_mutex>
-#include <algorithm>
+#include <memory>
+#include <thread>
+#include <atomic>
 
-struct MatchResult {
-    PacketInfo inbound_packet;
-    PacketInfo outbound_packet;
-    uint64_t latency_ns;
+// Forward declarations
+struct pcap_file_header;
+
+/// Produces packets from PCAP files in a specified directory
+class PacketProducer : public IPacketProducer {
+public:
+    PacketProducer(BufferPool& bufferPool, 
+                  rigtorp::MPMCQueue<RawPacket>& outputQueue);
+    ~PacketProducer() override;
+
+    // Implement IPacketProducer interface
+    void run(PacketCallback callback) override;
+    void stop() override;
+
+    // Configure directory to monitor for PCAP files
+    void setSourceDirectory(const std::string& directory);
+
+    // Get stats
+    size_t getProcessedPackets() const;
+    size_t getProcessedFiles() const;
+
+private:
+    // Memory-mapped file handling
+    class MappedPcapFile {
+    public:
+        MappedPcapFile(const std::string& filename);
+        ~MappedPcapFile();
+
+        bool isValid() const;
+        bool readNextPacket(RawPacket& packet, BufferPool& bufferPool);
+        
+    private:
+        int m_fd;
+        void* m_mappedData;
+        size_t m_fileSize;
+        size_t m_currentOffset;
+        pcap_file_header* m_fileHeader;
+        bool m_isValid;
+    };
+
+    void processDirectory();
+    void processPcapFile(const std::string& filename);
+
+    BufferPool& m_bufferPool;
+    rigtorp::MPMCQueue<RawPacket>& m_outputQueue;
+    std::string m_sourceDirectory;
+    std::atomic<bool> m_running;
+    std::unique_ptr<std::thread> m_worker;
+    PacketCallback m_callback;
+    std::atomic<size_t> m_processedPackets;
+    std::atomic<size_t> m_processedFiles;
+};
+PacketProducer.cpp
+cppCopy#include "PacketProducer.h"
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#include <filesystem>
+#include <algorithm>
+#include <chrono>
+#include <thread>
+
+// PCAP file header structure
+struct pcap_file_header {
+    uint32_t magic;
+    uint16_t version_major;
+    uint16_t version_minor;
+    int32_t thiszone;
+    uint32_t sigfigs;
+    uint32_t snaplen;
+    uint32_t linktype;
 };
 
-class PacketCorrelator {
-private:
-    // Configuration
-    std::chrono::milliseconds max_retention_time_;  // Maximum time to keep unmatched packets
-    std::chrono::milliseconds max_correlation_latency_;  // Maximum allowed latency between request and response
+// PCAP packet header structure
+struct pcap_pkthdr {
+    uint32_t ts_sec;
+    uint32_t ts_usec;
+    uint32_t caplen;
+    uint32_t len;
+};
+
+PacketProducer::PacketProducer(BufferPool& bufferPool, 
+                               rigtorp::MPMCQueue<RawPacket>& outputQueue)
+    : m_bufferPool(bufferPool), 
+      m_outputQueue(outputQueue),
+      m_running(false),
+      m_processedPackets(0),
+      m_processedFiles(0) {
+}
+
+PacketProducer::~PacketProducer() {
+    stop();
+}
+
+void PacketProducer::run(PacketCallback callback) {
+    if (m_running) return;
     
-    // Thread-safe storage for unmatched packets
-    mutable std::shared_mutex inbound_mutex_;
-    std::unordered_map<FiveTupleKey, PacketInfo> unmatched_inbound_;
+    m_callback = std::move(callback);
+    m_running = true;
     
-    mutable std::shared_mutex outbound_mutex_;
-    std::unordered_map<FiveTupleKey, PacketInfo> unmatched_outbound_;
+    m_worker = std::make_unique<std::thread>([this] {
+        processDirectory();
+    });
+}
+
+void PacketProducer::stop() {
+    if (!m_running) return;
     
-    // Matched packet storage
-    mutable std::mutex match_mutex_;
-    std::vector<MatchResult> matches_;
+    m_running = false;
     
-    // Stats
-    std::atomic<size_t> total_inbound_{0};
-    std::atomic<size_t> total_outbound_{0};
-    std::atomic<size_t> total_matches_{0};
-    std::atomic<size_t> expired_packets_{0};
+    if (m_worker && m_worker->joinable()) {
+        m_worker->join();
+    }
     
-    // Cleanup thread for removing expired packets
-    std::thread cleanup_thread_;
-    std::atomic<bool> running_{false};
+    m_worker.reset();
+}
+
+void PacketProducer::setSourceDirectory(const std::string& directory) {
+    m_sourceDirectory = directory;
+}
+
+size_t PacketProducer::getProcessedPackets() const {
+    return m_processedPackets.load(std::memory_order_relaxed);
+}
+
+size_t PacketProducer::getProcessedFiles() const {
+    return m_processedFiles.load(std::memory_order_relaxed);
+}
+
+void PacketProducer::processDirectory() {
+    namespace fs = std::filesystem;
     
-    // Advanced correlation logic for UDP-TCP pairs
-    bool correlate_udp_tcp(const PacketInfo& udp_packet, const PacketInfo& tcp_packet) const {
-        // Verify directionality - UDP should be inbound, TCP outbound
-        if (udp_packet.direction != PacketDirection::Inbound || 
-            tcp_packet.direction != PacketDirection::Outbound) {
-            return false;
-        }
+    while (m_running) {
+        // Get all PCAP files in directory
+        std::vector<fs::path> pcapFiles;
         
-        // Check time constraints - TCP must follow UDP within reasonable time
-        if (tcp_packet.timestamp_ns <= udp_packet.timestamp_ns) {
-            return false;  // TCP packet can't precede UDP packet
-        }
-        
-        uint64_t latency = tcp_packet.timestamp_ns - udp_packet.timestamp_ns;
-        if (latency > max_correlation_latency_.count() * 1000000) {
-            return false;  // Latency too high
-        }
-        
-        // Protocol-specific correlation logic
-        // This is where you'd implement your specific matching logic based on:
-        // 1. Payload inspection
-        // 2. Known patterns in request-response
-        // 3. Application-specific identifiers in packets
-        
-        // Simple correlation - check if payload snippets contain common patterns
-        // This is highly application-specific and would need customization
-        if (!udp_packet.payload_snippet.empty() && !tcp_packet.payload_snippet.empty()) {
-            // Look for pattern where TCP payload contains parts of UDP payload
-            // Just a simplified example - real matching would be more sophisticated
-            for (size_t i = 0; i < udp_packet.payload_snippet.size() - 3; i++) {
-                // Look for at least 4 consecutive bytes that match
-                if (std::search(tcp_packet.payload_snippet.begin(), tcp_packet.payload_snippet.end(),
-                               udp_packet.payload_snippet.begin() + i, 
-                               udp_packet.payload_snippet.begin() + i + 4) != tcp_packet.payload_snippet.end()) {
-                    return true;
-                }
+        for (const auto& entry : fs::directory_iterator(m_sourceDirectory)) {
+            if (entry.is_regular_file() && 
+                entry.path().extension() == ".pcap") {
+                pcapFiles.push_back(entry.path());
             }
         }
         
+        // Sort by creation time
+        std::sort(pcapFiles.begin(), pcapFiles.end(), 
+            [](const fs::path& a, const fs::path& b) {
+                return fs::last_write_time(a) < fs::last_write_time(b);
+            });
+        
+        // Process each file
+        for (const auto& file : pcapFiles) {
+            if (!m_running) break;
+            
+            processPcapFile(file.string());
+            
+            // Move or mark as processed
+            try {
+                fs::rename(file, file.string() + ".processed");
+                m_processedFiles.fetch_add(1, std::memory_order_relaxed);
+            } catch (const std::exception& e) {
+                // Log error and continue
+            }
+        }
+        
+        // Wait before checking directory again
+        if (m_running) {
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+        }
+    }
+}
+
+void PacketProducer::processPcapFile(const std::string& filename) {
+    MappedPcapFile pcapFile(filename);
+    
+    if (!pcapFile.isValid()) {
+        // Log error and return
+        return;
+    }
+    
+    RawPacket packet;
+    while (m_running && pcapFile.readNextPacket(packet, m_bufferPool)) {
+        // Use the callback if provided, otherwise use the queue
+        if (m_callback) {
+            m_callback(std::move(packet));
+        } else {
+            m_outputQueue.try_emplace(std::move(packet));
+        }
+        
+        m_processedPackets.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
+// MappedPcapFile implementation
+PacketProducer::MappedPcapFile::MappedPcapFile(const std::string& filename)
+    : m_fd(-1), m_mappedData(nullptr), m_fileSize(0), 
+      m_currentOffset(0), m_fileHeader(nullptr), m_isValid(false) {
+    
+    // Open file
+    m_fd = open(filename.c_str(), O_RDONLY);
+    if (m_fd == -1) return;
+    
+    // Get file size
+    struct stat sb;
+    if (fstat(m_fd, &sb) == -1) {
+        close(m_fd);
+        m_fd = -1;
+        return;
+    }
+    
+    m_fileSize = static_cast<size_t>(sb.st_size);
+    
+    // Map file into memory
+    m_mappedData = mmap(nullptr, m_fileSize, PROT_READ, MAP_PRIVATE, m_fd, 0);
+    if (m_mappedData == MAP_FAILED) {
+        close(m_fd);
+        m_fd = -1;
+        m_mappedData = nullptr;
+        return;
+    }
+    
+    // Prefetch file data into memory
+    madvise(m_mappedData, m_fileSize, MADV_SEQUENTIAL);
+    
+    // Validate PCAP header
+    if (m_fileSize < sizeof(pcap_file_header)) {
+        munmap(m_mappedData, m_fileSize);
+        close(m_fd);
+        m_fd = -1;
+        m_mappedData = nullptr;
+        return;
+    }
+    
+    m_fileHeader = static_cast<pcap_file_header*>(m_mappedData);
+    m_currentOffset = sizeof(pcap_file_header);
+    
+    // Validate magic number (0xa1b2c3d4 or 0xd4c3b2a1 for endianness)
+    if (m_fileHeader->magic != 0xa1b2c3d4 && m_fileHeader->magic != 0xd4c3b2a1) {
+        munmap(m_mappedData, m_fileSize);
+        close(m_fd);
+        m_fd = -1;
+        m_mappedData = nullptr;
+        return;
+    }
+    
+    m_isValid = true;
+}
+
+PacketProducer::MappedPcapFile::~MappedPcapFile() {
+    if (m_mappedData) {
+        munmap(m_mappedData, m_fileSize);
+    }
+    
+    if (m_fd != -1) {
+        close(m_fd);
+    }
+}
+
+bool PacketProducer::MappedPcapFile::isValid() const {
+    return m_isValid;
+}
+
+bool PacketProducer::MappedPcapFile::readNextPacket(RawPacket& packet, BufferPool& bufferPool) {
+    if (!m_isValid || m_currentOffset + sizeof(pcap_pkthdr) > m_fileSize) {
         return false;
     }
     
-    void cleanup_loop() {
-        while (running_) {
-            std::this_thread::sleep_for(std::chrono::seconds(1));
-            
-            auto now = std::chrono::steady_clock::now();
-            auto now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
-                now.time_since_epoch()).count();
-            
-            size_t expired_count = 0;
-            
-            // Clean up inbound packets
-            {
-                std::unique_lock<std::shared_mutex> lock(inbound_mutex_);
-                for (auto it = unmatched_inbound_.begin(); it != unmatched_inbound_.end();) {
-                    if (now_ns - it->second.timestamp_ns > max_retention_time_.count() * 1000000) {
-                        it = unmatched_inbound_.erase(it);
-                        expired_count++;
-                    } else {
-                        ++it;
-                    }
-                }
-            }
-            
-            // Clean up outbound packets
-            {
-                std::unique_lock<std::shared_mutex> lock(outbound_mutex_);
-                for (auto it = unmatched_outbound_.begin(); it != unmatched_outbound_.end();) {
-                    if (now_ns - it->second.timestamp_ns > max_retention_time_.count() * 1000000) {
-                        it = unmatched_outbound_.erase(it);
-                        expired_count++;
-                    } else {
-                        ++it;
-                    }
-                }
-            }
-            
-            expired_packets_ += expired_count;
-        }
+    // Get packet header
+    auto* pkthdr = reinterpret_cast<pcap_pkthdr*>(
+        static_cast<uint8_t*>(m_mappedData) + m_currentOffset);
+    m_currentOffset += sizeof(pcap_pkthdr);
+    
+    // Validate packet size
+    if (m_currentOffset + pkthdr->caplen > m_fileSize) {
+        return false;
     }
     
+    // Get packet data pointer (still in mmap memory)
+    const uint8_t* packet_data = static_cast<uint8_t*>(m_mappedData) + m_currentOffset;
+    m_currentOffset += pkthdr->caplen;
+    
+    // Try to get a buffer from the pool
+    auto bufferOpt = bufferPool.acquire();
+    if (!bufferOpt) {
+        // No buffer available - packet will be dropped
+        return false;
+    }
+    
+    // Create a packet with the buffer
+    packet.buffer = std::move(bufferOpt.value());
+    
+    // Copy data into the buffer
+    const size_t copy_len = std::min(pkthdr->caplen, 
+                                    static_cast<uint32_t>(BufferPool::BUFFER_SIZE));
+    std::memcpy(packet.buffer->data(), packet_data, copy_len);
+    packet.dataSize = copy_len;
+    
+    // Set timestamp
+    using namespace std::chrono;
+    seconds sec(pkthdr->ts_sec);
+    microseconds usec(pkthdr->ts_usec);
+    system_clock::time_point pkt_time = system_clock::from_time_t(0) + sec + usec;
+    packet.timestamp = std::chrono::steady_clock::now(); // Use original timestamp when possible
+    
+    return true;
+}
+PacketParser.h
+cppCopy#pragma once
+
+#include "IPacketParser.h"
+#include <span>
+
+/// Parses raw packet data into structured ParsedPacket objects
+class PacketParser : public IPacketParser {
 public:
-    PacketCorrelator(std::chrono::milliseconds retention_time = std::chrono::seconds(30),
-                    std::chrono::milliseconds max_latency = std::chrono::seconds(5))
-        : max_retention_time_(retention_time), max_correlation_latency_(max_latency) {}
+    PacketParser();
+    ~PacketParser() override;
     
-    ~PacketCorrelator() {
-        stop();
-    }
+    // Implementation of IPacketParser interface
+    ParsedPacket parse(const RawPacket& raw) override;
     
-    void start() {
-        if (running_) return;
-        
-        running_ = true;
-        cleanup_thread_ = std::thread(&PacketCorrelator::cleanup_loop, this);
-        spdlog::info("Packet correlator started");
-    }
+    // Configure internal network for direction detection
+    void setInternalNetwork(const std::array<uint8_t, 4>& prefix, uint8_t prefixLength);
     
-    void stop() {
-        if (!running_) return;
-        
-        running_ = false;
-        if (cleanup_thread_.joinable()) {
-            cleanup_thread_.join();
-        }
-        spdlog::info("Packet correlator stopped");
-    }
+private:
+    // Helper methods for parsing specific headers
+    bool parseEthernetHeader(std::span<const uint8_t> data, size_t& offset, ParsedPacket& packet);
+    bool parseIPv4Header(std::span<const uint8_t> data, size_t& offset, ParsedPacket& packet);
+    bool parseTCPHeader(std::span<const uint8_t> data, size_t& offset, ParsedPacket& packet);
+    bool parseUDPHeader(std::span<const uint8_t> data, size_t& offset, ParsedPacket& packet);
     
-    void process_packet(const PacketInfo& packet) {
-        // Check packet direction and process accordingly
-        if (packet.direction == PacketDirection::Inbound && packet.key.protocol == IPPROTO_UDP) {
-            total_inbound_++;
-            
-            // Store inbound UDP packet
-            {
-                std::unique_lock<std::shared_mutex> lock(inbound_mutex_);
-                unmatched_inbound_[packet.key] = packet;
-            }
-            
-            // Try to find matching TCP outbound packet
-            std::vector<FiveTupleKey> potential_matches;
-            {
-                std::shared_lock<std::shared_mutex> lock(outbound_mutex_);
-                for (const auto& [key, outbound_packet] : unmatched_outbound_) {
-                    if (outbound_packet.key.protocol == IPPROTO_TCP &&
-                        correlate_udp_tcp(packet, outbound_packet)) {
-                        potential_matches.push_back(key);
-                    }
-                }
-            }
-            
-            // Process potential matches
-            for (const auto& key : potential_matches) {
-                PacketInfo outbound_packet;
-                {
-                    std::unique_lock<std::shared_mutex> lock(outbound_mutex_);
-                    auto it = unmatched_outbound_.find(key);
-                    if (it != unmatched_outbound_.end()) {
-                        outbound_packet = it->second;
-                        unmatched_outbound_.erase(it);
-                    } else {
-                        continue;  // Packet was already matched by another thread
-                    }
-                }
-                
-                // Create match
-                MatchResult match;
-                match.inbound_packet = packet;
-                match.outbound_packet = outbound_packet;
-                match.latency_ns = outbound_packet.timestamp_ns - packet.timestamp_ns;
-                
-                // Store match
-                {
-                    std::lock_guard<std::mutex> lock(match_mutex_);
-                    matches_.push_back(match);
-                }
-                
-                total_matches_++;
-                
-                // Remove packet from inbound map since it's matched
-                {
-                    std::unique_lock<std::shared_mutex> lock(inbound_mutex_);
-                    unmatched_inbound_.erase(packet.key);
-                }
-                
-                break;  // Only use the first match found
-            }
-        }
-        else if (packet.direction == PacketDirection::Outbound && packet.key.protocol == IPPROTO_TCP) {
-            total_outbound_++;
-            
-            // Try to find matching UDP inbound packet
-            std::vector<FiveTupleKey> potential_matches;
-            {
-                std::shared_lock<std::shared_mutex> lock(inbound_mutex_);
-                for (const auto& [key, inbound_packet] : unmatched_inbound_) {
-                    if (inbound_packet.key.protocol == IPPROTO_UDP &&
-                        correlate_udp_tcp(inbound_packet, packet)) {
-                        potential_matches.push_back(key);
-                    }
-                }
-            }
-            
-            // Process potential matches
-            for (const auto& key : potential_matches) {
-                PacketInfo inbound_packet;
-                {
-                    std::unique_lock<std::shared_mutex> lock(inbound_mutex_);
-                    auto it = unmatched_inbound_.find(key);
-                    if (it != unmatched_inbound_.end()) {
-                        inbound_packet = it->second;
-                        unmatched_inbound_.erase(it);
-                    } else {
-                        continue;  // Packet was already matched by another thread
-                    }
-                }
-                
-                // Create match
-                MatchResult match;
-                match.inbound_packet = inbound_packet;
-                match.outbound_packet = packet;
-                match.latency_ns = packet.timestamp_ns - inbound_packet.timestamp_ns;
-                
-                // Store match
-                {
-                    std::lock_guard<std::mutex> lock(match_mutex_);
-                    matches_.push_back(match);
-                }
-                
-                total_matches_++;
-                
-                // Don't store this outbound packet since it's matched
-                return;
-            }
-            
-            // If no match found, store outbound packet
-            {
-                std::unique_lock<std::shared_mutex> lock(outbound_mutex_);
-                unmatched_outbound_[packet.key] = packet;
-            }
-        }
-    }
+    // Calculate hash of payload data
+    uint64_t calculatePayloadHash(std::span<const uint8_t> data);
     
-    std::vector<MatchResult> get_matches(size_t max_count = 1000) {
-        std::lock_guard<std::mutex> lock(match_mutex_);
-        
-        std::vector<MatchResult> result;
-        if (matches_.empty()) {
-            return result;
-        }
-        
-        size_t count = std::min(max_count, matches_.size());
-        result.reserve(count);
-        
-        // Return oldest matches first
-        std::copy(matches_.begin(), matches_.begin() + count, std::back_inserter(result));
-        
-        // Remove returned matches
-        matches_.erase(matches_.begin(), matches_.begin() + count);
-        
-        return result;
-    }
+    // Determine packet direction based on IP
+    PacketDirection determineDirection(const std::array<uint8_t, 4>& ip);
     
-    // Get statistics
-    struct Stats {
-        size_t inbound_packets;
-        size_t outbound_packets;
-        size_t matched_pairs;
-        size_t unmatched_inbound;
-        size_t unmatched_outbound;
-        size_t expired_packets;
-    };
-    
-    Stats get_stats() const {
-        Stats stats;
-        stats.inbound_packets = total_inbound_;
-        stats.outbound_packets = total_outbound_;
-        stats.matched_pairs = total_matches_;
-        stats.expired_packets = expired_packets_;
-        
-        {
-            std::shared_lock<std::shared_mutex> lock(inbound_mutex_);
-            stats.unmatched_inbound = unmatched_inbound_.size();
-        }
-        
-        {
-            std::shared_lock<std::shared_mutex> lock(outbound_mutex_);
-            stats.unmatched_outbound = unmatched_outbound_.size();
-        }
-        
-        return stats;
-    }
+    // Network configuration
+    std::array<uint8_t, 4> m_internalNetworkPrefix;
+    uint8_t m_internalNetworkPrefixLength;
+};
+PacketParser.cpp
+cppCopy#include "PacketParser.h"
+#include <cstring>
+#include <functional>
+#include <arpa/inet.h>
+
+// Ethernet header structure
+struct EthernetHeader {
+    uint8_t dstMac[6];
+    uint8_t srcMac[6];
+    uint16_t etherType;
 };
 
-4. Worker Pool for Parallel Processing
-#include <thread>
+// IPv4 header structure
+struct IPv4Header {
+    uint8_t versionIhl;
+    uint8_t tos;
+    uint16_t totalLength;
+    uint16_t identification;
+    uint16_t flagsFragmentOffset;
+    uint8_t ttl;
+    uint8_t protocol;
+    uint16_t headerChecksum;
+    uint8_t srcIp[4];
+    uint8_t dstIp[4];
+};
+
+// TCP header structure
+struct TCPHeader {
+    uint16_t srcPort;
+    uint16_t dstPort;
+    uint32_t sequenceNumber;
+    uint32_t ackNumber;
+    uint16_t dataOffsetFlags;
+    uint16_t window;
+    uint16_t checksum;
+    uint16_t urgentPointer;
+};
+
+// UDP header structure
+struct UDPHeader {
+    uint16_t srcPort;
+    uint16_t dstPort;
+    uint16_t length;
+    uint16_t checksum;
+};
+
+PacketParser::PacketParser() {
+    // Default to 192.168.0.0/16 as internal network
+    m_internalNetworkPrefix = {192, 168, 0, 0};
+    m_internalNetworkPrefixLength = 16;
+}
+
+PacketParser::~PacketParser() = default;
+
+void PacketParser::setInternalNetwork(const std::array<uint8_t, 4>& prefix, uint8_t prefixLength) {
+    m_internalNetworkPrefix = prefix;
+    m_internalNetworkPrefixLength = prefixLength;
+}
+
+ParsedPacket PacketParser::parse(const RawPacket& raw) {
+    ParsedPacket parsed;
+    size_t offset = 0;
+    
+    // Get packet data as a span for zero-copy access
+    std::span<const uint8_t> data = raw.data();
+    
+    // Parse Ethernet header
+    if (!parseEthernetHeader(data, offset, parsed)) {
+        return parsed;
+    }
+    
+    // Parse IP header
+    if (!parseIPv4Header(data, offset, parsed)) {
+        return parsed;
+    }
+    
+    // Parse TCP or UDP based on protocol
+    if (parsed.protocol == 6) { // TCP
+        if (!parseTCPHeader(data, offset, parsed)) {
+            return parsed;
+        }
+    } else if (parsed.protocol == 17) { // UDP
+        if (!parseUDPHeader(data, offset, parsed)) {
+            return parsed;
+        }
+    } else {
+        // Unsupported protocol
+        return parsed;
+    }
+    
+    // Calculate payload hash if there's payload data
+    if (offset < data.size()) {
+        parsed.payloadHash = calculatePayloadHash(data.subspan(offset));
+    }
+    
+    // Set timestamp from original packet
+    parsed.timestamp = raw.timestamp;
+    
+    return parsed;
+}
+
+bool PacketParser::parseEthernetHeader(std::span<const uint8_t> data, 
+                                     size_t& offset, 
+                                     ParsedPacket& packet) {
+    if (data.size() < sizeof(EthernetHeader)) {
+        return false;
+    }
+    
+    const auto* ethHeader = 
+        reinterpret_cast<const EthernetHeader*>(data.data());
+    
+    // Check for IPv4 packet (EtherType = 0x0800, in network byte order)
+    uint16_t etherType = ntohs(ethHeader->etherType);
+    
+    if (etherType != 0x0800) {
+        return false; // Not IPv4
+    }
+    
+    offset += sizeof(EthernetHeader);
+    return true;
+}
+
+bool PacketParser::parseIPv4Header(std::span<const uint8_t> data, 
+                                 size_t& offset, 
+                                 ParsedPacket& packet) {
+    if (data.size() < offset + sizeof(IPv4Header)) {
+        return false;
+    }
+    
+    const auto* ipHeader = 
+        reinterpret_cast<const IPv4Header*>(data.data() + offset);
+    
+    // Get IP header length (in 32-bit words)
+    uint8_t ihl = (ipHeader->versionIhl & 0x0F);
+    size_t ipHeaderLength = ihl * 4;
+    
+    if (data.size() < offset + ipHeaderLength) {
+        return false;
+    }
+    
+    // Extract IP addresses
+    std::memcpy(packet.srcIP.data(), ipHeader->srcIp, 4);
+    std::memcpy(packet.dstIP.data(), ipHeader->dstIp, 4);
+    
+    // Set protocol
+    packet.protocol = ipHeader->protocol;
+    
+    // Determine direction
+    packet.direction = determineDirection(packet.srcIP);
+    
+    offset += ipHeaderLength;
+    return true;
+}
+
+bool PacketParser::parseTCPHeader(std::span<const uint8_t> data, 
+                                size_t& offset, 
+                                ParsedPacket& packet) {
+    if (data.size() < offset + sizeof(TCPHeader)) {
+        return false;
+    }
+    
+    const auto* tcpHeader = 
+        reinterpret_cast<const TCPHeader*>(data.data() + offset);
+    
+    // Get data offset (in 32-bit words)
+    uint8_t dataOffset = (ntohs(tcpHeader->dataOffsetFlags) >> 12) & 0x0F;
+    size_t tcpHeaderLength = dataOffset * 4;
+    
+    if (data.size() < offset + tcpHeaderLength) {
+        return false;
+    }
+    
+    // Extract ports (network byte order)
+    packet.srcPort = ntohs(tcpHeader->srcPort);
+    packet.dstPort = ntohs(tcpHeader->dstPort);
+    
+    offset += tcpHeaderLength;
+    return true;
+}
+
+bool PacketParser::parseUDPHeader(std::span<const uint8_t> data, 
+                                size_t& offset, 
+                                ParsedPacket& packet) {
+    if (data.size() < offset + sizeof(UDPHeader)) {
+        return false;
+    }
+    
+    const auto* udpHeader = 
+        reinterpret_cast<const UDPHeader*>(data.data() + offset);
+    
+    // Extract ports (network byte order)
+    packet.srcPort = ntohs(udpHeader->srcPort);
+    packet.dstPort = ntohs(udpHeader->dstPort);
+    
+    offset += sizeof(UDPHeader);
+    return true;
+}
+
+uint64_t PacketParser::calculatePayloadHash(std::span<const uint8_t> data) {
+    if (data.empty()) {
+        return 0;
+    }
+    
+    // Use a simple FNV-1a hash
+    uint64_t hash = 14695981039346656037ULL;
+    for (uint8_t byte : data) {
+        hash ^= byte;
+        hash *= 1099511628211ULL;
+    }
+    
+    return hash;
+}
+
+PacketDirection PacketParser::determineDirection(const std::array<uint8_t, 4>& ip) {
+    // Compare IP address to internal network prefix
+    for (size_t i = 0; i < m_internalNetworkPrefixLength / 8; i++) {
+        if (ip[i] != m_internalNetworkPrefix[i]) {
+            return PacketDirection::Inbound;
+        }
+    }
+    
+    // If we reached here, the first bytes match the prefix
+    // Check partial byte if needed
+    if (m_internalNetworkPrefixLength % 8 != 0) {
+        uint8_t remainingBits = m_internalNetworkPrefixLength % 8;
+        uint8_t mask = ~(0xFF >> remainingBits);
+        
+        if ((ip[m_internalNetworkPrefixLength / 8] & mask) !=
+            (m_internalNetworkPrefix[m_internalNetworkPrefixLength / 8] & mask)) {
+            return PacketDirection::Inbound;
+        }
+    }
+    
+    return PacketDirection::Outbound;
+}
+UnmatchedStore.h
+cppCopy#pragma once
+
+#include "IUnmatchedStore.h"
 #include <vector>
-#include <queue>
-#include <functional>
-#include <condition_variable>
+#include <unordered_map>
+#include <shared_mutex>
+#include <chrono>
+#include <memory>
+#include <array>
 #include <atomic>
 
-class WorkerPool {
-private:
-    std::vector<std::thread> workers_;
-    std::queue<std::function<void()>> tasks_;
-    
-    std::mutex queue_mutex_;
-    std::condition_variable condition_;
-    std::atomic<bool> stop_{false};
-    
-    void worker_loop() {
-        while (true) {
-            std::function<void()> task;
-            
-            {
-                std::unique_lock<std::mutex> lock(queue_mutex_);
-                condition_.wait(lock, [this]() {
-                    return stop_ || !tasks_.empty();
-                });
-                
-                if (stop_ && tasks_.empty()) {
-                    return;
-                }
-                
-                task = std::move(tasks_.front());
-                tasks_.pop();
-            }
-            
-            task();
-        }
-    }
-    
+/// Stores unmatched packets for later correlation
+class UnmatchedStore : public IUnmatchedStore {
 public:
-    WorkerPool(size_t num_threads) {
-        workers_.reserve(num_threads);
-        for (size_t i = 0; i < num_threads; ++i) {
-            workers_.emplace_back(&WorkerPool::worker_loop, this);
-        }
+    UnmatchedStore(std::chrono::milliseconds expiryDuration = std::chrono::seconds(30),
+                  size_t shardCount = 16);
+    ~UnmatchedStore() override;
+    
+    void insert(const ParsedPacket& packet) override;
+    std::optional<ParsedPacket> retrieve(const ParsedPacket& packet) override;
+    void cleanupExpired() override;
+    
+    // Stats methods
+    size_t getTotalStoredPackets() const;
+    
+private:
+    // Forward declarations
+    struct PacketKey;
+    struct StoredPacket;
+    struct Shard;
+    
+    // Packet key for matching
+    struct PacketKey {
+        uint32_t srcIP;
+        uint32_t dstIP;
+        uint16_t srcPort;
+        uint16_t dstPort;
+        uint8_t protocol;
+        uint64_t payloadHash;
+        
+        // Hash function declaration (defined in .cpp)
+        struct Hasher {
+            size_t operator()(const PacketKey& key) const;
+        };
+        
+        // Equality comparison (defined in .cpp)
+        bool operator==(const PacketKey& other) const;
+    };
+    
+    // Packet storage structure
+    struct StoredPacket {
+        ParsedPacket packet;
+        std::chrono::steady_clock::time_point expiry;
+    };
+    
+    // Shard for lock reduction
+    struct Shard {
+        std::unordered_map<PacketKey, StoredPacket, PacketKey::Hasher> packets;
+        mutable std::shared_mutex mutex;
+    };
+    
+    // Helper methods
+    size_t getShardIndex(const PacketKey& key) const;
+    PacketKey createKey(const ParsedPacket& packet) const;
+    PacketKey createMatchingKey(const ParsedPacket& packet) const;
+    
+    // Member variables
+    std::vector<std::unique_ptr<Shard>> m_shards;
+    std::chrono::milliseconds m_expiryDuration;
+    mutable std::atomic<size_t> m_totalPackets;
+};
+UnmatchedStore.cpp
+cppCopy#include "UnmatchedStore.h"
+
+UnmatchedStore::UnmatchedStore(std::chrono::milliseconds expiryDuration, 
+                             size_t shardCount)
+    : m_expiryDuration(expiryDuration), m_totalPackets(0) {
+    
+    // Create shards
+    m_shards.reserve(shardCount);
+    for (size_t i = 0; i < shardCount; ++i) {
+        m_shards.push_back(std::make_unique<Shard>());
+    }
+}
+
+UnmatchedStore::~UnmatchedStore() = default;
+
+void UnmatchedStore::insert(const ParsedPacket& packet) {
+    auto key = createKey(packet);
+    auto shardIdx = getShardIndex(key);
+    auto& shard = *m_shards[shardIdx];
+    
+    // Exclusive lock for writing
+    std::unique_lock lock(shard.mutex);
+    
+    auto expiry = std::chrono::steady_clock::now() + m_expiryDuration;
+    shard.packets.insert_or_assign(key, StoredPacket{packet, expiry});
+    
+    m_totalPackets.fetch_add(1, std::memory_order_relaxed);
+}
+
+std::optional<ParsedPacket> UnmatchedStore::retrieve(
+    const ParsedPacket& packet) {
+    
+    auto key = createMatchingKey(packet);
+    auto shardIdx = getShardIndex(key);
+    auto& shard = *m_shards[shardIdx];
+    
+    // Shared lock for reading
+    std::shared_lock readLock(shard.mutex);
+    
+    auto it = shard.packets.find(key);
+    if (it == shard.packets.end()) {
+        return std::nullopt;
     }
     
-    ~WorkerPool() {
-        {
-            std::unique_lock<std::mutex> lock(queue_mutex_);
-            stop_ = true;
-        }
+    // Found match - upgrade to exclusive lock
+    readLock.unlock();
+    std::unique_lock writeLock(shard.mutex);
+    
+    // Check again after lock upgrade
+    it = shard.packets.find(key);
+    if (it == shard.packets.end()) {
+        return std::nullopt;
+    }
+    
+    // Extract packet and remove from map
+    ParsedPacket result = it->second.packet;
+    shard.packets.erase(it);
+    
+    m_totalPackets.fetch_sub(1, std::memory_order_relaxed);
+    
+    return result;
+}
+
+void UnmatchedStore::cleanupExpired() {
+    auto now = std::chrono::steady_clock::now();
+    
+    size_t removedCount = 0;
+    
+    // Process each shard independently
+    for (auto& shardPtr : m_shards) {
+        auto& shard = *shardPtr;
+        std::unique_lock lock(shard.mutex);
         
-        condition_.notify_all();
-        
-        for (auto& worker : workers_) {
-            if (worker.joinable()) {
-                worker.join();
+        for (auto it = shard.packets.begin(); it != shard.packets.end();) {
+            if (it->second.expiry < now) {
+                it = shard.packets.erase(it);
+                removedCount++;
+            } else {
+                ++it;
             }
         }
     }
     
-    template<class F>
-    void enqueue(F&& f) {
-        {
-            std::unique_lock<std::mutex> lock(queue_mutex_);
-            tasks_.emplace(std::forward<F>(f));
+    if (removedCount > 0) {
+        m_totalPackets.fetch_sub(removedCount, std::memory_order_relaxed);
+    }
+}
+
+size_t UnmatchedStore::getTotalStoredPackets() const {
+    return m_totalPackets.load(std::memory_order_relaxed);
+}
+
+size_t UnmatchedStore::getShardIndex(const PacketKey& key) const {
+    // Use hash to distribute among shards
+    return PacketKey::Hasher{}(key) % m_shards.size();
+}
+
+UnmatchedStore::PacketKey 
+UnmatchedStore::createKey(const ParsedPacket& packet) const {
+    PacketKey key;
+    
+    // Convert IPv4 array to uint32_t
+    key.srcIP = (packet.srcIP[0] << 24) | (packet.srcIP[1] << 16) | 
+                (packet.srcIP[2] << 8) | packet.srcIP[3];
+    key.dstIP = (packet.dstIP[0] << 24) | (packet.dstIP[1] << 16) | 
+                (packet.dstIP[2] << 8) | packet.dstIP[3];
+    
+    key.srcPort = packet.srcPort;
+    key.dstPort = packet.dstPort;
+    key.protocol = packet.protocol;
+    key.payloadHash = packet.payloadHash;
+    
+    return key;
+}
+
+UnmatchedStore::PacketKey 
+UnmatchedStore::createMatchingKey(const ParsedPacket& packet) const {
+    PacketKey key;
+    
+    // For matching, we swap src/dst to match the other direction
+    key.srcIP = (packet.dstIP[0] << 24) | (packet.dstIP[1] << 16) | 
+                (packet.dstIP[2] << 8) | packet.dstIP[3];
+    key.dstIP = (packet.srcIP[0] << 24) | (packet.srcIP[1] << 16) | 
+                (packet.srcIP[2] << 8) | packet.srcIP[3];
+    
+    key.srcPort = packet.dstPort;
+    key.dstPort = packet.srcPort;
+    
+    // For UDP<->TCP matching, we might need to adapt protocol
+    key.protocol = (packet.protocol == 6) ? 17 : 6; // Flip between TCP and UDP
+    
+    key.payloadHash = packet.payloadHash;
+    
+    return key;
+}
+
+// PacketKey::Hasher implementation
+size_t UnmatchedStore::PacketKey::Hasher::operator()(
+    const PacketKey& key) const {
+    
+    // FNV-1a hash
+    size_t h = 14695981039346656037ULL;
+    h ^= key.srcIP; h *= 1099511628211ULL;
+    h ^= key.dstIP; h *= 1099511628211ULL;
+    h ^= key.srcPort; h *= 1099511628211ULL;
+    h ^= key.dstPort; h *= 1099511628211ULL;
+    h ^= key.protocol; h *= 1099511628211ULL;
+    h ^= key.payloadHash; h *= 1099511628211ULL;
+    
+    return h;
+}
+
+// PacketKey equality operator
+bool UnmatchedStore::PacketKey::operator==(const PacketKey& other) const {
+    return srcIP == other.srcIP &&
+           dstIP == other.dstIP &&
+           srcPort == other.srcPort &&
+           dstPort == other.dstPort &&
+           protocol == other.protocol &&
+           payloadHash == other.payloadHash;
+}
+PacketCorrelator.h
+cppCopy#pragma once
+
+#include "IPacketCorrelator.h"
+#include "IUnmatchedStore.h"
+#include <memory>
+#include <atomic>
+
+/// Correlates related packets using an UnmatchedStore
+class PacketCorrelator : public IPacketCorrelator {
+public:
+    explicit PacketCorrelator(std::shared_ptr<IUnmatchedStore> store);
+    ~PacketCorrelator() override;
+    
+    // Implementation of IPacketCorrelator interface
+    std::optional<MatchResult> correlate(ParsedPacket&& packet) override;
+    
+    // Stats methods
+    size_t getMatchCount() const;
+    
+private:
+    std::shared_ptr<IUnmatchedStore> m_store;
+    std::atomic<size_t> m_matchCount;
+};
+PacketCorrelator.cpp
+cppCopy#include "PacketCorrelator.h"
+
+PacketCorrelator::PacketCorrelator(std::shared_ptr<IUnmatchedStore> store)
+    : m_store(std::move(store)), m_matchCount(0) {
+}
+
+PacketCorrelator::~PacketCorrelator() = default;
+
+std::optional<MatchResult> PacketCorrelator::correlate(ParsedPacket&& packet) {
+    // Try to find a matching packet
+    auto matchingPacket = m_store->retrieve(packet);
+    
+    if (matchingPacket) {
+        // Create a match result
+        MatchResult result;
+        
+        // Determine which packet is the request and which is the response
+        if (packet.direction == PacketDirection::Inbound && 
+            matchingPacket->direction == PacketDirection::Outbound) {
+            // Current packet is inbound (request), matching is outbound (response)
+            result.request = std::move(packet);
+            result.response = std::move(*matchingPacket);
+        } else {
+            // Current packet is outbound (response), matching is inbound (request)
+            result.request = std::move(*matchingPacket);
+            result.response = std::move(packet);
         }
         
-        condition_.notify_one();
+        // Calculate latency
+        result.latency = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            result.response.timestamp - result.request.timestamp);
+        
+        m_matchCount.fetch_add(1, std::memory_order_relaxed);
+        
+        return result;
+    } else {
+        // No match found, store the packet for later correlation
+        m_store->insert(packet);
+        return std::nullopt;
     }
+}
+
+size_t PacketCorrelator::getMatchCount() const {
+    return m_matchCount.load(std::memory_order_relaxed);
+}
+OutputWriter.h
+cppCopy#pragma once
+
+#include "IOutputWriter.h"
+#include <string>
+#include <fstream>
+#include <mutex>
+#include <vector>
+
+/// Writes match results to files or standard output
+class OutputWriter : public IOutputWriter {
+public:
+    explicit OutputWriter(const std::string& outputPath = "", 
+                         size_t bufferSize = 1000);
+    ~OutputWriter() override;
     
-    size_t get_thread_count() const {
-        return workers_.size();
-    }
+    // IOutputWriter interface implementation
+    void write(const MatchResult& result) override;
+    void flush() override;
     
-    size_t get_pending_tasks() const {
-        std::unique_lock<std::mutex> lock(queue_mutex_);
-        return tasks_.size();
-    }
+    // Set output file path
+    void setOutputPath(const std::string& path);
+    
+    // Get stats
+    size_t getWrittenResults() const;
+    
+private:
+    // Format a match result as a string
+    std::string formatResult(const MatchResult& result) const;
+    
+    // Open or reopen the output file
+    void openOutputFile();
+    
+    std::string m_outputPath;
+    std::ofstream m_outputFile;
+    std::mutex m_writeMutex;
+    std::vector<std::string> m_buffer;
+    size_t m_bufferSize;
+    size_t m_writtenResults;
+    bool m_useStdout;
 };
-5. Main Engine Class
-#include <spdlog/spdlog.h>
-#include <spdlog/sinks/rotating_file_sink.h>
+OutputWriter.cpp
+cppCopy#include "OutputWriter.h"
+#include <iostream>
+#include <iomanip>
+#include <sstream>
+
+OutputWriter::OutputWriter(const std::string& outputPath, size_t bufferSize)
+    : m_outputPath(outputPath), 
+      m_bufferSize(bufferSize),
+      m_writtenResults(0),
+      m_useStdout(outputPath.empty()) {
+    
+    m_buffer.reserve(m_bufferSize);
+    
+    if (!m_useStdout) {
+        openOutputFile();
+    }
+}
+
+OutputWriter::~OutputWriter() {
+    flush();
+    
+    if (m_outputFile.is_open()) {
+        m_outputFile.close();
+    }
+}
+
+void OutputWriter::write(const MatchResult& result) {
+    std::string formatted = formatResult(result);
+    
+    std::lock_guard<std::mutex> lock(m_writeMutex);
+    
+    m_buffer.push_back(std::move(formatted));
+    m_writtenResults++;
+    
+    if (m_buffer.size() >= m_bufferSize) {
+        flush();
+    }
+}
+
+void OutputWriter::flush() {
+    std::lock_guard<std::mutex> lock(m_writeMutex);
+    
+    if (m_buffer.empty()) {
+        return;
+    }
+    
+    if (m_useStdout) {
+        // Write to stdout
+        for (const auto& line : m_buffer) {
+            std::cout << line << std::endl;
+        }
+    } else {
+        // Write to file
+        if (!m_outputFile.is_open()) {
+            openOutputFile();
+        }
+        
+        for (const auto& line : m_buffer) {
+            m_outputFile << line << std::endl;
+        }
+        
+        m_outputFile.flush();
+    }
+    
+    m_buffer.clear();
+}
+
+void OutputWriter::setOutputPath(const std::string& path) {
+    std::lock_guard<std::mutex> lock(m_writeMutex);
+    
+    // Flush current buffer
+    flush();
+    
+    // Close current file if open
+    if (m_outputFile.is_open()) {
+        m_outputFile.close();
+    }
+    
+    m_outputPath = path;
+    m_useStdout = path.empty();
+    
+    if (!m_useStdout) {
+        openOutputFile();
+    }
+}
+
+size_t OutputWriter::getWrittenResults() const {
+    return m_writtenResults;
+}
+
+std::string OutputWriter::formatResult(const MatchResult& result) const {
+    std::ostringstream oss;
+    
+    // Format IP addresses
+    auto formatIP = [](const std::array<uint8_t, 4>& ip) {
+        std::ostringstream ip_oss;
+        ip_oss << static_cast<int>(ip[0]) << "."
+               << static_cast<int>(ip[1]) << "."
+               << static_cast<int>(ip[2]) << "."
+               << static_cast<int>(ip[3]);
+        return ip_oss.str();
+    };
+    
+    // Format timestamp
+    auto formatTime = [](const std::chrono::steady_clock::time_point& time) {
+        // This is a placeholder since steady_clock doesn't convert to system time easily
+        auto duration = time.time_since_epoch();
+        auto micros = std::chrono::duration_cast<std::chrono::microseconds>(duration).count();
+        return std::to_string(micros);
+    };
+    
+    // Request information
+    oss << "REQ: " << formatIP(result.request.srcIP) << ":" << result.request.srcPort
+        << " -> " << formatIP(result.request.dstIP) << ":" << result.request.dstPort
+        << " [" << (result.request.protocol == 17 ? "UDP" : "TCP") << "] "
+        << "Time: " << formatTime(result.request.timestamp) << std::endl;
+    
+    // Response information
+    oss << "RES: " << formatIP(result.response.srcIP) << ":" << result.response.srcPort
+        << " -> " << formatIP(result.response.dstIP) << ":" << result.response.dstPort
+        << " [" << (result.response.protocol == 17 ? "UDP" : "TCP") << "] "
+        << "Time: " << formatTime(result.response.timestamp) << std::endl;
+    
+    // Latency information
+    oss << "LATENCY: " << result.latency.count() << " ns";
+    
+    return oss.str();
+}
+
+void OutputWriter::openOutputFile() {
+    m_outputFile.open(m_outputPath, std::ios::out | std::ios::app);
+    
+    if (!m_outputFile.is_open()) {
+        // Fall back to stdout if file can't be opened
+        std::cerr << "Warning: Could not open output file " << m_outputPath 
+                  << ". Using stdout instead." << std::endl;
+        m_useStdout = true;
+    }
+}
+WorkerPool.h
+cppCopy#pragma once
+
+#include <vector>
+#include <thread>
+#include <functional>
+#include <atomic>
+#include <string>
+
+/// Manages a pool of worker threads for packet processing
+class WorkerPool {
+public:
+    using WorkerFunction = std::function<void(size_t)>;
+    
+    WorkerPool(size_t threadCount = 0);
+    ~WorkerPool();
+    
+    // Start workers with the given function
+    void start(WorkerFunction workerFunc);
+    
+    // Stop all workers and join them
+    void stop();
+    
+    // Check if the pool is running
+    bool isRunning() const;
+    
+    // Get the number of threads
+    size_t getThreadCount() const;
+    
+private:
+    std::vector<std::thread> m_workers;
+    std::atomic<bool> m_running;
+    size_t m_threadCount;
+};
+WorkerPool.cpp
+cppCopy#include "WorkerPool.h"
+#include <thread>
+
+WorkerPool::WorkerPool(size_t threadCount)
+    : m_running(false) {
+    
+    // If thread count is 0, use hardware concurrency
+    if (threadCount == 0) {
+        m_threadCount = std::thread::hardware_concurrency();
+        // Ensure at least 1 thread
+        if (m_threadCount == 0) {
+            m_threadCount = 1;
+        }
+    } else {
+        m_threadCount = threadCount;
+    }
+}
+
+WorkerPool::~WorkerPool() {
+    stop();
+}
+
+void WorkerPool::start(WorkerFunction workerFunc) {
+    if (m_running) {
+        return; // Already running
+    }
+    
+    m_running = true;
+    
+    m_workers.clear();
+    m_workers.reserve(m_threadCount);
+    
+    for (size_t i = 0; i < m_threadCount; ++i) {
+        m_workers.emplace_back([this, workerFunc, i]() {
+            workerFunc(i);
+        });
+    }
+}
+
+void WorkerPool::stop() {
+    if (!m_running) {
+        return; // Not running
+    }
+    
+    m_running = false;
+    
+    // Join all threads
+    for (auto& worker : m_workers) {
+        if (worker.joinable()) {
+            worker.join();
+        }
+    }
+    
+    m_workers.clear();
+}
+
+bool WorkerPool::isRunning() const {
+    return m_running;
+}
+
+size_t WorkerPool::getThreadCount() const {
+    return m_threadCount;
+}
+Engine.h
+cppCopy#pragma once
+
+#include "BufferPool.h"
+#include "WorkerPool.h"
+#include "IPacketProducer.h"
+#include "IPacketParser.h"
+#include "IPacketCorrelator.h"
+#include "IUnmatchedStore.h"
+#include "IOutputWriter.h"
+#include "RawPacket.h"
+#include "ParsedPacket.h"
+#include "MatchResult.h"
+#include "rigtorp/MPMCQueue.h"
+#include <memory>
+#include <atomic>
+#include <chrono>
+
+/// Core engine that orchestrates the packet processing pipeline
+class Engine {
+public:
+    Engine(size_t queueSize = 10000, 
+          size_t bufferPoolSize = 20000,
+          size_t parserThreads = 0,
+          size_t correlatorThreads = 0);
+    ~Engine();
+    
+    // Set components
+    void setPacketProducer(std::shared_ptr<IPacketProducer> producer);
+    void setPacketParser(std::shared_ptr<IPacketParser> parser);
+    void setPacketCorrelator(std::shared_ptr<IPacketCorrelator> correlator);
+    void setUnmatchedStore(std::shared_ptr<IUnmatchedStore> store);
+    void setOutputWriter(std::shared_ptr<IOutputWriter> writer);
+    
+    // Start and stop the engine
+    void start();
+    void stop();
+    
+    // Status check
+    bool isRunning() const;
+    
+    // Configuration
+    void setCleanupInterval(std::chrono::milliseconds interval);
+    
+    // Stats
+    struct Statistics {
+        size_t rawPacketsProcessed;
+        size_t parsedPacketsProcessed;
+        size_t matchesFound;
+        size_t unmatchedPackets;
+        size_t outputsWritten;
+        size_t buffersAvailable;
+        size_t totalBuffers;
+    };
+    
+    Statistics getStatistics() const;
+    
+private:
+    // Worker functions
+    void parserWorker(size_t workerId);
+    void correlatorWorker(size_t workerId);
+    void cleanupWorker();
+    
+    // Queue handling
+    void onRawPacket(RawPacket&& packet);
+    
+    // Components
+    std::shared_ptr<IPacketProducer> m_packetProducer;
+    std::shared_ptr<IPacketParser> m_packetParser;
+    std::shared_ptr<IPacketCorrelator> m_packetCorrelator;
+    std::shared_ptr<IUnmatchedStore> m_unmatchedStore;
+    std::shared_ptr<IOutputWriter> m_outputWriter;
+    
+    // Thread pools
+    std::unique_ptr<WorkerPool> m_parserPool;
+    std::unique_ptr<WorkerPool> m_correlatorPool;
+    std::unique_ptr<std::thread> m_cleanupThread;
+    
+    // Queues
+    rigtorp::MPMCQueue<RawPacket> m_rawPacketQueue;
+    rigtorp::MPMCQueue<ParsedPacket> m_parsedPacketQueue;
+    
+    // Buffer pool
+    BufferPool m_bufferPool;
+    
+    // State
+    std::atomic<bool> m_running;
+    std::chrono::milliseconds m_cleanupInterval;
+    
+    // Stats
+    std::atomic<size_t> m_rawPacketsProcessed;
+    std::atomic<size_t> m_parsedPacketsProcessed;
+};
+Engine.cpp
+cppCopy#include "Engine.h"
+#include <iostream>
+#include <thread>
+
+Engine::Engine(size_t queueSize, 
+               size_t bufferPoolSize,
+               size_t parserThreads,
+               size_t correlatorThreads)
+    : m_rawPacketQueue(queueSize),
+      m_parsedPacketQueue(queueSize),
+      m_bufferPool(bufferPoolSize),
+      m_running(false),
+      m_cleanupInterval(std::chrono::seconds(5)),
+      m_rawPacketsProcessed(0),
+      m_parsedPacketsProcessed(0) {
+    
+    m_parserPool = std::make_unique<WorkerPool>(parserThreads);
+    m_correlatorPool = std::make_unique<WorkerPool>(correlatorThreads);
+}
+
+Engine::~Engine() {
+    stop();
+}
+
+void Engine::setPacketProducer(std::shared_ptr<IPacketProducer> producer) {
+    m_packetProducer = std::move(producer);
+}
+
+void Engine::setPacketParser(std::shared_ptr<IPacketParser> parser) {
+    m_packetParser = std::move(parser);
+}
+
+void Engine::setPacketCorrelator(std::shared_ptr<IPacketCorrelator> correlator) {
+    m_packetCorrelator = std::move(correlator);
+}
+
+void Engine::setUnmatchedStore(std::shared_ptr<IUnmatchedStore> store) {
+    m_unmatchedStore = std::move(store);
+}
+
+void Engine::setOutputWriter(std::shared_ptr<IOutputWriter> writer) {
+    m_outputWriter = std::move(writer);
+}
+
+void Engine::start() {
+    if (m_running) {
+        return; // Already running
+    }
+    
+    // Validate components
+    if (!m_packetProducer || !m_packetParser || !m_packetCorrelator ||
+        !m_unmatchedStore || !m_outputWriter) {
+        throw std::runtime_error("Engine components not fully configured");
+    }
+    
+    m_running = true;
+    
+    // Start worker pools
+    m_parserPool->start([this](size_t id) { parserWorker(id); });
+    m_correlatorPool->start([this](size_t id) { correlatorWorker(id); });
+    
+    // Start cleanup thread
+    m_cleanupThread = std::make_unique<std::thread>([this]() { cleanupWorker(); });
+    
+    // Start packet producer
+    m_packetProducer->run([this](RawPacket&& packet) {
+        onRawPacket(std::move(packet));
+    });
+}
+
+void Engine::stop() {
+    if (!m_running) {
+        return; // Not running
+    }
+    
+    m_running = false;
+    
+    // Stop producer
+    if (m_packetProducer) {
+        m_packetProducer->stop();
+    }
+    
+    // Stop worker pools
+    m_parserPool->stop();
+    m_correlatorPool->stop();
+    
+    // Stop cleanup thread
+    if (m_cleanupThread && m_cleanupThread->joinable()) {
+        m_cleanupThread->join();
+    }
+    
+    // Flush any remaining output
+    if (m_outputWriter) {
+        m_outputWriter->flush();
+    }
+}
+
+bool Engine::isRunning() const {
+    return m_running;
+}
+
+void Engine::setCleanupInterval(std::chrono::milliseconds interval) {
+    m_cleanupInterval = interval;
+}
+
+Engine::Statistics Engine::getStatistics() const {
+    Statistics stats;
+    
+    stats.rawPacketsProcessed = m_rawPacketsProcessed.load(std::memory_order_relaxed);
+    stats.parsedPacketsProcessed = m_parsedPacketsProcessed.load(std::memory_order_relaxed);
+    
+    // Get stats from components
+    if (m_packetCorrelator) {
+        auto* correlator = dynamic_cast<PacketCorrelator*>(m_packetCorrelator.get());
+        if (correlator) {
+            stats.matchesFound = correlator->getMatchCount();
+        } else {
+            stats.matchesFound = 0;
+        }
+    } else {
+        stats.matchesFound = 0;
+    }
+    
+    if (m_unmatchedStore) {
+        auto* store = dynamic_cast<UnmatchedStore*>(m_unmatchedStore.get());
+        if (store) {
+            stats.unmatchedPackets = store->getTotalStoredPackets();
+        } else {
+            stats.unmatchedPackets = 0;
+        }
+    } else {
+        stats.unmatchedPackets = 0;
+    }
+    
+    if (m_outputWriter) {
+        auto* writer = dynamic_cast<OutputWriter*>(m_outputWriter.get());
+        if (writer) {
+            stats.outputsWritten = writer->getWrittenResults();
+        } else {
+            stats.outputsWritten = 0;
+        }
+    } else {
+        stats.outputsWritten = 0;
+    }
+    
+    stats.buffersAvailable = m_bufferPool.getAvailableBuffers();
+    stats.totalBuffers = m_bufferPool.getTotalBuffers();
+    
+    return stats;
+}
+
+void Engine::parserWorker(size_t workerId) {
+    RawPacket rawPacket;
+    
+    while (m_running) {
+        if (m_rawPacketQueue.try_pop(rawPacket)) {
+            // Parse the packet
+            ParsedPacket parsedPacket = m_packetParser->parse(rawPacket);
+            
+            // Release the buffer back to the pool
+            m_bufferPool.release(std::move(rawPacket.buffer));
+            
+            // Push to the parsed packet queue
+            m_parsedPacketQueue.emplace(std::move(parsedPacket));
+            
+            m_parsedPacketsProcessed.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            // No packet to process, yield to other threads
+            std::this_thread::yield();
+        }
+    }
+}
+
+void Engine::correlatorWorker(size_t workerId) {
+    ParsedPacket parsedPacket;
+    
+    while (m_running) {
+        if (m_parsedPacketQueue.try_pop(parsedPacket)) {
+            // Try to correlate the packet
+            auto matchResult = m_packetCorrelator->correlate(std::move(parsedPacket));
+            
+            // If we got a match, write it to output
+            if (matchResult) {
+                m_outputWriter->write(*matchResult);
+            }
+        } else {
+            // No packet to process, yield to other threads
+            std::this_thread::yield();
+        }
+    }
+}
+
+void Engine::cleanupWorker() {
+    while (m_running) {
+        // Sleep for the cleanup interval
+        std::this_thread::sleep_for(m_cleanupInterval);
+        
+        // Cleanup unmatched packets
+        if (m_running && m_unmatchedStore) {
+            m_unmatchedStore->cleanupExpired();
+        }
+        
+        // Flush output periodically
+        if (m_running && m_outputWriter) {
+            m_outputWriter->flush();
+        }
+    }
+}
+
+void Engine::onRawPacket(RawPacket&& packet) {
+    // Simply push to the raw packet queue
+    if (m_rawPacketQueue.try_emplace(std::move(packet))) {
+        m_rawPacketsProcessed.fetch_add(1, std::memory_order_relaxed);
+    } else {
+        // Queue is full, buffer will be destroyed
+        // Could log this as packet drop
+    }
+}
+Main Application Entry Point
+main.cpp
+cppCopy#include "PacketMatchingEngine/Engine.h"
+#include "PacketMatchingEngine/PacketProducer.h"
+#include "PacketMatchingEngine/PacketParser.h"
+#include "PacketMatchingEngine/PacketCorrelator.h"
+#include "PacketMatchingEngine/UnmatchedStore.h"
+#include "PacketMatchingEngine/OutputWriter.h"
+#include <iostream>
+#include <csignal>
 #include <chrono>
 #include <thread>
 #include <atomic>
-#include <fstream>
-class PacketMatchingEngine {
-private:
-    // Components
-    PcapStreamReader pcap_reader_;
-    PacketParser packet_parser_;
-    PacketCorrelator packet_correlator_;
-    WorkerPool worker_pool_;
-    
-    // Engine state
-    std::atomic<bool> running_{false};
-    std::thread main_thread_;
-    std::thread output_thread_;
-    std::string output_file_path_;
-    
-    // Stats
-    std::atomic<size_t> processed_packets_{0};
-    std::atomic<size_t> failed_parse_{0};
-    std::chrono::time_point<std::chrono::steady_clock> start_time_;
-    
-    void main_loop() {
-        spdlog::info("Main processing loop started");
-        
-        while (running_) {
-            // Get next packet from the reader
-            struct pcap_pkthdr header;
-            std::vector<u_char> packet_data;
-            
-            if (pcap_reader_.get_next_packet(header, packet_data)) {
-                // Increment counter
-                processed_packets_++;
-                
-                // Submit packet for processing
-                worker_pool_.enqueue([this, header, packet_data = std::move(packet_data)]() {
-                    // Parse packet
-                    auto packet_info = packet_parser_.parse_packet(header, packet_data);
-                    
-                    if (!packet_info) {
-                        failed_parse_++;
-                        return;
-                    }
-                    
-                    // Send to correlator
-                    packet_correlator_.process_packet(*packet_info);
-                });
-            } else {
-                // No packets available, sleep briefly
-                std::this_thread::sleep_for(std::chrono::milliseconds(10));
-            }
-            
-            // Periodically log stats (every 10000 packets)
-            if (processed_packets_ % 10000 == 0) {
-                log_stats();
-            }
-        }
-        
-        spdlog::info("Main processing loop stopped");
-    }
-    
-    void output_loop() {
-        spdlog::info("Output loop started");
-        
-        std::ofstream output_file(output_file_path_, std::ios::app);
-        if (!output_file) {
-            spdlog::error("Failed to open output file: {}", output_file_path_);
-            return;
-        }
-        
-        // Write header if file is empty
-        if (output_file.tellp() == 0) {
-            output_file << "inbound_timestamp,outbound_timestamp,latency_ns,"
-                        << "src_ip,dst_ip,src_port,dst_port,protocol\n";
-        }
-        
-        while (running_) {
-            // Get matches from correlator
-            auto matches = packet_correlator_.get_matches(1000);
-            
-            // Write matches to file
-            for (const auto& match : matches) {
-                output_file << match.inbound_packet.timestamp_ns << ","
-                           << match.outbound_packet.timestamp_ns << ","
-                           << match.latency_ns << ","
-                           << match.inbound_packet.key.src_ip << ","
-                           << match.inbound_packet.key.dst_ip << ","
-                           << match.inbound_packet.key.src_port << ","
-                           << match.inbound_packet.key.dst_port << ","
-                           << static_cast<int>(match.inbound_packet.key.protocol) << "\n";
-            }
-            
-            output_file.flush();
-            
-            // Sleep if no matches were found
-            if (matches.empty()) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(100));
-            }
-        }
-        
-        // Process any remaining matches
-        auto final_matches = packet_correlator_.get_matches();
-        for (const auto& match : final_matches) {
-            output_file << match.inbound_packet.timestamp_ns << ","
-                       << match.outbound_packet.timestamp_ns << ","
-                       << match.latency_ns << ","
-                       << match.inbound_packet.key.src_ip << ","
-                       << match.inbound_packet.key.dst_ip << ","
-                       << match.inbound_packet.key.src_port << ","
-                       << match.inbound_packet.key.dst_port << ","
-                       << static_cast<int>(match.inbound_packet.key.protocol) << "\n";
-        }
-        
-        output_file.close();
-        spdlog::info("Output loop stopped");
-    }
-    
-    void log_stats() {
-        auto now = std::chrono::steady_clock::now();
-        auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - start_time_).count();
-        
-        if (elapsed == 0) elapsed = 1;  // Avoid division by zero
-        
-        auto correlator_stats = packet_correlator_.get_stats();
-        
-        spdlog::info("--- Performance Statistics ---");
-        spdlog::info("Running time: {}s", elapsed);
-        spdlog::info("Processed packets: {} ({}/s)", 
-                     processed_packets_.load(), processed_packets_.load() / elapsed);
-        spdlog::info("Failed to parse: {} ({:.2f}%)", 
-                     failed_parse_.load(), 
-                     100.0 * failed_parse_.load() / std::max<size_t>(1, processed_packets_.load()));
-        spdlog::info("Inbound packets: {}", correlator_stats.inbound_packets);
-        spdlog::info("Outbound packets: {}", correlator_stats.outbound_packets);
-        spdlog::info("Matched pairs: {}", correlator_stats.matched_pairs);
-        spdlog::info("Unmatched inbound: {}", correlator_stats.unmatched_inbound);
-        spdlog::info("Unmatched outbound: {}", correlator_stats.unmatched_outbound);
-        spdlog::info("Expired packets: {}", correlator_stats.expired_packets);
-        spdlog::info("Worker queue size: {}", worker_pool_.get_pending_tasks());
-        spdlog::info("Reader queue size: {}", pcap_reader_.queue_size());
-    }
-    
-public:
-    PacketMatchingEngine(
-        size_t max_queue_size = 10000,
-        size_t num_worker_threads = 4,
-        std::chrono::milliseconds retention_time = std::chrono::seconds(30),
-        std::chrono::milliseconds max_latency = std::chrono::seconds(5),
-        const std::string& output_path = "packet_matches.csv")
-        : pcap_reader_(max_queue_size),
-          packet_correlator_(retention_time, max_latency),
-          worker_pool_(num_worker_threads),
-          output_file_path_(output_path) {
-        
-        // Initialize logging
-        try {
-            auto rotating_logger = spdlog::rotating_logger_mt(
-                "packet_engine", "logs/packet_engine.log", 
-                10 * 1024 * 1024,  // 10 MB max file size
-                5);                // Keep 5 files
-            spdlog::set_default_logger(rotating_logger);
-            spdlog::flush_on(spdlog::level::info);
-        } catch (const spdlog::spdlog_ex& ex) {
-            std::cerr << "Log initialization failed: " << ex.what() << std::endl;
-        }
-    }
-    
-    ~PacketMatchingEngine() {
-        stop();
-    }
-    
-    void configure_parser(
-        const std::vector<std::pair<uint32_t, uint32_t>>& inbound_ranges,
-        const std::vector<std::pair<uint32_t, uint32_t>>& outbound_ranges) {
-        packet_parser_.configure_direction_rules(inbound_ranges, outbound_ranges);
-    }
-    
-    void start(const std::string& pcap_directory) {
-        if (running_) return;
-        
-        spdlog::info("Starting packet matching engine");
-        running_ = true;
-        start_time_ = std::chrono::steady_clock::now();
-        
-        // Start components
-        packet_correlator_.start();
-        pcap_reader_.start(pcap_directory);
-        
-        // Start processing threads
-        main_thread_ = std::thread(&PacketMatchingEngine::main_loop, this);
-        output_thread_ = std::thread(&PacketMatchingEngine::output_loop, this);
-        
-        spdlog::info("Packet matching engine started");
-    }
-    
-    void stop() {
-        if (!running_) return;
-        
-        spdlog::info("Stopping packet matching engine");
-        running_ = false;
-        
-        // Wait for threads to finish
-        if (main_thread_.joinable()) {
-            main_thread_.join();
-        }
-        
-        if (output_thread_.joinable()) {
-            output_thread_.join();
-        }
-        
-        // Stop components
-        pcap_reader_.stop();
-        packet_correlator_.stop();
-        
-        // Log final stats
-        log_stats();
-        
-        spdlog::info("Packet matching engine stopped");
-    }
-    
-    // Get current statistics
-    struct EngineStats {
-        size_t processed_packets;
-        size_t failed_parse;
-        size_t inbound_packets;
-        size_t outbound_packets;
-        size_t matched_pairs;
-        size_t unmatched_inbound;
-        size_t unmatched_outbound;
-        size_t expired_packets;
-        size_t worker_queue_size;
-        size_t reader_queue_size;
-        double runtime_seconds;
-        double packets_per_second;
-    };
-    
-    EngineStats get_stats() const {
-        auto now = std::chrono::steady_clock::now();
-        auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - start_time_).count();
-        
-        auto correlator_stats = packet_correlator_.get_stats();
-        
-        EngineStats stats;
-        stats.processed_packets = processed_packets_;
-        stats.failed_parse = failed_parse_;
-        stats.inbound_packets = correlator_stats.inbound_packets;
-        stats.outbound_packets = correlator_stats.outbound_packets;
-        stats.matched_pairs = correlator_stats.matched_pairs;
-        stats.unmatched_inbound = correlator_stats.unmatched_inbound;
-        stats.unmatched_outbound = correlator_stats.unmatched_outbound;
-        stats.expired_packets = correlator_stats.expired_packets;
-        stats.worker_queue_size = worker_pool_.get_pending_tasks();
-        stats.reader_queue_size = pcap_reader_.queue_size();
-        stats.runtime_seconds = elapsed;
-        stats.packets_per_second = elapsed > 0 ? static_cast<double>(processed_packets_) / elapsed : 0;
-        
-        return stats;
-    }
-};
 
-6. Main Program and Configuration
-#include <iostream>
-#include <string>
-#include <vector>
-#include <csignal>
-#include <unistd.h>
+// Global engine pointer for signal handling
+static std::shared_ptr<Engine> g_engine;
+static std::atomic<bool> g_running(true);
 
-// Global reference for signal handling
-PacketMatchingEngine* g_engine = nullptr;
-
-void signal_handler(int signal) {
+// Signal handler
+void signalHandler(int signal) {
+    std::cout << "Received signal " << signal << ", shutting down..." << std::endl;
+    g_running = false;
+    
     if (g_engine) {
-        std::cout << "Received signal " << signal << ", shutting down..." << std::endl;
         g_engine->stop();
     }
 }
 
-// Helper function to convert IP string to uint32_t
-uint32_t ip_to_uint32(const std::string& ip_str) {
-    struct in_addr addr;
-    if (inet_pton(AF_INET, ip_str.c_str(), &addr) != 1) {
-        throw std::runtime_error("Invalid IP address: " + ip_str);
-    }
-    return ntohl(addr.s_addr);
+void printStatistics(const Engine::Statistics& stats) {
+    std::cout << "=== Packet Matching Engine Statistics ===" << std::endl;
+    std::cout << "Raw packets processed: " << stats.rawPacketsProcessed << std::endl;
+    std::cout << "Parsed packets processed: " << stats.parsedPacketsProcessed << std::endl;
+    std::cout << "Matches found: " << stats.matchesFound << std::endl;
+    std::cout << "Unmatched packets: " << stats.unmatchedPackets << std::endl;
+    std::cout << "Outputs written: " << stats.outputsWritten << std::endl;
+    std::cout << "Buffer pool: " << stats.buffersAvailable << "/" 
+              << stats.totalBuffers << " available" << std::endl;
+    std::cout << "=======================================" << std::endl;
 }
 
 int main(int argc, char* argv[]) {
-    try {
-        // Parse command line arguments
-        if (argc < 2) {
-            std::cerr << "Usage: " << argv[0] << " <pcap_directory> [output_file]" << std::endl;
-            return 1;
-        }
-        
-        std::string pcap_directory = argv[1];
-        std::string output_file = argc > 2 ? argv[2] : "packet_matches.csv";
-        
-        // Configure the engine
-        size_t num_threads = std::thread::hardware_concurrency();
-        size_t queue_size = 100000;  // Adjust based on expected traffic volume
-        std::chrono::milliseconds retention_time(30000);  // 30 seconds
-        std::chrono::milliseconds max_latency(5000);      // 5 seconds
-        
-        // Create engine
-        PacketMatchingEngine engine(queue_size, num_threads, retention_time, max_latency, output_file);
-        g_engine = &engine;
-        
-        // Set up signal handlers
-        signal(SIGINT, signal_handler);
-        signal(SIGTERM, signal_handler);
-        
-        // Configure network direction rules
-        // Example: 192.168.1.0/24 as inbound, 10.0.0.0/8 as outbound
-        std::vector<std::pair<uint32_t, uint32_t>> inbound_ranges = {
-            {ip_to_uint32("192.168.1.0"), ip_to_uint32("192.168.1.255")}
-        };
-        
-        std::vector<std::pair<uint32_t, uint32_t>> outbound_ranges = {
-            {ip_to_uint32("10.0.0.0"), ip_to_uint32("10.255.255.255")}
-        };
-        
-        engine.configure_parser(inbound_ranges, outbound_ranges);
-        
-        // Start the engine
-        std::cout << "Starting packet matching engine..." << std::endl;
-        std::cout << "Monitoring directory: " << pcap_directory << std::endl;
-        std::cout << "Writing results to: " << output_file << std::endl;
-        std::cout << "Press Ctrl+C to stop" << std::endl;
-        
-        engine.start(pcap_directory);
-        
-        // Main thread just waits for signals
-        while (true) {
-            sleep(10);
-            
-            // Print stats periodically
-            auto stats = engine.get_stats();
-            std::cout << "Processed: " << stats.processed_packets 
-                     << " packets (" << stats.packets_per_second << "/s), "
-                     << "Matches: " << stats.matched_pairs << std::endl;
+    // Parse command line arguments
+    std::string inputDir = ".";
+    std::string outputFile = "";
+    
+    for (int i = 1; i < argc; i++) {
+        std::string arg = argv[i];
+        if (arg == "-i" || arg == "--input") {
+            if (i + 1 < argc) {
+                inputDir = argv[++i];
+            }
+        } else if (arg == "-o" || arg == "--output") {
+            if (i + 1 < argc) {
+                outputFile = argv[++i];
+            }
+        } else if (arg == "-h" || arg == "--help") {
+            std::cout << "Usage: " << argv[0] << " [options]" << std::endl;
+            std::cout << "Options:" << std::endl;
+            std::cout << "  -i, --input DIR    Directory to monitor for PCAP files" << std::endl;
+            std::cout << "  -o, --output FILE  Output file (stdout if not specified)" << std::endl;
+            std::cout << "  -h, --help         Show this help message" << std::endl;
+            return 0;
         }
     }
-    catch (const std::exception& e) {
+    
+    // Setup signal handlers
+    std::signal(SIGINT, signalHandler);
+    std::signal(SIGTERM, signalHandler);
+    
+    try {
+        // Create and configure engine
+        g_engine = std::make_shared<Engine>(10000, 20000);
+        
+        // Create components
+        auto producer = std::make_shared<PacketProducer>(
+            g_engine->getBufferPool(), 
+            g_engine->getRawPacketQueue());
+        producer->setSourceDirectory(inputDir);
+        
+        auto parser = std::make_shared<PacketParser>();
+        auto store = std::make_shared<UnmatchedStore>(
+            std::chrono::seconds(30), 16);
+        auto correlator = std::make_shared<PacketCorrelator>(store);
+        auto writer = std::make_shared<OutputWriter>(outputFile);
+        
+        // Set components in engine
+        g_engine->setPacketProducer(producer);
+        g_engine->setPacketParser(parser);
+        g_engine->setUnmatchedStore(store);
+        g_engine->setPacketCorrelator(correlator);
+        g_engine->setOutputWriter(writer);
+        
+        // Start the engine
+        g_engine->start();
+        
+        std::cout << "Packet Matching Engine started." << std::endl;
+        std::cout << "Monitoring directory: " << inputDir << std::endl;
+        std::cout << "Output: " << (outputFile.empty() ? "stdout" : outputFile) << std::endl;
+        std::cout << "Press Ctrl+C to stop." << std::endl;
+        
+        // Main loop - print statistics periodically
+        while (g_running) {
+            std::this_thread::sleep_for(std::chrono::seconds(5));
+            
+            if (g_running) {
+                printStatistics(g_engine->getStatistics());
+            }
+        }
+        
+        // Final statistics
+        std::cout << "Final statistics:" << std::endl;
+        printStatistics(g_engine->getStatistics());
+        
+    } catch (const std::exception& e) {
         std::cerr << "Error: " << e.what() << std::endl;
         return 1;
     }
     
+    std::cout << "Packet Matching Engine stopped." << std::endl;
     return 0;
 }
+This implementation incorporates all of our optimizations:
+
+✅ Memory-mapped file I/O for faster PCAP processing
+✅ Buffer pool for minimizing allocations
+✅ Zero-copy parsing with std::span
+✅ Lock-free queues with rigtorp::MPMCQueue
+✅ Proper move semantics throughout
+✅ Thread pool for parallel processing
+✅ Sharded storage in UnmatchedStore
+✅ Clean header/implementation separation
+✅ Atomic operations for statistics
+✅ Graceful shutdown handling
+
+The code follows the provided directory structure with proper organization of interfaces, implementations, and data structures.Add to Conversation
