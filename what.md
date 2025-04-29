@@ -1,3 +1,104 @@
+void MMapHandler::unmapCurrentFile() {
+    try {
+        PME_LOG_INFO(log_, "MMapHandler::unmapCurrentFile - starting");
+        
+        // Print current state for debugging
+        PME_LOG_DEBUG(log_, "Current state - mapped data: " << (m_mappedData ? "exists" : "null") 
+                           << ", fd: " << m_fd
+                           << ", size: " << m_mappedSize);
+        
+        if (m_mappedData && m_mappedData != MAP_FAILED) {
+            PME_LOG_DEBUG(log_, "About to unmap memory at " << static_cast<const void*>(m_mappedData));
+            
+            int result = munmap(m_mappedData, m_mappedSize);
+            if (result == -1) {
+                PME_LOG_ERROR(log_, "Failed to unmap file: " << strerror(errno));
+            } else {
+                PME_LOG_DEBUG(log_, "Memory unmapped successfully");
+            }
+        } else {
+            PME_LOG_DEBUG(log_, "No valid mapped data to unmap");
+        }
+        
+        m_mappedData = nullptr;
+        
+        if (m_fd != -1) {
+            PME_LOG_DEBUG(log_, "About to close file descriptor " << m_fd);
+            
+            int result = close(m_fd);
+            if (result == -1) {
+                PME_LOG_ERROR(log_, "Failed to close file descriptor: " << strerror(errno));
+            } else {
+                PME_LOG_DEBUG(log_, "File descriptor closed successfully");
+            }
+        } else {
+            PME_LOG_DEBUG(log_, "No file descriptor to close");
+        }
+        
+        m_fd = -1;
+        m_mappedSize = 0;
+        
+        if (!m_currentFilePath.empty()) {
+            PME_LOG_INFO(log_, "Unmapped file: " << m_currentFilePath);
+            m_currentFilePath.clear();
+        } else {
+            PME_LOG_DEBUG(log_, "No current file path to clear");
+        }
+        
+        PME_LOG_INFO(log_, "MMapHandler::unmapCurrentFile - completed unmapping");
+        
+        // Store callback locally to prevent any issues if this gets cleared during execution
+        auto handler = m_completionHandler;
+        if (handler) {
+            PME_LOG_DEBUG(log_, "About to call completion handler");
+            handler();
+            PME_LOG_DEBUG(log_, "Completion handler finished");
+        } else {
+            PME_LOG_DEBUG(log_, "No completion handler to call");
+        }
+        
+        PME_LOG_INFO(log_, "MMapHandler::unmapCurrentFile - finished");
+    }
+    catch (const std::exception& e) {
+        PME_LOG_ERROR(log_, "Exception in unmapCurrentFile: " << e.what());
+    }
+    catch (...) {
+        PME_LOG_ERROR(log_, "Unknown exception in unmapCurrentFile");
+    }
+}
+
+bool MMapHandler::processFile(const std::string& filePath) {
+    try {
+        PME_LOG_INFO(log_, "MMapHandler::processFile called for " << filePath);
+        
+        // Clean up previous mapping if any
+        PME_LOG_DEBUG(log_, "Calling unmapCurrentFile to clean up previous mapping");
+        unmapCurrentFile();
+        
+        PME_LOG_INFO(log_, "Processing file: " << filePath);
+        
+        // Open the file
+        PME_LOG_DEBUG(log_, "Opening file: " << filePath);
+        m_fd = open(filePath.c_str(), O_RDONLY);
+        if (m_fd == -1) {
+            PME_LOG_ERROR(log_, "Failed to open file: " << filePath << " - " << strerror(errno));
+            return false;
+        }
+        PME_LOG_DEBUG(log_, "File opened successfully, fd=" << m_fd);
+        
+        // Rest of the method...
+        // ... (existing code with debug logs)
+    }
+    catch (const std::exception& e) {
+        PME_LOG_ERROR(log_, "Exception in processFile: " << e.what());
+        return false;
+    }
+    catch (...) {
+        PME_LOG_ERROR(log_, "Unknown exception in processFile");
+        return false;
+    }
+}
+
 // In MMapHandler.cpp
 
 bool MMapHandler::processFile(const std::string& filePath) {
