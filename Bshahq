@@ -1,0 +1,1737 @@
+# Comprehensive Guide to Using PcapPlusPlus: From PCAP Files to TCP/UDP Packet Processing
+
+## Table of Contents
+1. [Introduction to PcapPlusPlus](#introduction-to-pcapplusplus)
+2. [Setting Up PcapPlusPlus](#setting-up-pcapplusplus)
+3. [Reading PCAP Files](#reading-pcap-files)
+4. [Packet Dissection and Analysis](#packet-dissection-and-analysis)
+5. [TCP Stream Reassembly](#tcp-stream-reassembly)
+6. [Handling UDP Packet Drops](#handling-udp-packet-drops)
+7. [Advanced PcapPlusPlus Techniques](#advanced-pcapplusplus-techniques)
+8. [Best Practices and Optimization](#best-practices-and-optimization)
+9. [Troubleshooting](#troubleshooting)
+
+## Introduction to PcapPlusPlus
+
+PcapPlusPlus is a multiplatform C++ library for packet processing that provides a framework for parsing, creating, and manipulating network packets. It offers powerful capabilities for working with PCAP files and network traffic analysis.
+
+```cpp
+// PcapPlusPlus main header files
+#include "PcapLiveDeviceList.h"
+#include "PcapFileDevice.h"
+#include "NetworkUtils.h"
+#include "SystemUtils.h"
+#include "PcapFilter.h"
+#include "TcpReassembly.h"
+#include "IPv4Layer.h"
+#include "TcpLayer.h"
+#include "UdpLayer.h"
+#include "Packet.h"
+```
+
+## Setting Up PcapPlusPlus
+
+### Installation
+
+On Linux:
+```bash
+git clone https://github.com/seladb/PcapPlusPlus.git
+cd PcapPlusPlus
+./configure-linux.sh
+make
+sudo make install
+```
+
+### Basic Project Setup with CMake
+
+```cmake
+cmake_minimum_required(VERSION 3.13)
+project(packet_analyzer)
+
+set(CMAKE_CXX_STANDARD 17)
+
+find_package(PcapPlusPlus REQUIRED)
+
+add_executable(packet_analyzer main.cpp)
+
+target_link_libraries(packet_analyzer PUBLIC PcapPlusPlus::Pcap++)
+```
+
+## Reading PCAP Files
+
+### Opening and Reading a PCAP File
+
+```cpp
+#include <iostream>
+#include "PcapFileDevice.h"
+
+int main(int argc, char* argv[]) {
+    if (argc != 2) {
+        std::cerr << "Usage: " << argv[0] << " <pcap-file>" << std::endl;
+        return 1;
+    }
+
+    // Open the pcap file for reading
+    pcpp::PcapFileReaderDevice reader(argv[1]);
+    if (!reader.open()) {
+        std::cerr << "Error opening pcap file: " << argv[1] << std::endl;
+        return 1;
+    }
+
+    // Read packets from the file
+    pcpp::RawPacket rawPacket;
+    uint64_t packetCount = 0;
+    
+    while (reader.getNextPacket(rawPacket)) {
+        packetCount++;
+        
+        // Create a Packet object from the raw packet
+        pcpp::Packet parsedPacket(&rawPacket);
+        
+        std::cout << "Packet #" << packetCount << ":"
+                  << " Length: " << parsedPacket.getRawPacketReadOnly()->getRawDataLen() << " bytes"
+                  << std::endl;
+    }
+    
+    reader.close();
+    std::cout << "Read " << packetCount << " packets from the file" << std::endl;
+    
+    return 0;
+}
+```
+
+### Working with PCAP-NG Files
+
+```cpp
+pcpp::PcapNgFileReaderDevice reader("capture.pcapng");
+if (!reader.open()) {
+    std::cerr << "Error opening pcapng file" << std::endl;
+    return 1;
+}
+
+// Rest of the code same as for reading PCAP files
+```
+
+## Packet Dissection and Analysis
+
+### Accessing Layer Information
+
+```cpp
+void analyzePacket(const pcpp::Packet& packet) {
+    // Check for Ethernet layer
+    if (packet.isPacketOfType(pcpp::Ethernet)) {
+        const pcpp::EthLayer* ethLayer = packet.getLayerOfType<pcpp::EthLayer>();
+        std::cout << "Source MAC: " << ethLayer->getSourceMac() << std::endl;
+        std::cout << "Dest MAC: " << ethLayer->getDestMac() << std::endl;
+    }
+    
+    // Check for IPv4 layer
+    if (packet.isPacketOfType(pcpp::IPv4)) {
+        const pcpp::IPv4Layer* ipLayer = packet.getLayerOfType<pcpp::IPv4Layer>();
+        std::cout << "Source IP: " << ipLayer->getSrcIPAddress() << std::endl;
+        std::cout << "Dest IP: " << ipLayer->getDstIPAddress() << std::endl;
+        std::cout << "IP ID: 0x" << std::hex << ipLayer->getIPv4Header()->ipId 
+                  << std::dec << std::endl;
+    }
+    
+    // Check for TCP layer
+    if (packet.isPacketOfType(pcpp::TCP)) {
+        const pcpp::TcpLayer* tcpLayer = packet.getLayerOfType<pcpp::TcpLayer>();
+        std::cout << "Source Port: " << tcpLayer->getSrcPort() << std::endl;
+        std::cout << "Dest Port: " << tcpLayer->getDstPort() << std::endl;
+        std::cout << "Sequence Number: " << tcpLayer->getTcpHeader()->sequenceNumber 
+                  << std::endl;
+        std::cout << "Ack Number: " << tcpLayer->getTcpHeader()->ackNumber << std::endl;
+        std::cout << "Window Size: " << tcpLayer->getTcpHeader()->windowSize << std::endl;
+        
+        // Check TCP flags
+        std::cout << "Flags: ";
+        if (tcpLayer->getTcpHeader()->synFlag) std::cout << "SYN ";
+        if (tcpLayer->getTcpHeader()->ackFlag) std::cout << "ACK ";
+        if (tcpLayer->getTcpHeader()->pshFlag) std::cout << "PSH ";
+        if (tcpLayer->getTcpHeader()->rstFlag) std::cout << "RST ";
+        if (tcpLayer->getTcpHeader()->finFlag) std::cout << "FIN ";
+        std::cout << std::endl;
+    }
+    
+    // Check for UDP layer
+    if (packet.isPacketOfType(pcpp::UDP)) {
+        const pcpp::UdpLayer* udpLayer = packet.getLayerOfType<pcpp::UdpLayer>();
+        std::cout << "Source Port: " << udpLayer->getSrcPort() << std::endl;
+        std::cout << "Dest Port: " << udpLayer->getDstPort() << std::endl;
+        std::cout << "Length: " << udpLayer->getUdpHeader()->length << std::endl;
+    }
+}
+```
+
+### Working with Packet Timestamps
+
+```cpp
+void printPacketTimestamp(const pcpp::RawPacket& rawPacket) {
+    timespec timestamp = rawPacket.getPacketTimeStamp();
+    time_t seconds = timestamp.tv_sec;
+    struct tm* timeinfo = localtime(&seconds);
+    
+    char timeBuffer[80];
+    strftime(timeBuffer, sizeof(timeBuffer), "%Y-%m-%d %H:%M:%S", timeinfo);
+    
+    std::cout << "Packet timestamp: " << timeBuffer << "."
+              << std::setfill('0') << std::setw(9) << timestamp.tv_nsec
+              << std::endl;
+}
+```
+
+### Filtering Packets
+
+```cpp
+bool filterPackets(pcpp::PcapFileReaderDevice& reader, const std::string& filterExpression) {
+    // Create a BPF filter
+    pcpp::BPFStringFilter filter(filterExpression);
+    
+    // Set the filter on the reader
+    if (!reader.setFilter(filter)) {
+        std::cerr << "Could not set filter '" << filterExpression << "'" << std::endl;
+        return false;
+    }
+    
+    return true;
+}
+
+// Usage:
+// filterPackets(reader, "tcp port 80");  // HTTP traffic only
+// filterPackets(reader, "udp and ip src 192.168.1.1");  // UDP from a specific IP
+```
+
+## TCP Stream Reassembly
+
+### Basic TCP Reassembly
+
+```cpp
+class TcpReassemblyCallback : public pcpp::TcpReassemblyCallback {
+private:
+    std::map<std::string, std::ofstream> m_streamFiles;
+    
+    std::string getConnectionString(const pcpp::ConnectionData& connectionData) {
+        std::stringstream stream;
+        stream << connectionData.srcIP << ":" << connectionData.srcPort 
+               << "-" 
+               << connectionData.dstIP << ":" << connectionData.dstPort;
+        return stream.str();
+    }
+    
+public:
+    ~TcpReassemblyCallback() {
+        // Close any open files
+        for (auto& pair : m_streamFiles) {
+            pair.second.close();
+        }
+    }
+    
+    void onMessageReady(int8_t sideIndex, const pcpp::TcpStreamData& tcpData) override {
+        // Get a string representation of the connection
+        std::string connection = getConnectionString(tcpData.getConnectionData());
+        
+        // Determine the direction (client->server or server->client)
+        std::string direction = (sideIndex == 0) ? "c2s" : "s2c";
+        
+        // Create a unique file name for this stream direction
+        std::string fileName = connection + "_" + direction + ".bin";
+        
+        // Create or get the file stream
+        if (m_streamFiles.find(fileName) == m_streamFiles.end()) {
+            m_streamFiles[fileName].open(fileName, std::ios::binary | std::ios::out);
+        }
+        
+        // Write the data to the file
+        m_streamFiles[fileName].write(
+            reinterpret_cast<const char*>(tcpData.getData()),
+            tcpData.getDataLength()
+        );
+        
+        std::cout << "Got " << tcpData.getDataLength() << " bytes on connection " 
+                  << connection << " [" << direction << "]" << std::endl;
+    }
+    
+    void onConnectionStart(const pcpp::ConnectionData& connectionData) override {
+        std::string connection = getConnectionString(connectionData);
+        std::cout << "Connection started: " << connection << std::endl;
+    }
+    
+    void onConnectionEnd(const pcpp::ConnectionData& connectionData) override {
+        std::string connection = getConnectionString(connectionData);
+        std::cout << "Connection ended: " << connection << std::endl;
+        
+        // Close the stream files for this connection
+        std::string c2sFileName = connection + "_c2s.bin";
+        std::string s2cFileName = connection + "_s2c.bin";
+        
+        if (m_streamFiles.find(c2sFileName) != m_streamFiles.end()) {
+            m_streamFiles[c2sFileName].close();
+            m_streamFiles.erase(c2sFileName);
+        }
+        
+        if (m_streamFiles.find(s2cFileName) != m_streamFiles.end()) {
+            m_streamFiles[s2cFileName].close();
+            m_streamFiles.erase(s2cFileName);
+        }
+    }
+};
+
+// Main function to perform TCP reassembly
+void performTcpReassembly(const std::string& pcapFileName) {
+    // Create a TCP reassembly instance
+    TcpReassemblyCallback tcpReassemblyCallback;
+    pcpp::TcpReassembly tcpReassembly(tcpReassemblyCallback);
+    
+    // Open the pcap file
+    pcpp::PcapFileReaderDevice reader(pcapFileName);
+    if (!reader.open()) {
+        std::cerr << "Failed to open pcap file" << std::endl;
+        return;
+    }
+    
+    // Read each packet and feed it to the TCP reassembly mechanism
+    pcpp::RawPacket rawPacket;
+    while (reader.getNextPacket(rawPacket)) {
+        pcpp::Packet parsedPacket(&rawPacket);
+        
+        // TCP reassembly works only on TCP packets
+        if (parsedPacket.isPacketOfType(pcpp::TCP)) {
+            tcpReassembly.reassemblePacket(parsedPacket);
+        }
+    }
+    
+    // Close the reader
+    reader.close();
+    
+    // After all packets are read, call the following method to close all 
+    // connections that are still open
+    tcpReassembly.closeAllConnections();
+}
+```
+
+### Advanced TCP Stream Management with C++17
+
+```cpp
+class ModernTcpStreamManager {
+private:
+    struct TcpStreamData {
+        std::vector<uint8_t> clientToServer;
+        std::vector<uint8_t> serverToClient;
+        bool isComplete = false;
+        std::chrono::system_clock::time_point lastSeen;
+    };
+    
+    // Using std::shared_mutex for reader-writer lock (C++17)
+    std::shared_mutex m_streamsMutex;
+    std::unordered_map<std::string, TcpStreamData> m_streams;
+    
+    // Helper method to generate a connection key
+    static std::string getConnectionKey(const pcpp::ConnectionData& connData) {
+        return fmt::format("{}:{}-{}:{}", 
+            connData.srcIP, connData.srcPort,
+            connData.dstIP, connData.dstPort);
+    }
+    
+public:
+    class StreamCallbackHandler : public pcpp::TcpReassemblyCallback {
+    private:
+        ModernTcpStreamManager& m_manager;
+        
+    public:
+        explicit StreamCallbackHandler(ModernTcpStreamManager& manager) : m_manager(manager) {}
+        
+        void onMessageReady(int8_t sideIndex, const pcpp::TcpStreamData& tcpData) override {
+            m_manager.addStreamData(sideIndex, tcpData);
+        }
+        
+        void onConnectionStart(const pcpp::ConnectionData& connectionData) override {
+            m_manager.connectionStarted(connectionData);
+        }
+        
+        void onConnectionEnd(const pcpp::ConnectionData& connectionData) override {
+            m_manager.connectionEnded(connectionData);
+        }
+    };
+    
+    void addStreamData(int8_t sideIndex, const pcpp::TcpStreamData& tcpData) {
+        const auto& connData = tcpData.getConnectionData();
+        std::string key = getConnectionKey(connData);
+        
+        // Use a unique_lock for writing
+        std::unique_lock lock(m_streamsMutex);
+        
+        if (m_streams.find(key) == m_streams.end()) {
+            // This shouldn't happen normally, but just in case
+            m_streams[key] = TcpStreamData{};
+        }
+        
+        auto& stream = m_streams[key];
+        stream.lastSeen = std::chrono::system_clock::now();
+        
+        // Add data to the appropriate direction
+        if (sideIndex == 0) { // Client to server
+            auto& buffer = stream.clientToServer;
+            buffer.insert(buffer.end(), 
+                          tcpData.getData(), 
+                          tcpData.getData() + tcpData.getDataLength());
+        } else { // Server to client
+            auto& buffer = stream.serverToClient;
+            buffer.insert(buffer.end(), 
+                          tcpData.getData(), 
+                          tcpData.getData() + tcpData.getDataLength());
+        }
+    }
+    
+    void connectionStarted(const pcpp::ConnectionData& connectionData) {
+        std::string key = getConnectionKey(connectionData);
+        
+        // Use a unique_lock for writing
+        std::unique_lock lock(m_streamsMutex);
+        
+        // Initialize a new stream
+        m_streams[key] = TcpStreamData{};
+        m_streams[key].lastSeen = std::chrono::system_clock::now();
+        
+        std::cout << "Started connection: " << key << std::endl;
+    }
+    
+    void connectionEnded(const pcpp::ConnectionData& connectionData) {
+        std::string key = getConnectionKey(connectionData);
+        
+        // Use a unique_lock for writing
+        std::unique_lock lock(m_streamsMutex);
+        
+        if (m_streams.find(key) != m_streams.end()) {
+            m_streams[key].isComplete = true;
+            std::cout << "Ended connection: " << key << std::endl;
+        }
+    }
+    
+    // Method to retrieve a completed stream
+    std::optional<std::pair<std::vector<uint8_t>, std::vector<uint8_t>>> 
+    getCompletedStream(const std::string& connectionKey) {
+        // Use a shared_lock for reading
+        std::shared_lock lock(m_streamsMutex);
+        
+        auto it = m_streams.find(connectionKey);
+        if (it != m_streams.end() && it->second.isComplete) {
+            return std::make_pair(it->second.clientToServer, it->second.serverToClient);
+        }
+        
+        return std::nullopt;
+    }
+    
+    // Method to get all complete stream keys
+    std::vector<std::string> getCompletedStreamKeys() {
+        std::vector<std::string> keys;
+        
+        // Use a shared_lock for reading
+        std::shared_lock lock(m_streamsMutex);
+        
+        for (const auto& [key, data] : m_streams) {
+            if (data.isComplete) {
+                keys.push_back(key);
+            }
+        }
+        
+        return keys;
+    }
+    
+    // Cleanup stale streams (e.g., for handling connection timeouts)
+    void cleanupStaleStreams(std::chrono::seconds timeout) {
+        auto now = std::chrono::system_clock::now();
+        
+        // Use a unique_lock for writing
+        std::unique_lock lock(m_streamsMutex);
+        
+        for (auto it = m_streams.begin(); it != m_streams.end();) {
+            if (!it->second.isComplete && 
+                (now - it->second.lastSeen) > timeout) {
+                std::cout << "Removing stale connection: " << it->first << std::endl;
+                it = m_streams.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+};
+
+// Usage example
+void reassembleTcpStreamsModern(const std::string& pcapFileName) {
+    ModernTcpStreamManager streamManager;
+    ModernTcpStreamManager::StreamCallbackHandler callbackHandler(streamManager);
+    
+    pcpp::TcpReassembly tcpReassembly(callbackHandler);
+    
+    // Open the pcap file
+    pcpp::PcapFileReaderDevice reader(pcapFileName);
+    if (!reader.open()) {
+        std::cerr << "Failed to open pcap file" << std::endl;
+        return;
+    }
+    
+    // Process packets
+    pcpp::RawPacket rawPacket;
+    while (reader.getNextPacket(rawPacket)) {
+        pcpp::Packet parsedPacket(&rawPacket);
+        
+        if (parsedPacket.isPacketOfType(pcpp::TCP)) {
+            tcpReassembly.reassemblePacket(parsedPacket);
+        }
+        
+        // Periodically clean up stale streams
+        static int packetCounter = 0;
+        if (++packetCounter % 10000 == 0) {
+            streamManager.cleanupStaleStreams(std::chrono::seconds(300)); // 5-minute timeout
+        }
+    }
+    
+    reader.close();
+    
+    // Close all connections
+    tcpReassembly.closeAllConnections();
+    
+    // Process completed streams
+    auto completedKeys = streamManager.getCompletedStreamKeys();
+    std::cout << "Total completed streams: " << completedKeys.size() << std::endl;
+    
+    for (const auto& key : completedKeys) {
+        auto streamData = streamManager.getCompletedStream(key);
+        if (streamData) {
+            const auto& [c2s, s2c] = *streamData;
+            std::cout << "Connection " << key << ": "
+                      << "Client sent " << c2s.size() << " bytes, "
+                      << "Server sent " << s2c.size() << " bytes"
+                      << std::endl;
+            
+            // Process the reassembled data...
+        }
+    }
+}
+```
+
+## Handling UDP Packet Drops
+
+UDP doesn't have built-in sequence numbers, but many application-layer protocols on top of UDP implement their own sequencing. Here's a generic approach to detect and handle UDP drops:
+
+```cpp
+class UdpStreamTracker {
+private:
+    struct FlowKey {
+        pcpp::IPv4Address srcIp;
+        pcpp::IPv4Address dstIp;
+        uint16_t srcPort;
+        uint16_t dstPort;
+        
+        bool operator==(const FlowKey& other) const {
+            return srcIp == other.srcIp && 
+                   dstIp == other.dstIp && 
+                   srcPort == other.srcPort && 
+                   dstPort == other.dstPort;
+        }
+    };
+    
+    struct FlowKeyHash {
+        std::size_t operator()(const FlowKey& key) const {
+            // Combine hashes for the individual fields
+            std::size_t h1 = std::hash<uint32_t>{}(key.srcIp.toInt());
+            std::size_t h2 = std::hash<uint32_t>{}(key.dstIp.toInt());
+            std::size_t h3 = std::hash<uint16_t>{}(key.srcPort);
+            std::size_t h4 = std::hash<uint16_t>{}(key.dstPort);
+            
+            return h1 ^ (h2 << 1) ^ (h3 << 2) ^ (h4 << 3);
+        }
+    };
+    
+    struct UdpFlow {
+        uint64_t packetCount = 0;
+        std::chrono::system_clock::time_point lastSeen;
+        double avgInterPacketTime = 0.0; // in milliseconds
+        double avgPacketSize = 0.0;
+        std::vector<double> interPacketTimes;
+        bool hasGap = false;
+        
+        // For protocols with app-layer sequence numbers
+        std::optional<uint32_t> lastSeqNum;
+    };
+    
+    std::unordered_map<FlowKey, UdpFlow, FlowKeyHash> m_flows;
+    
+    // Function to extract application-specific sequence number
+    // This is highly protocol-dependent and should be customized
+    std::optional<uint32_t> extractSequenceNumber(const pcpp::Packet& packet) {
+        // Example for RTP (Real-time Transport Protocol)
+        if (packet.isPacketOfType(pcpp::UDP)) {
+            const pcpp::UdpLayer* udpLayer = packet.getLayerOfType<pcpp::UdpLayer>();
+            const pcpp::PayloadLayer* payloadLayer = packet.getLayerOfType<pcpp::PayloadLayer>();
+            
+            if (payloadLayer && payloadLayer->getDataLen() >= 4) {
+                const uint8_t* data = payloadLayer->getData();
+                
+                // Check if it's likely an RTP packet (version 2)
+                if ((data[0] & 0xC0) == 0x80) { // RTP version 2
+                    // RTP sequence number is in bytes 2-3
+                    uint16_t seqNum = (data[2] << 8) | data[3];
+                    return seqNum;
+                }
+            }
+        }
+        return std::nullopt;
+    }
+    
+public:
+    void processUdpPacket(const pcpp::Packet& packet, const pcpp::RawPacket& rawPacket) {
+        if (!packet.isPacketOfType(pcpp::UDP) || !packet.isPacketOfType(pcpp::IPv4)) {
+            return;
+        }
+        
+        const pcpp::IPv4Layer* ipLayer = packet.getLayerOfType<pcpp::IPv4Layer>();
+        const pcpp::UdpLayer* udpLayer = packet.getLayerOfType<pcpp::UdpLayer>();
+        
+        // Create flow key
+        FlowKey key = {
+            ipLayer->getSrcIPAddress(),
+            ipLayer->getDstIPAddress(),
+            udpLayer->getSrcPort(),
+            udpLayer->getDstPort()
+        };
+        
+        // Get or create flow
+        auto& flow = m_flows[key];
+        
+        // Update flow statistics
+        auto now = std::chrono::system_clock::now();
+        if (flow.packetCount > 0) {
+            auto timeDiff = std::chrono::duration_cast<std::chrono::milliseconds>(
+                now - flow.lastSeen).count();
+            
+            // Update moving average of inter-packet time
+            flow.interPacketTimes.push_back(timeDiff);
+            
+            // Keep only the last 100 inter-packet times to avoid using too much memory
+            if (flow.interPacketTimes.size() > 100) {
+                flow.interPacketTimes.erase(flow.interPacketTimes.begin());
+            }
+            
+            // Recalculate average
+            double sum = 0;
+            for (double time : flow.interPacketTimes) {
+                sum += time;
+            }
+            flow.avgInterPacketTime = sum / flow.interPacketTimes.size();
+            
+            // Detect potential packet drops based on timing
+            // If this packet arrived much later than expected, there might be a drop
+            if (timeDiff > 3 * flow.avgInterPacketTime && flow.avgInterPacketTime > 0) {
+                flow.hasGap = true;
+                std::cout << "Potential UDP packet drop detected in flow "
+                          << key.srcIp << ":" << key.srcPort << " -> "
+                          << key.dstIp << ":" << key.dstPort
+                          << " (time gap: " << timeDiff << " ms, avg: " 
+                          << flow.avgInterPacketTime << " ms)" << std::endl;
+            }
+        }
+        
+        // Update packet size average
+        double packetSize = rawPacket.getRawDataLen();
+        flow.avgPacketSize = (flow.avgPacketSize * flow.packetCount + packetSize) / 
+                            (flow.packetCount + 1);
+        
+        // Check for sequence number gaps in application protocols
+        auto seqNum = extractSequenceNumber(packet);
+        if (seqNum.has_value() && flow.lastSeqNum.has_value()) {
+            uint32_t expected = (flow.lastSeqNum.value() + 1) % 65536; // For 16-bit seq nums
+            
+            if (seqNum.value() != expected) {
+                flow.hasGap = true;
+                
+                // Calculate how many packets were likely dropped
+                int dropped;
+                if (seqNum.value() > expected) {
+                    dropped = seqNum.value() - expected;
+                } else {
+                    // Handle wraparound (for 16-bit sequence numbers)
+                    dropped = (65536 - expected) + seqNum.value();
+                }
+                
+                std::cout << "UDP sequence gap detected: expected " << expected 
+                          << ", got " << seqNum.value()
+                          << " (approximately " << dropped << " packets lost)" << std::endl;
+            }
+        }
+        
+        // Update flow data
+        flow.packetCount++;
+        flow.lastSeen = now;
+        if (seqNum.has_value()) {
+            flow.lastSeqNum = seqNum;
+        }
+    }
+    
+    // Get statistics about all flows
+    void printFlowStatistics() {
+        for (const auto& [key, flow] : m_flows) {
+            std::cout << "Flow: " << key.srcIp << ":" << key.srcPort << " -> "
+                      << key.dstIp << ":" << key.dstPort << std::endl;
+            std::cout << "  Packets: " << flow.packetCount << std::endl;
+            std::cout << "  Avg packet size: " << flow.avgPacketSize << " bytes" << std::endl;
+            std::cout << "  Avg inter-packet time: " << flow.avgInterPacketTime << " ms" << std::endl;
+            std::cout << "  Detected gaps: " << (flow.hasGap ? "Yes" : "No") << std::endl;
+        }
+    }
+    
+    // Clean up flows that haven't been seen for a while
+    void cleanupStaleFlows(std::chrono::seconds timeout) {
+        auto now = std::chrono::system_clock::now();
+        
+        for (auto it = m_flows.begin(); it != m_flows.end();) {
+            if (now - it->second.lastSeen > timeout) {
+                it = m_flows.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+};
+
+// Usage example
+void analyzeUdpFlows(const std::string& pcapFileName) {
+    UdpStreamTracker udpTracker;
+    
+    pcpp::PcapFileReaderDevice reader(pcapFileName);
+    if (!reader.open()) {
+        std::cerr << "Failed to open pcap file" << std::endl;
+        return;
+    }
+    
+    pcpp::RawPacket rawPacket;
+    while (reader.getNextPacket(rawPacket)) {
+        pcpp::Packet parsedPacket(&rawPacket);
+        
+        if (parsedPacket.isPacketOfType(pcpp::UDP)) {
+            udpTracker.processUdpPacket(parsedPacket, rawPacket);
+        }
+        
+        // Periodically clean up stale flows
+        static int packetCounter = 0;
+        if (++packetCounter % 10000 == 0) {
+            udpTracker.cleanupStaleFlows(std::chrono::seconds(300)); // 5-minute timeout
+        }
+    }
+    
+    reader.close();
+    
+    // Print final statistics
+    udpTracker.printFlowStatistics();
+}
+```
+
+## Advanced PcapPlusPlus Techniques
+
+### Efficient Parallel Processing of PCAP Files
+
+```cpp
+#include <iostream>
+#include <vector>
+#include <thread>
+#include <mutex>
+#include <atomic>
+#include <filesystem>
+#include "PcapFileDevice.h"
+
+// Structure to hold packet processing statistics
+struct ProcessingStats {
+    std::atomic<uint64_t> totalPackets{0};
+    std::atomic<uint64_t> tcpPackets{0};
+    std::atomic<uint64_t> udpPackets{0};
+    std::atomic<uint64_t> bytesProcessed{0};
+    std::mutex logMutex;
+};
+
+// Split a PCAP file into smaller chunks for parallel processing
+std::vector<std::string> splitPcapFile(const std::string& inputFile, int numChunks) {
+    std::vector<std::string> chunkFiles;
+    
+    // Check how big the input file is
+    std::filesystem::path path(inputFile);
+    auto fileSize = std::filesystem::file_size(path);
+    
+    // Open the source file
+    pcpp::PcapFileReaderDevice reader(inputFile);
+    if (!reader.open()) {
+        std::cerr << "Failed to open input file" << std::endl;
+        return chunkFiles;
+    }
+    
+    // Calculate approximate packets per chunk
+    uint64_t packetsPerChunk = 0;
+    
+    // Count total packets
+    {
+        pcpp::RawPacket rawPacket;
+        uint64_t packetCount = 0;
+        while (reader.getNextPacket(rawPacket)) {
+            packetCount++;
+        }
+        reader.close();
+        reader.open();
+        
+        packetsPerChunk = (packetCount + numChunks - 1) / numChunks;
+    }
+    
+    // Create each chunk file
+    for (int i = 0; i < numChunks; i++) {
+        std::string chunkFileName = path.stem().string() + "_chunk_" + 
+                                   std::to_string(i) + ".pcap";
+        chunkFiles.push_back(chunkFileName);
+        
+        pcpp::PcapFileWriterDevice writer(chunkFileName);
+        if (!writer.open()) {
+            std::cerr << "Failed to create chunk file " << chunkFileName << std::endl;
+            continue;
+        }
+        
+        // Write packets to this chunk
+        pcpp::RawPacket rawPacket;
+        uint64_t packetCount = 0;
+        
+        while (packetCount < packetsPerChunk && reader.getNextPacket(rawPacket)) {
+            writer.writePacket(rawPacket);
+            packetCount++;
+        }
+        
+        writer.close();
+        
+        // If no more packets, break early
+        if (packetCount < packetsPerChunk) {
+            break;
+        }
+    }
+    
+    reader.close();
+    return chunkFiles;
+}
+
+// Process a single PCAP chunk file
+void processChunk(const std::string& chunkFile, ProcessingStats& stats) {
+    pcpp::PcapFileReaderDevice reader(chunkFile);
+    if (!reader.open()) {
+        std::lock_guard<std::mutex> lock(stats.logMutex);
+        std::cerr << "Failed to open chunk file " << chunkFile << std::endl;
+        return;
+    }
+    
+    pcpp::RawPacket rawPacket;
+    uint64_t localPacketCount = 0;
+    
+    while (reader.getNextPacket(rawPacket)) {
+        pcpp::Packet parsedPacket(&rawPacket);
+        
+        stats.totalPackets++;
+        stats.bytesProcessed += rawPacket.getRawDataLen();
+        
+        if (parsedPacket.isPacketOfType(pcpp::TCP)) {
+            stats.tcpPackets++;
+        } else if (parsedPacket.isPacketOfType(pcpp::UDP)) {
+            stats.udpPackets++;
+        }
+        
+        // Process the packet further as needed...
+        
+        localPacketCount++;
+    }
+    
+    reader.close();
+    
+    {
+        std::lock_guard<std::mutex> lock(stats.logMutex);
+        std::cout << "Processed " << localPacketCount << " packets from " 
+                  << chunkFile << std::endl;
+    }
+    
+    // Optionally remove the temporary chunk file
+    std::filesystem::remove(chunkFile);
+}
+
+// Main function for parallel processing
+void processInParallel(const std::string& pcapFileName) {
+    // Determine optimal number of threads (e.g., number of cores)
+    unsigned int numThreads = std::thread::hardware_concurrency();
+    if (numThreads == 0) numThreads = 4; // Fallback if hardware_concurrency fails
+    
+    std::cout << "Processing with " << numThreads << " threads" << std::endl;
+    
+    // Split the file into chunks
+    auto chunkFiles = splitPcapFile(pcapFileName, numThreads);
+    
+    // Create thread pool and stats object
+    std::vector<std::thread> threads;
+    ProcessingStats stats;
+    
+    // Start a thread for each chunk
+    for (const auto& chunkFile : chunkFiles) {
+        threads.emplace_back(processChunk, chunkFile, std::ref(stats));
+    }
+    
+    // Wait for all threads to complete
+    for (auto& thread : threads) {
+        thread.join();
+    }
+    
+    // Print final statistics
+    std::cout << "Processed " << stats.totalPackets << " packets total" << std::endl;
+    std::cout << "TCP packets: " << stats.tcpPackets << std::endl;
+    std::cout << "UDP packets: " << stats.udpPackets << std::endl;
+    std::cout << "Total bytes processed: " << stats.bytesProcessed << std::endl;
+}
+```
+
+### Creating a Custom Protocol Parser
+
+```cpp
+// Define a custom protocol layer (e.g., a simple application protocol)
+class CustomProtocolLayer : public pcpp::Layer {
+private:
+    // Protocol header definition
+    struct CustomHeader {
+        uint8_t version;
+        uint8_t type;
+        uint16_t length;
+        uint32_t sessionId;
+        // ... other fields
+    } __attribute__((__packed__));
+    
+    CustomHeader* m_header;
+    
+public:
+    // Constructor for parsing existing packets
+    CustomProtocolLayer(uint8_t* data, size_t dataLen, pcpp::Layer* prevLayer, pcpp::Packet* packet) 
+        : Layer(data, dataLen, prevLayer, packet) {
+        m_header = (CustomHeader*)m_Data;
+    }
+    
+    // Constructor for creating new packets
+    CustomProtocolLayer(uint8_t version, uint8_t type, uint32_t sessionId) {
+        m_DataLen = sizeof(CustomHeader);
+        m_Data = new uint8_t[m_DataLen];
+        memset(m_Data, 0, m_DataLen);
+        m_header = (CustomHeader*)m_Data;
+        
+        m_header->version = version;
+        m_header->type = type;
+        m_header->length = 0; // Will be set when payload is added
+        m_header->sessionId = sessionId;
+    }
+    
+    ~CustomProtocolLayer() {
+        if (m_Data != nullptr && m_AllocatedData)
+            delete[] m_Data;
+    }
+    
+    // Layer interface implementation
+    pcpp::LayerType getProtocol() const override {
+        // Use a custom enum value for your protocol
+        return (pcpp::LayerType)10000; // Use a high number to avoid conflicts
+    }
+    
+    void parseNextLayer() override {
+        // Check if there's data after the header
+        if (m_DataLen <= sizeof(CustomHeader))
+            return;
+        
+        // Get a pointer to the beginning of the next layer
+        uint8_t* payloadData = m_Data + sizeof(CustomHeader);
+        size_t payloadLen = m_DataLen - sizeof(CustomHeader);
+        
+        // Create a payload layer with the remaining data
+        m_NextLayer = new pcpp::PayloadLayer(payloadData, payloadLen, this, m_Packet);
+    }
+    
+    std::string toString() const override {
+        return "Custom Protocol Layer, Version: " + std::to_string(m_header->version) +
+               ", Type: " + std::to_string(m_header->type) +
+               ", Session ID: " + std::to_string(m_header->sessionId);
+    }
+    
+    // Protocol-specific methods
+    uint8_t getVersion() const { return m_header->version; }
+    uint8_t getType() const { return m_header->type; }
+    uint16_t getLength() const { return ntohs(m_header->length); }
+    uint32_t getSessionId() const { return ntohl(m_header->sessionId); }
+    
+    void setLength(uint16_t length) { m_header->length = htons(length); }
+    
+    // Method to create a new packet with this protocol
+    static pcpp::Packet createPacket(pcpp::IPv4Address srcIP, pcpp::IPv4Address dstIP,
+                                    uint16_t srcPort, uint16_t dstPort,
+                                    uint8_t version, uint8_t type, uint32_t sessionId,
+                                    const uint8_t* payload, size_t payloadSize) {
+        // Create an empty packet
+        pcpp::Packet packet;
+        
+        // Build the packet layers
+        pcpp::EthLayer ethLayer(pcpp::MacAddress("00:00:00:00:00:01"), 
+                              pcpp::MacAddress("00:00:00:00:00:02"));
+        
+        pcpp::IPv4Layer ipLayer(srcIP, dstIP);
+        ipLayer.getIPv4Header()->timeToLive = 64;
+        
+        pcpp::TcpLayer tcpLayer(srcPort, dstPort);
+        tcpLayer.getTcpHeader()->sequenceNumber = htonl(1);
+        tcpLayer.getTcpHeader()->ackNumber = 0;
+        tcpLayer.getTcpHeader()->pshFlag = 1;
+        tcpLayer.getTcpHeader()->windowSize = htons(8192);
+        
+        // Create our custom protocol layer
+        CustomProtocolLayer customLayer(version, type, sessionId);
+        
+        // Add payload if provided
+        pcpp::PayloadLayer payloadLayer;
+        if (payload != nullptr && payloadSize > 0) {
+            payloadLayer = pcpp::PayloadLayer(payload, payloadSize);
+            customLayer.setLength(payloadSize);
+        }
+        
+        // Add all layers to the packet
+        packet.addLayer(&ethLayer);
+        packet.addLayer(&ipLayer);
+        packet.addLayer(&tcpLayer);
+        packet.addLayer(&customLayer);
+        if (payload != nullptr && payloadSize > 0) {
+            packet.addLayer(&payloadLayer);
+        }
+        
+        // Calculate all required fields
+        packet.computeCalculateFields();
+        
+        return packet;
+    }
+};
+
+// Register the custom protocol parser with PcapPlusPlus
+class CustomProtocolParserRegistration {
+private:
+    static CustomProtocolLayer* createInstance(uint8_t* data, size_t dataLen, 
+                                              pcpp::Layer* prevLayer, pcpp::Packet* packet) {
+        return new CustomProtocolLayer(data, dataLen, prevLayer, packet);
+    }
+    
+public:
+    static void registerProtocol() {
+        // Register the custom protocol to be identified after TCP or UDP
+        pcpp::OsiModelLayer usiModelLayer = pcpp::OsiModelApplicationLayer;
+        pcpp::ParsingFieldFactory::registerParsingLayer((pcpp::LayerType)10000, // Custom protocol ID
+                                                      createInstance,
+                                                      usiModelLayer);
+    }
+};
+
+// Example usage
+void testCustomProtocol() {
+    // Register the custom protocol parser
+    CustomProtocolParserRegistration::registerProtocol();
+    
+    // Create a packet with the custom protocol
+    uint8_t payload[] = "Hello, Custom Protocol!";
+    pcpp::Packet packet = CustomProtocolLayer::createPacket(
+        pcpp::IPv4Address("192.168.1.1"), pcpp::IPv4Address("192.168.1.2"),
+        12345, 80,
+        1, 2, 0x12345678, // version, type, sessionId
+        payload, sizeof(payload)
+    );
+    
+    // Write the packet to a PCAP file
+    pcpp::PcapFileWriterDevice writer("custom_protocol.pcap");
+    if (!writer.open()) {
+        std::cerr << "Failed to open file for writing" << std::endl;
+        return;
+    }
+    
+    writer.writePacket(*(packet.getRawPacket()));
+    writer.close();
+    
+    // Read the packet back and verify parsing
+    pcpp::PcapFileReaderDevice reader("custom_protocol.pcap");
+    if (!reader.open()) {
+        std::cerr << "Failed to open file for reading" << std::endl;
+        return;
+    }
+    
+    pcpp::RawPacket rawPacket;
+    if (reader.getNextPacket(rawPacket)) {
+        pcpp::Packet parsedPacket(&rawPacket);
+        
+        // Find our custom layer
+        CustomProtocolLayer* customLayer = 
+            parsedPacket.getLayerOfType<CustomProtocolLayer>((pcpp::LayerType)10000);
+        
+        if (customLayer != nullptr) {
+            std::cout << "Successfully parsed custom protocol layer:" << std::endl;
+            std::cout << "  Version: " << (int)customLayer->getVersion() << std::endl;
+            std::cout << "  Type: " << (int)customLayer->getType() << std::endl;
+            std::cout << "  Session ID: 0x" << std::hex << customLayer->getSessionId() 
+                      << std::dec << std::endl;
+            std::cout << "  Payload length: " << customLayer->getLength() << std::endl;
+        } else {
+            std::cerr << "Failed to find custom protocol layer" << std::endl;
+        }
+    }
+    
+    reader.close();
+}
+```
+
+## Best Practices and Optimization
+
+### Memory Efficient Processing of Large PCAP Files
+
+```cpp
+class PcapProcessor {
+public:
+    static void processLargePcapFile(const std::string& pcapFileName, 
+                                     const std::function<void(const pcpp::Packet&)>& packetHandler) {
+        // Use a smaller buffer size for reading the PCAP file
+        pcpp::PcapFileReaderDevice reader(pcapFileName);
+        
+        // Set PCAP reader in non-blocking mode with a smaller buffer
+        if (!reader.open()) {
+            std::cerr << "Failed to open pcap file" << std::endl;
+            return;
+        }
+        
+        // Process packets in batches to reduce memory usage
+        const size_t BATCH_SIZE = 10000;
+        std::vector<pcpp::RawPacket> packetBatch;
+        packetBatch.reserve(BATCH_SIZE);
+        
+        // Read packets in batches
+        pcpp::RawPacket rawPacket;
+        size_t totalPackets = 0;
+        auto startTime = std::chrono::high_resolution_clock::now();
+        
+        while (true) {
+            packetBatch.clear();
+            
+            // Read a batch of packets
+            for (size_t i = 0; i < BATCH_SIZE; ++i) {
+                if (!reader.getNextPacket(rawPacket)) {
+                    break;
+                }
+                
+                // Create a copy of the packet data to store in our batch
+                packetBatch.push_back(rawPacket);
+            }
+            
+            if (packetBatch.empty()) {
+                break;  // No more packets
+            }
+            
+            // Process the batch
+            for (const auto& packet : packetBatch) {
+                pcpp::Packet parsedPacket(&packet);
+                packetHandler(parsedPacket);
+                totalPackets++;
+            }
+            
+            // Print progress
+            if (totalPackets % 100000 == 0) {
+                auto currentTime = std::chrono::high_resolution_clock::now();
+                auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
+                    currentTime - startTime).count();
+                
+                if (elapsed > 0) {
+                    double packetsPerSecond = totalPackets / static_cast<double>(elapsed);
+                    std::cout << "Processed " << totalPackets << " packets (" 
+                              << packetsPerSecond << " packets/sec)" << std::endl;
+                }
+            }
+        }
+        
+        reader.close();
+        
+        auto endTime = std::chrono::high_resolution_clock::now();
+        auto totalTime = std::chrono::duration_cast<std::chrono::seconds>(
+            endTime - startTime).count();
+        
+        std::cout << "Finished processing " << totalPackets << " packets in " 
+                  << totalTime << " seconds" << std::endl;
+    }
+};
+
+// Example usage:
+void processLargePcap(const std::string& pcapFileName) {
+    // Define a packet handler function
+    std::atomic<uint64_t> tcpPackets{0};
+    std::atomic<uint64_t> udpPackets{0};
+    
+    auto packetHandler = [&](const pcpp::Packet& packet) {
+        if (packet.isPacketOfType(pcpp::TCP)) {
+            tcpPackets++;
+        } else if (packet.isPacketOfType(pcpp::UDP)) {
+            udpPackets++;
+        }
+    };
+    
+    // Process the file with our optimized processor
+    PcapProcessor::processLargePcapFile(pcapFileName, packetHandler);
+    
+    std::cout << "TCP packets: " << tcpPackets << std::endl;
+    std::cout << "UDP packets: " << udpPackets << std::endl;
+}
+```
+
+### PCAP Filtering Best Practices
+
+```cpp
+class PcapFilterHelper {
+public:
+    // Create a BPF filter string for common use cases
+    static std::string createPortFilter(uint16_t port, bool isTcp = true, bool isDst = true) {
+        std::string proto = isTcp ? "tcp" : "udp";
+        std::string direction = isDst ? "dst" : "src";
+        return proto + " " + direction + " port " + std::to_string(port);
+    }
+    
+    static std::string createHostFilter(const std::string& ip, bool isDst = true) {
+        std::string direction = isDst ? "dst" : "src";
+        return direction + " host " + ip;
+    }
+    
+    static std::string createProtocolFilter(const std::string& protocol) {
+        return protocol;
+    }
+    
+    // Combine multiple filters with AND logic
+    static std::string combineFilters(const std::vector<std::string>& filters) {
+        if (filters.empty()) return "";
+        
+        std::string result = filters[0];
+        for (size_t i = 1; i < filters.size(); ++i) {
+            result += " and " + filters[i];
+        }
+        return result;
+    }
+    
+    // Apply a filter to a PCAP reader
+    static bool applyFilter(pcpp::PcapFileReaderDevice& reader, const std::string& filterExpression) {
+        if (filterExpression.empty()) {
+            return true;  // No filter to apply
+        }
+        
+        pcpp::BPFStringFilter filter(filterExpression);
+        return reader.setFilter(filter);
+    }
+    
+    // Apply a filter to a PCAP reader and write matching packets to another file
+    static bool filterPcapFile(const std::string& inputFile, const std::string& outputFile,
+                              const std::string& filterExpression) {
+        pcpp::PcapFileReaderDevice reader(inputFile);
+        if (!reader.open()) {
+            std::cerr << "Failed to open input file" << std::endl;
+            return false;
+        }
+        
+        pcpp::PcapFileWriterDevice writer(outputFile);
+        if (!writer.open()) {
+            std::cerr << "Failed to open output file" << std::endl;
+            reader.close();
+            return false;
+        }
+        
+        // Apply the filter
+        if (!filterExpression.empty()) {
+            if (!applyFilter(reader, filterExpression)) {
+                std::cerr << "Failed to apply filter: " << filterExpression << std::endl;
+                reader.close();
+                writer.close();
+                return false;
+            }
+        }
+        
+        // Copy matching packets
+        pcpp::RawPacket rawPacket;
+        uint64_t packetCount = 0;
+        uint64_t matchingPackets = 0;
+        
+        while (reader.getNextPacket(rawPacket)) {
+            packetCount++;
+            writer.writePacket(rawPacket);
+            matchingPackets++;
+        }
+        
+        reader.close();
+        writer.close();
+        
+        std::cout << "Processed " << packetCount << " packets, " 
+                  << matchingPackets << " matched the filter" << std::endl;
+        return true;
+    }
+    
+    // Split a PCAP file into multiple files based on a field value
+    template<typename T>
+    static void splitPcapByField(const std::string& inputFile, 
+                                const std::function<std::optional<T>(const pcpp::Packet&)>& fieldExtractor,
+                                const std::function<std::string(const T&)>& fileNameGenerator) {
+        pcpp::PcapFileReaderDevice reader(inputFile);
+        if (!reader.open()) {
+            std::cerr << "Failed to open input file" << std::endl;
+            return;
+        }
+        
+        // Map to store output file handles
+        std::map<T, pcpp::PcapFileWriterDevice*> outputFiles;
+        
+        // Process each packet
+        pcpp::RawPacket rawPacket;
+        while (reader.getNextPacket(rawPacket)) {
+            pcpp::Packet parsedPacket(&rawPacket);
+            
+            // Extract the field value
+            auto fieldValue = fieldExtractor(parsedPacket);
+            if (!fieldValue.has_value()) {
+                continue;  // Skip packets that don't have the field
+            }
+            
+            // Get or create the appropriate output file
+            if (outputFiles.find(fieldValue.value()) == outputFiles.end()) {
+                std::string outputFileName = fileNameGenerator(fieldValue.value());
+                outputFiles[fieldValue.value()] = new pcpp::PcapFileWriterDevice(outputFileName);
+                
+                if (!outputFiles[fieldValue.value()]->open()) {
+                    std::cerr << "Failed to open output file: " << outputFileName << std::endl;
+                    delete outputFiles[fieldValue.value()];
+                    outputFiles.erase(fieldValue.value());
+                    continue;
+                }
+            }
+            
+            // Write the packet to the appropriate file
+            outputFiles[fieldValue.value()]->writePacket(rawPacket);
+        }
+        
+        // Close and clean up all output files
+        for (auto& [key, writer] : outputFiles) {
+            writer->close();
+            delete writer;
+        }
+        
+        reader.close();
+    }
+};
+
+// Example usage of the filter helper
+void filterPcapExamples(const std::string& pcapFileName) {
+    // Create filters for common protocols
+    std::string httpFilter = PcapFilterHelper::createPortFilter(80);
+    std::string httpsFilter = PcapFilterHelper::createPortFilter(443);
+    std::string dnsFilter = PcapFilterHelper::createPortFilter(53, false);  // UDP port 53
+    
+    // Combine filters (HTTP or HTTPS)
+    std::string webFilter = "(" + httpFilter + ") or (" + httpsFilter + ")";
+    
+    // Filter a PCAP file for web traffic
+    PcapFilterHelper::filterPcapFile(pcapFileName, "web_traffic.pcap", webFilter);
+    
+    // Split a PCAP file by source IP address
+    auto ipExtractor = [](const pcpp::Packet& packet) -> std::optional<std::string> {
+        if (packet.isPacketOfType(pcpp::IPv4)) {
+            const pcpp::IPv4Layer* ipLayer = packet.getLayerOfType<pcpp::IPv4Layer>();
+            return ipLayer->getSrcIPAddress().toString();
+        }
+        return std::nullopt;
+    };
+    
+    auto fileNameGenerator = [](const std::string& ip) {
+        return "split_by_ip_" + ip + ".pcap";
+    };
+    
+    PcapFilterHelper::splitPcapByField<std::string>(
+        pcapFileName, ipExtractor, fileNameGenerator);
+}
+```
+
+## Troubleshooting
+
+### Common Issues and Solutions
+
+```cpp
+class PcapTroubleshooter {
+public:
+    // Check PCAP file integrity
+    static bool checkPcapFileIntegrity(const std::string& pcapFileName) {
+        pcpp::PcapFileReaderDevice reader(pcapFileName);
+        if (!reader.open()) {
+            std::cerr << "Error: Cannot open PCAP file. File might be corrupted or inaccessible." 
+                      << std::endl;
+            return false;
+        }
+        
+        pcpp::RawPacket rawPacket;
+        uint64_t packetCount = 0;
+        bool hasErrors = false;
+        
+        try {
+            while (reader.getNextPacket(rawPacket)) {
+                packetCount++;
+                
+                // Try to parse the packet
+                try {
+                    pcpp::Packet parsedPacket(&rawPacket);
+                    
+                    // Check for common layer parsing errors
+                    if (parsedPacket.isPacketOfType(pcpp::Ethernet) && 
+                        !parsedPacket.getLayerOfType<pcpp::EthLayer>()) {
+                        std::cout << "Warning: Packet #" << packetCount 
+                                  << " identified as Ethernet but failed to parse Ethernet layer" 
+                                  << std::endl;
+                        hasErrors = true;
+                    }
+                    
+                    if (parsedPacket.isPacketOfType(pcpp::IPv4) && 
+                        !parsedPacket.getLayerOfType<pcpp::IPv4Layer>()) {
+                        std::cout << "Warning: Packet #" << packetCount 
+                                  << " identified as IPv4 but failed to parse IPv4 layer" 
+                                  << std::endl;
+                        hasErrors = true;
+                    }
+                    
+                    if (parsedPacket.isPacketOfType(pcpp::TCP) && 
+                        !parsedPacket.getLayerOfType<pcpp::TcpLayer>()) {
+                        std::cout << "Warning: Packet #" << packetCount 
+                                  << " identified as TCP but failed to parse TCP layer" 
+                                  << std::endl;
+                        hasErrors = true;
+                    }
+                    
+                    if (parsedPacket.isPacketOfType(pcpp::UDP) && 
+                        !parsedPacket.getLayerOfType<pcpp::UdpLayer>()) {
+                        std::cout << "Warning: Packet #" << packetCount 
+                                  << " identified as UDP but failed to parse UDP layer" 
+                                  << std::endl;
+                        hasErrors = true;
+                    }
+                } catch (const std::exception& e) {
+                    std::cout << "Error parsing packet #" << packetCount << ": " 
+                              << e.what() << std::endl;
+                    hasErrors = true;
+                }
+            }
+        } catch (const std::exception& e) {
+            std::cerr << "Error reading PCAP file: " << e.what() << std::endl;
+            reader.close();
+            return false;
+        }
+        
+        reader.close();
+        
+        if (packetCount == 0) {
+            std::cout << "Warning: PCAP file contains no packets." << std::endl;
+            return false;
+        }
+        
+        std::cout << "PCAP file integrity check completed: " << packetCount << " packets processed." 
+                  << std::endl;
+        
+        if (hasErrors) {
+            std::cout << "Some packets had parsing issues. The file may be partially corrupted." 
+                      << std::endl;
+        } else {
+            std::cout << "No packet parsing errors detected." << std::endl;
+        }
+        
+        return !hasErrors;
+    }
+    
+    // Recover data from a corrupted PCAP file
+    static bool recoverCorruptedPcap(const std::string& corruptedFile, 
+                                   const std::string& recoveredFile) {
+        // Open the file as a binary file first
+        std::ifstream inputFile(corruptedFile, std::ios::binary);
+        if (!inputFile.is_open()) {
+            std::cerr << "Cannot open corrupted file" << std::endl;
+            return false;
+        }
+        
+        pcpp::PcapFileWriterDevice writer(recoveredFile);
+        if (!writer.open()) {
+            std::cerr << "Cannot create output file" << std::endl;
+            inputFile.close();
+            return false;
+        }
+        
+        // Check if it's a valid PCAP file by trying to open it
+        pcpp::PcapFileReaderDevice reader(corruptedFile);
+        if (reader.open()) {
+            std::cout << "File appears to be a valid PCAP. Attempting normal recovery." 
+                      << std::endl;
+            
+            // Try to read all valid packets
+            pcpp::RawPacket rawPacket;
+            uint64_t packetCount = 0;
+            uint64_t recoveredCount = 0;
+            
+            try {
+                while (reader.getNextPacket(rawPacket)) {
+                    packetCount++;
+                    
+                    // Try to parse the packet to verify it's valid
+                    try {
+                        pcpp::Packet parsedPacket(&rawPacket);
+                        
+                        // If we can parse it, write it to the output file
+                        writer.writePacket(rawPacket);
+                        recoveredCount++;
+                    } catch (const std::exception&) {
+                        // Skip corrupted packets
+                    }
+                }
+            } catch (const std::exception& e) {
+                std::cout << "Exception while reading PCAP: " << e.what() << std::endl;
+                std::cout << "Recovered " << recoveredCount << " of " << packetCount 
+                          << " packets before error." << std::endl;
+            }
+            
+            reader.close();
+            writer.close();
+            return recoveredCount > 0;
+        }
+        
+        // If we can't open it as a PCAP, try to search for packet signatures
+        std::cout << "File doesn't appear to be a valid PCAP. Attempting signature-based recovery." 
+                  << std::endl;
+        
+        // First, write a valid PCAP global header
+        // This is a simplified example; real recovery would need to guess link type
+        writer.close(); // Close and reopen in binary mode
+        std::ofstream outputFile(recoveredFile, std::ios::binary | std::ios::trunc);
+        
+        // PCAP global header (standard format, link type 1 = Ethernet)
+        const uint8_t pcapHeader[] = {
+            0xd4, 0xc3, 0xb2, 0xa1,  // Magic number
+            0x02, 0x00, 0x04, 0x00,  // Version
+            0x00, 0x00, 0x00, 0x00,  // Timezone
+            0x00, 0x00, 0x00, 0x00,  // Sigfigs
+            0xff, 0xff, 0x00, 0x00,  // Snaplen
+            0x01, 0x00, 0x00, 0x00   // Link type (1 = Ethernet)
+        };
+        
+        outputFile.write(reinterpret_cast<const char*>(pcapHeader), sizeof(pcapHeader));
+        
+        // Now search for Ethernet packet patterns (simplified example)
+        inputFile.seekg(0, std::ios::beg);
+        std::vector<char> buffer(4096);
+        uint64_t recoveredPackets = 0;
+        
+        while (inputFile.good()) {
+            inputFile.read(buffer.data(), buffer.size());
+            std::streamsize bytesRead = inputFile.gcount();
+            
+            if (bytesRead < 14) break; // Minimum Ethernet frame size
+            
+            // Very simplistic pattern matching for Ethernet frames
+            // Real recovery would be much more sophisticated
+            for (size_t i = 0; i < bytesRead - 14; ++i) {
+                // Look for common Ethernet type values like IPv4 (0x0800) or ARP (0x0806)
+                if ((buffer[i+12] == 0x08 && (buffer[i+13] == 0x00 || buffer[i+13] == 0x06)) ||
+                    (buffer[i+12] == 0x86 && buffer[i+13] == 0xdd)) { // IPv6
+                    
+                    // Potential Ethernet frame found, try to estimate its length
+                    uint16_t frameLength = 64; // Minimum frame size guess
+                    
+                    // Construct a PCAP packet header (timestamp is fake)
+                    time_t now = time(nullptr);
+                    uint32_t timestamp_sec = static_cast<uint32_t>(now);
+                    uint32_t timestamp_usec = 0;
+                    uint32_t captured_len = frameLength;
+                    uint32_t original_len = frameLength;
+                    
+                    outputFile.write(reinterpret_cast<const char*>(&timestamp_sec), 4);
+                    outputFile.write(reinterpret_cast<const char*>(&timestamp_usec), 4);
+                    outputFile.write(reinterpret_cast<const char*>(&captured_len), 4);
+                    outputFile.write(reinterpret_cast<const char*>(&original_len), 4);
+                    
+                    // Write the Ethernet frame data
+                    if (i + frameLength <= bytesRead) {
+                        outputFile.write(buffer.data() + i, frameLength);
+                    } else {
+                        // Handle case where frame is split across buffer boundaries
+                        outputFile.write(buffer.data() + i, bytesRead - i);
+                        // Skip the rest for simplicity in this example
+                    }
+                    
+                    recoveredPackets++;
+                    i += frameLength - 1; // Skip ahead
+                }
+            }
+        }
+        
+        inputFile.close();
+        outputFile.close();
+        
+        std::cout << "Recovered " << recoveredPackets 
+                  << " potential packets using signature-based recovery." << std::endl;
+        std::cout << "The recovered file may need further cleanup." << std::endl;
+        
+        return recoveredPackets > 0;
+    }
+    
+    // Check for common issues with TcpReassembly
+    static void diagnoseTcpReassemblyIssues(const std::string& pcapFileName) {
+        pcpp::PcapFileReaderDevice reader(pcapFileName);
+        if (!reader.open()) {
+            std::cerr << "Error: Cannot open PCAP file." << std::endl;
+            return;
+        }
+        
+        struct TcpFlowStats {
+            uint64_t packetCount = 0;
+            uint64_t dataPacketCount = 0;
+            uint64_t outOfOrderPackets = 0;
+            uint64_t retransmissions = 0;
+            uint32_t lastSequence = 0;
+            bool seqInitialized = false;
+            bool hasSyn = false;
+            bool hasFin = false;
+            std::set<uint32_t> seenSequences;
+        };
+        
+        struct FlowKey {
+            pcpp::IPv4Address srcIp;
+            pcpp::IPv4Address dstIp;
+            uint16_t srcPort;
+            uint16_t dstPort;
+            
+            bool operator<(const FlowKey& other) const {
+                if (srcIp != other.srcIp) return srcIp < other.srcIp;
+                if (dstIp != other.dstIp) return dstIp < other.dstIp;
+                if (srcPort != other.srcPort) return srcPort < other.srcPort;
+                return dstPort < other.dstPort;
+            }
+        };
+        
+        std::map<FlowKey, TcpFlowStats> flowStats;
+        
+        pcpp::RawPacket rawPacket;
+        while (reader.getNextPacket(rawPacket)) {
+            pcpp::Packet parsedPacket(&rawPacket);
+            
+            if (!parsedPacket.isPacketOfType(pcpp::TCP) || 
+                !parsedPacket.isPacketOfType(pcpp::IPv4)) {
+                continue;
+            }
+            
+            const pcpp::IPv4Layer* ipLayer = parsedPacket.getLayerOfType<pcpp::IPv4Layer>();
+            const pcpp::TcpLayer* tcpLayer = parsedPacket.getLayerOfType<pcpp::TcpLayer>();
+            
+            FlowKey key = {
+                ipLayer->getSrcIPAddress(),
+                ipLayer->getDstIPAddress(),
+                tcpLayer->getSrcPort(),
+                tcpLayer->getDstPort()
+            };
+            
+            TcpFlowStats& stats = flowStats[key];
+            stats.packetCount++;
+            
+            // Check for SYN and FIN
+            if (tcpLayer->getTcpHeader()->synFlag) {
+                stats.hasSyn = true;
+            }
+            
+            if (tcpLayer->getTcpHeader()->finFlag) {
+                stats.hasFin = true;
+            }
+            
+            // Check data packets
+            if (tcpLayer->getDataLen() > 0) {
+                stats.dataPacketCount++;
+                
+                uint32_t seqNum = ntohl(tcpLayer->getTcpHeader()->sequenceNumber);
+                
+                // Check for out-of-order packets and retransmissions
+                if (stats.seqInitialized) {
+                    if (stats.seenSequences.find(seqNum) != stats.seenSequences.end()) {
+                        stats.retransmissions++;
+                    } else if (seqNum < stats.lastSequence && 
+                              !(stats.lastSequence > 0xFFFFFF00 && seqNum < 0x000000FF)) {
+                        // Not a sequence number wrap-around
+                        stats.outOfOrderPackets++;
+                    }
+                } else {
+                    stats.seqInitialized = true;
+                }
+                
+                stats.lastSequence = seqNum;
+                stats.seenSequences.insert(seqNum);
+            }
+        }
+        
+        reader.close();
+        
+        // Report issues
+        std::cout << "TCP Flow Analysis Results:" << std::endl;
+        std::cout << "-------------------------" << std::endl;
+        
+        int flowsWithIssues = 0;
+        
+        for (const auto& [key, stats] : flowStats) {
+            bool hasIssues = false;
+            
+            std::stringstream issues;
+            
+            if (!stats.hasSyn) {
+                issues << "Missing SYN packet (connection start may be missing). ";
+                hasIssues = true;
+            }
+            
+            if (!stats.hasFin && stats.packetCount > 10) {
+                issues << "Missing FIN packet (connection end may be missing). ";
+                hasIssues = true;
+            }
+            
+            if (stats.outOfOrderPackets > 0) {
+                issues << "Has " << stats.outOfOrderPackets << " out-of-order packets. ";
+                hasIssues = true;
+            }
+            
+            if (stats.retransmissions > stats.dataPacketCount * 0.1) {
+                issues << "High retransmission rate (" << stats.retransmissions << " packets). ";
+                hasIssues = true;
+            }
+            
+            if (hasIssues) {
+                flowsWithIssues++;
+                std::cout << "Flow " << key.srcIp << ":" << key.srcPort << " -> "
+                          << key.dstIp << ":" << key.dstPort << std::endl;
+                std::cout << "  " << stats.packetCount << " packets, " 
+                          << stats.dataPacketCount << " with data" << std::endl;
+                std::cout << "  Issues: " << issues.str() << std::endl;
+            }
+        }
+        
+        if (flowsWithIssues == 0) {
+            std::cout << "No TCP reassembly issues detected in " 
+                      << flowStats.size() << " flows." << std::endl;
+        } else {
+            std::cout << "Detected issues in " << flowsWithIssues << " of " 
+                      << flowStats.size() << " TCP flows." << std::endl;
+            std::cout << "These issues may affect TCP reassembly accuracy." << std::endl;
+        }
+    }
+};
+
+// Example usage:
+void troubleshootPcap(const std::string& pcapFileName) {
+    // Check file integrity
+    PcapTroubleshooter::checkPcapFileIntegrity(pcapFileName);
+    
+    // Diagnose TCP reassembly issues
+    PcapTroubleshooter::diagnoseTcpReassemblyIssues(pcapFileName);
+    
+    // Recover corrupted file (if needed)
+    // PcapTroubleshooter::recoverCorruptedPcap("corrupted.pcap", "recovered.pcap");
+}
+```
+
+This comprehensive guide covers the main aspects of using PcapPlusPlus for packet analysis, TCP reassembly, UDP analysis, and advanced packet processing. The examples demonstrate modern C++ techniques and best practices for efficient and maintainable network packet processing code.
