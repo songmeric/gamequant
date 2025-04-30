@@ -1,0 +1,346 @@
+Handling Growing PCAP Files with Memory Mapping
+When dealing with a PCAP file that's actively being written to (like a continuous capture), memory mapping presents some special challenges, but there are viable solutions.
+
+Challenges with Memory Mapping Growing Files
+Fixed Map Size: When you create a memory mapping with mmap(), it maps a fixed region of the file based on its size at the time of mapping.
+No Automatic Growth: The memory map doesn't automatically extend when the underlying file grows.
+Coherence Issues: Even if you could expand the mapping, you might have coherence issues with the writer process.
+Solutions for Handling Growing PCAP Files
+Option 1: Periodic Remapping
+cpp
+
+Copy
+class GrowingPcapHandler : public IMMapHandler {
+private:
+    std::chrono::steady_clock::time_point m_lastRemapTime;
+    std::chrono::seconds m_remapInterval;
+    
+public:
+    GrowingPcapHandler(std::chrono::seconds remapInterval = std::chrono::seconds(5))
+        : m_remapInterval(remapInterval),
+          m_lastRemapTime(std::chrono::steady_clock::now()) {
+    }
+    
+    bool processFile(const std::string& filePath) override {
+        // Initial mapping
+        m_currentFilePath = filePath;
+        return remapFile();
+    }
+    
+    bool checkForUpdates() {
+        auto now = std::chrono::steady_clock::now();
+        if (now - m_lastRemapTime > m_remapInterval) {
+            m_lastRemapTime = now;
+            return remapFile();
+        }
+        return false;
+    }
+    
+private:
+    bool remapFile() {
+        // Get current file position if we already have a mapping
+        off_t currentPosition = 0;
+        if (m_mappedData != nullptr) {
+            // Calculate how far we've read into the current mapping
+            currentPosition = m_currentPos - m_mappedData;
+            
+            // Unmap current mapping
+            unmapCurrentFile();
+        }
+        
+        // Open the file
+        m_fd = open(m_currentFilePath.c_str(), O_RDONLY);
+        if (m_fd == -1) {
+            PME_LOG_ERROR(log_, "Failed to open file: " << strerror(errno));
+            return false;
+        }
+        
+        // Get new file size
+        struct stat sb;
+        if (fstat(m_fd, &sb) == -1) {
+            PME_LOG_ERROR(log_, "Failed to get file stats: " << strerror(errno));
+            close(m_fd);
+            m_fd = -1;
+            return false;
+        }
+        
+        size_t newSize = sb.st_size;
+        
+        // Check if file has grown
+        if (newSize > m_mappedSize) {
+            PME_LOG_INFO(log_, "File has grown from " << m_mappedSize 
+                        << " to " << newSize << " bytes");
+            
+            // Map the file
+            m_mappedData = static_cast<uint8_t*>(mmap(nullptr, newSize, 
+                                                  PROT_READ, MAP_PRIVATE, m_fd, 0));
+            if (m_mappedData == MAP_FAILED) {
+                PME_LOG_ERROR(log_, "Failed to map file: " << strerror(errno));
+                close(m_fd);
+                m_fd = -1;
+                m_mappedData = nullptr;
+                return false;
+            }
+            
+            // Update size and position
+            m_mappedSize = newSize;
+            m_currentPos = m_mappedData + currentPosition;
+            
+            return true;
+        } else {
+            PME_LOG_DEBUG(log_, "File size unchanged at " << newSize << " bytes");
+            
+            // Remap anyway to ensure consistency
+            m_mappedData = static_cast<uint8_t*>(mmap(nullptr, newSize, 
+                                                  PROT_READ, MAP_PRIVATE, m_fd, 0));
+            if (m_mappedData == MAP_FAILED) {
+                PME_LOG_ERROR(log_, "Failed to map file: " << strerror(errno));
+                close(m_fd);
+                m_fd = -1;
+                m_mappedData = nullptr;
+                return false;
+            }
+            
+            // Update position
+            m_mappedSize = newSize;
+            m_currentPos = m_mappedData + currentPosition;
+            
+            return false;  // No new data
+        }
+    }
+};
+Then modify your Engine's run loop:
+
+cpp
+
+Copy
+void Engine::run() {
+    PME_LOG_INFO(log_, "Engine running");
+    
+    try {
+        while (!shouldStop()) {
+            // Check if file has grown (if we're in live capture mode)
+            auto* growingHandler = dynamic_cast<GrowingPcapHandler*>(m_mmapHandler.get());
+            if (growingHandler && growingHandler->checkForUpdates()) {
+                // File has grown, update our iterator with the new mapping
+                m_iterator = std::make_unique<ThreadSafeIterator>(
+                    m_mmapHandler->getMappedData(),
+                    m_mmapHandler->getMappedSize()
+                );
+                PME_LOG_INFO(log_, "Updated mapping for growing file");
+            }
+            
+            // Process current file if we have one
+            if (m_iterator) {
+                processCurrentFile();
+            } else {
+                // No active file, sleep briefly to avoid busy-waiting
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            }
+        }
+    } catch (const std::exception& e) {
+        PME_LOG_FATAL(log_, "Exception in engine loop: " << e.what());
+        stop();
+    }
+    
+    PME_LOG_INFO(log_, "Engine run loop exited");
+}
+Option 2: File Following with inotify
+For Linux systems, you can use the inotify API to be notified when the file changes:
+
+cpp
+
+Copy
+class InotifyPcapHandler : public IMMapHandler {
+private:
+    int m_inotifyFd;
+    int m_watchFd;
+    
+public:
+    InotifyPcapHandler() : m_inotifyFd(-1), m_watchFd(-1) {
+        // Initialize inotify
+        m_inotifyFd = inotify_init1(IN_NONBLOCK);
+        if (m_inotifyFd == -1) {
+            PME_LOG_ERROR(log_, "Failed to initialize inotify: " << strerror(errno));
+        }
+    }
+    
+    ~InotifyPcapHandler() {
+        if (m_watchFd != -1) {
+            inotify_rm_watch(m_inotifyFd, m_watchFd);
+        }
+        
+        if (m_inotifyFd != -1) {
+            close(m_inotifyFd);
+        }
+    }
+    
+    bool processFile(const std::string& filePath) override {
+        // Set up inotify watch on this file
+        if (m_inotifyFd != -1) {
+            if (m_watchFd != -1) {
+                inotify_rm_watch(m_inotifyFd, m_watchFd);
+            }
+            
+            m_watchFd = inotify_add_watch(m_inotifyFd, filePath.c_str(), 
+                                         IN_MODIFY | IN_ATTRIB);
+            if (m_watchFd == -1) {
+                PME_LOG_ERROR(log_, "Failed to add watch: " << strerror(errno));
+            }
+        }
+        
+        // Perform initial mapping
+        m_currentFilePath = filePath;
+        return remapFile();
+    }
+    
+    bool checkForUpdates() {
+        if (m_inotifyFd == -1 || m_watchFd == -1) {
+            // Fall back to time-based checking
+            return checkTimeBased();
+        }
+        
+        // Check for inotify events
+        char buffer[4096];
+        ssize_t length = read(m_inotifyFd, buffer, sizeof(buffer));
+        
+        if (length == -1) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                // No events available
+                return false;
+            } else {
+                PME_LOG_ERROR(log_, "Error reading inotify events: " << strerror(errno));
+                return false;
+            }
+        }
+        
+        if (length == 0) {
+            return false;
+        }
+        
+        // Process inotify events
+        size_t i = 0;
+        while (i < length) {
+            struct inotify_event* event = (struct inotify_event*)&buffer[i];
+            
+            if (event->mask & IN_MODIFY) {
+                // File was modified, remap it
+                return remapFile();
+            }
+            
+            i += sizeof(struct inotify_event) + event->len;
+        }
+        
+        return false;
+    }
+    
+private:
+    // Similar remapFile() implementation as in Option 1
+};
+Option 3: Memory-Mapped I/O (MMIO) with MAP_SHARED
+cpp
+
+Copy
+bool processFile(const std::string& filePath) override {
+    // Open file
+    m_fd = open(filePath.c_str(), O_RDONLY);
+    if (m_fd == -1) {
+        PME_LOG_ERROR(log_, "Failed to open file: " << strerror(errno));
+        return false;
+    }
+    
+    // Get file size
+    struct stat sb;
+    if (fstat(m_fd, &sb) == -1) {
+        PME_LOG_ERROR(log_, "Failed to get file stats: " << strerror(errno));
+        close(m_fd);
+        m_fd = -1;
+        return false;
+    }
+    
+    // Map file with shared mapping
+    m_mappedData = static_cast<uint8_t*>(mmap(nullptr, sb.st_size, 
+                                            PROT_READ, MAP_SHARED, m_fd, 0));
+    
+    // ... rest of implementation ...
+}
+Using MAP_SHARED can help see updates made to the file by the writer process, but it won't extend the mapping when the file grows.
+
+Recommended Approach for Growing PCAP Files
+For the most robust solution, I recommend a hybrid approach:
+
+Use inotify for Change Detection: This is the most efficient way to detect file changes on Linux.
+Use Periodic Remapping: When changes are detected, remap the file to see its new size.
+Maintain Processing State: Keep track of your position in the file.
+Handle End-of-File Specially: Instead of treating EOF as the end of processing, periodically check if more data has been appended.
+Implementation in Your Architecture
+To integrate this with your existing code:
+
+Create a GrowingMMapHandler subclass of your MMapHandler
+Add a live mode flag to your Engine
+Modify the run loop to periodically check for updates
+Update the iterator when the file grows
+cpp
+
+Copy
+// Add to Engine class
+void setLiveMode(bool live) {
+    m_liveMode = live;
+    
+    // If we're switching to live mode and already have a handler
+    if (live && m_mmapHandler) {
+        // Replace with a growing handler
+        auto currentHandler = std::move(m_mmapHandler);
+        m_mmapHandler = std::make_shared<GrowingPcapHandler>();
+        
+        // Copy over completion handler
+        m_mmapHandler->setCompletionHandler([this]() {
+            onFileProcessed();
+        });
+        
+        // If we're currently processing a file, switch to the new handler
+        if (!currentHandler->getCurrentFilePath().empty()) {
+            m_mmapHandler->processFile(currentHandler->getCurrentFilePath());
+            
+            // Update iterator
+            m_iterator = std::make_unique<ThreadSafeIterator>(
+                m_mmapHandler->getMappedData(),
+                m_mmapHandler->getMappedSize()
+            );
+        }
+    }
+}
+
+// Modify processCurrentFile for live mode
+void Engine::processCurrentFile() {
+    // Get next packet
+    PcapPacketIterator::PacketState state;
+    PcapPacketIterator::PacketView view;
+    
+    std::tie(state, view) = m_iterator->next();
+    
+    switch (state) {
+        case PcapPacketIterator::PacketState::VALID:
+            // Process packet as normal
+            break;
+            
+        case PcapPacketIterator::PacketState::END_OF_FILE:
+            if (m_liveMode) {
+                // In live mode, wait for more data
+                PME_LOG_DEBUG(log_, "Reached end of file in live mode, waiting for more data");
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            } else {
+                // Normal EOF processing for non-live mode
+                PME_LOG_INFO(log_, "Reached end of file, processed " 
+                           << m_iterator->getPacketCount() << " packets");
+                
+                m_mmapHandler->markCurrentFileProcessed();
+                m_mmapHandler->unmapCurrentFile();
+            }
+            break;
+            
+        // Other cases...
+    }
+}
+This approach gives you flexible handling of growing PCAP files without major changes to your core architecture. The key is to treat EOF as a temporary condition in live mode, and periodically check for and adapt to file growth.
+
