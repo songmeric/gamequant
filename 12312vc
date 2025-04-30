@@ -1,0 +1,470 @@
+Integrating Protocol Factory with PacketParser
+Here's how we can integrate the Protocol Factory pattern with your existing PacketParser class, using the setPayloadCallback approach to process UDP packets:
+1. First, let's define our ProtocolParser interface and Factory
+cppCopy// protocol_parser.h
+#pragma once
+
+#include <memory>
+#include <vector>
+#include <string>
+#include <functional>
+#include <map>
+#include "Log.h"
+
+// Forward declaration
+struct MarketEvent;
+
+/**
+ * Interface for all protocol parsers
+ */
+class ProtocolParser {
+public:
+    virtual ~ProtocolParser() = default;
+    
+    // Check if this parser can handle the data
+    virtual bool canParse(uint16_t srcPort, uint16_t dstPort, 
+                         const uint8_t* data, size_t size) const = 0;
+    
+    // Parse the packet data into market events
+    virtual std::vector<MarketEvent> parse(const uint8_t* data, size_t size) const = 0;
+    
+    // Get the name of this protocol
+    virtual std::string getProtocolName() const = 0;
+};
+
+/**
+ * Factory for creating protocol parsers
+ */
+class ProtocolParserFactory {
+public:
+    ProtocolParserFactory() {
+        m_log = PME_GET_LOGGER("ProtocolParserFactory");
+    }
+    
+    // Register a new parser
+    void registerParser(std::unique_ptr<ProtocolParser> parser) {
+        std::string name = parser->getProtocolName();
+        m_parsers.push_back(std::move(parser));
+        PME_LOG_INFO(m_log, "Registered parser for protocol: " << name);
+    }
+    
+    // Find parser that can handle this packet
+    const ProtocolParser* findParser(uint16_t srcPort, uint16_t dstPort, 
+                                    const uint8_t* data, size_t size) const {
+        for (const auto& parser : m_parsers) {
+            if (parser->canParse(srcPort, dstPort, data, size)) {
+                PME_LOG_DEBUG(m_log, "Found parser for protocol: " << parser->getProtocolName());
+                return parser.get();
+            }
+        }
+        PME_LOG_DEBUG(m_log, "No parser found for UDP packet src_port=" << srcPort 
+                    << " dst_port=" << dstPort);
+        return nullptr;
+    }
+    
+private:
+    std::vector<std::unique_ptr<ProtocolParser>> m_parsers;
+    px::Log* m_log;
+};
+2. Define the MarketEvent structure
+cppCopy// market_event.h
+#pragma once
+
+#include <string>
+#include <chrono>
+#include <variant>
+
+/**
+ * Structure to hold market data events
+ */
+struct MarketEvent {
+    // Timestamp from packet capture
+    std::chrono::system_clock::time_point timestamp;
+    
+    // Protocol that generated this event
+    std::string protocol;
+    
+    // Symbol/ticker
+    std::string symbol;
+    
+    // Event type
+    enum class Type {
+        TRADE,
+        QUOTE,
+        ORDER,
+        CANCEL,
+        IMBALANCE,
+        OTHER
+    } type;
+    
+    // Price information
+    double price = 0.0;
+    
+    // Size/quantity
+    int64_t size = 0;
+    
+    // Side (for quotes/orders)
+    enum class Side {
+        BUY,
+        SELL,
+        UNKNOWN
+    } side = Side::UNKNOWN;
+    
+    // Additional attributes specific to different event types
+    // Using variant to store type-specific data
+    std::variant<
+        std::monostate,  // No additional data
+        struct {         // Quote-specific data
+            double bidPrice;
+            int64_t bidSize;
+            double askPrice;
+            int64_t askSize;
+        },
+        struct {         // Imbalance-specific data
+            int64_t matchSize;
+            int64_t imbalanceSize;
+            char imbalanceSide;
+            double referencePrice;
+        }
+        // Add more types as needed
+    > additionalData;
+    
+    // Optional unique identifier for the event
+    int64_t eventId = 0;
+    
+    // Optional message sequence number from feed
+    int64_t sequenceNumber = 0;
+};
+3. Implement a concrete protocol parser (example)
+cppCopy// nasdaq_itch_parser.h
+#pragma once
+
+#include "protocol_parser.h"
+#include "market_event.h"
+#include "Log.h"
+
+/**
+ * Parser for NASDAQ ITCH protocol
+ */
+class NasdaqITCHParser : public ProtocolParser {
+public:
+    NasdaqITCHParser() {
+        m_log = PME_GET_LOGGER("NasdaqITCHParser");
+    }
+    
+    bool canParse(uint16_t srcPort, uint16_t dstPort, 
+                 const uint8_t* data, size_t size) const override {
+        // NASDAQ TotalView-ITCH typically uses specific ports
+        if (dstPort == 9000 || dstPort == 9001) {
+            return true;
+        }
+        
+        // Check for ITCH protocol signature if port check is insufficient
+        if (size >= 3) {
+            // ITCH 5.0 messages start with a length and message type
+            uint16_t length = *reinterpret_cast<const uint16_t*>(data);
+            uint8_t msgType = data[2];
+            
+            // Check for valid ITCH message types
+            if (msgType >= 'A' && msgType <= 'Z') {
+                return true;
+            }
+        }
+        
+        return false;
+    }
+    
+    std::vector<MarketEvent> parse(const uint8_t* data, size_t size) const override {
+        std::vector<MarketEvent> events;
+        
+        // Ensure we have at least the basic ITCH header
+        if (size < 3) {
+            PME_LOG_WARNING(m_log, "ITCH packet too small: " << size << " bytes");
+            return events;
+        }
+        
+        // Parse message type
+        uint8_t msgType = data[2];
+        
+        // Handle different message types
+        switch (msgType) {
+            case 'Q': // Add Quote
+                parseQuoteMessage(data, size, events);
+                break;
+                
+            case 'T': // Trade
+                parseTradeMessage(data, size, events);
+                break;
+                
+            // Add cases for other message types
+                
+            default:
+                PME_LOG_DEBUG(m_log, "Unhandled ITCH message type: " << static_cast<char>(msgType));
+                break;
+        }
+        
+        return events;
+    }
+    
+    std::string getProtocolName() const override {
+        return "NASDAQ_ITCH";
+    }
+    
+private:
+    // Parse an ITCH quote message
+    void parseQuoteMessage(const uint8_t* data, size_t size, 
+                         std::vector<MarketEvent>& events) const {
+        // Implementation would extract fields from the message
+        // This is a simplified example:
+        
+        // Extract stock symbol (assuming it's at offset 11 and is 8 bytes)
+        if (size < 19) return;
+        
+        std::string symbol(reinterpret_cast<const char*>(data + 11), 8);
+        // Trim any trailing spaces
+        symbol.erase(symbol.find_last_not_of(' ') + 1);
+        
+        // Create market event
+        MarketEvent event;
+        event.protocol = getProtocolName();
+        event.symbol = symbol;
+        event.type = MarketEvent::Type::QUOTE;
+        
+        // Extract other fields (simplified)
+        event.price = extractPrice(data + 19);
+        event.size = extractSize(data + 27);
+        
+        events.push_back(event);
+    }
+    
+    // Parse an ITCH trade message
+    void parseTradeMessage(const uint8_t* data, size_t size,
+                         std::vector<MarketEvent>& events) const {
+        // Similar implementation for trade messages
+        // ...
+    }
+    
+    // Helper to extract price from ITCH format (example)
+    double extractPrice(const uint8_t* data) const {
+        // ITCH prices are often scaled integers
+        int64_t priceValue = *reinterpret_cast<const int64_t*>(data);
+        return priceValue / 10000.0;  // Assuming 4 decimal places
+    }
+    
+    // Helper to extract size/quantity
+    int64_t extractSize(const uint8_t* data) const {
+        return *reinterpret_cast<const int64_t*>(data);
+    }
+    
+    px::Log* m_log;
+};
+4. UDPPacketHandler class
+cppCopy// udp_packet_handler.h
+#pragma once
+
+#include "protocol_parser.h"
+#include "market_event.h"
+#include "Log.h"
+#include <deque>
+#include <memory>
+
+/**
+ * Handler for UDP packets
+ */
+class UDPPacketHandler {
+public:
+    UDPPacketHandler() {
+        m_log = PME_GET_LOGGER("UDPPacketHandler");
+        
+        // Create the factory and register parsers
+        m_factory = std::make_unique<ProtocolParserFactory>();
+        
+        // Register all known protocol parsers
+        m_factory->registerParser(std::make_unique<NasdaqITCHParser>());
+        // Register other parsers...
+    }
+    
+    // Process a UDP packet
+    void processPacket(uint16_t srcPort, uint16_t dstPort, 
+                      const uint8_t* data, size_t size,
+                      std::chrono::system_clock::time_point timestamp) {
+        // Find a parser that can handle this packet
+        const ProtocolParser* parser = m_factory->findParser(srcPort, dstPort, data, size);
+        
+        if (parser) {
+            // Parse the packet
+            std::vector<MarketEvent> newEvents = parser->parse(data, size);
+            
+            // Set timestamp and add to our events queue
+            for (auto& event : newEvents) {
+                event.timestamp = timestamp;
+                m_events.push_back(event);
+            }
+            
+            PME_LOG_DEBUG(m_log, "Parsed " << newEvents.size() << " events from " 
+                        << parser->getProtocolName() << " packet");
+        } else {
+            PME_LOG_WARNING(m_log, "No parser found for UDP packet src_port=" 
+                          << srcPort << " dst_port=" << dstPort);
+        }
+    }
+    
+    // Get all events that have been parsed
+    const std::deque<MarketEvent>& getEvents() const {
+        return m_events;
+    }
+    
+    // Check if we have any events
+    bool hasEvents() const {
+        return !m_events.empty();
+    }
+    
+    // Clear all events
+    void clearEvents() {
+        m_events.clear();
+    }
+    
+private:
+    std::unique_ptr<ProtocolParserFactory> m_factory;
+    std::deque<MarketEvent> m_events;
+    px::Log* m_log;
+};
+5. Now, integrate with PacketParser by modifying the Engine class
+cppCopy// engine.cpp (modifications to init() method)
+
+void Engine::init() {
+    PME_LOG_INFO(log_, "Initializing engine with input directory: " << m_inputDir);
+    
+    // Create file handler
+    m_fileHandler = std::make_shared<PcapFileHandler>(m_inputDir);
+    
+    // Create memory map handler
+    m_mmapHandler = std::make_shared<MMapHandler>();
+    
+    // Create packet parser
+    m_parser = std::make_unique<PacketParser>();
+    
+    // Create UDP packet handler
+    m_udpHandler = std::make_unique<UDPPacketHandler>();
+    
+    // Set payload callback
+    static_cast<PacketParser*>(m_parser.get())->setPayloadCallback(
+        [this](const PacketParser::PacketInfo& info, const uint8_t* payload, size_t size) {
+            // Handle UDP packets with our protocol factory
+            if (info.l4Protocol == PacketParser::Protocol::UDP) {
+                m_udpHandler->processPacket(
+                    info.srcPort, 
+                    info.dstPort,
+                    payload, 
+                    size,
+                    info.timestamp
+                );
+                
+                // Periodically log event count
+                static size_t packetCount = 0;
+                if (++packetCount % 10000 == 0) {
+                    PME_LOG_INFO(log_, "Processed " << packetCount << " UDP packets, found " 
+                               << m_udpHandler->getEvents().size() << " market events");
+                }
+            }
+            // We're ignoring TCP packets for now
+        }
+    );
+    
+    // Set up callbacks
+    m_fileHandler->setTransitionHandler([this](const std::string& filePath) {
+        onFileReady(filePath);
+    });
+    
+    m_mmapHandler->setCompletionHandler([this]() {
+        onFileProcessed();
+    });
+    
+    PME_LOG_INFO(log_, "Engine initialized");
+}
+6. Update the Engine class definition to include the UDP handler
+cppCopy// engine.h (addition to private members)
+
+private:
+    // ... existing members ...
+    
+    // UDP packet handler
+    std::unique_ptr<UDPPacketHandler> m_udpHandler;
+7. After processing, use the market events
+cppCopy// engine.cpp (modification to onFileProcessed)
+
+void Engine::onFileProcessed() {
+    // Don't proceed if we're shutting down
+    if (shouldStop()) {
+        return;
+    }
+    
+    PME_LOG_INFO(log_, "File processing complete");
+    
+    // Process collected market events
+    if (m_udpHandler->hasEvents()) {
+        PME_LOG_INFO(log_, "Found " << m_udpHandler->getEvents().size() 
+                   << " market events in file");
+        
+        // Here you would analyze the events, possibly matching with TCP responses
+        analyzeMarketEvents();
+        
+        // Clear events for next file
+        m_udpHandler->clearEvents();
+    }
+    
+    // Clear iterator
+    m_iterator.reset();
+    
+    // Mark current file as processed and move to next
+    m_fileHandler->markCurrentFileProcessed();
+}
+
+void Engine::analyzeMarketEvents() {
+    // For now, just print some statistics
+    std::map<std::string, int> protocolCounts;
+    std::map<std::string, int> symbolCounts;
+    std::map<MarketEvent::Type, int> typeCounts;
+    
+    for (const auto& event : m_udpHandler->getEvents()) {
+        protocolCounts[event.protocol]++;
+        symbolCounts[event.symbol]++;
+        typeCounts[event.type]++;
+    }
+    
+    PME_LOG_INFO(log_, "Market event statistics:");
+    
+    PME_LOG_INFO(log_, "  Protocols:");
+    for (const auto& [protocol, count] : protocolCounts) {
+        PME_LOG_INFO(log_, "    " << protocol << ": " << count);
+    }
+    
+    PME_LOG_INFO(log_, "  Top 5 symbols:");
+    int symbolCount = 0;
+    for (const auto& [symbol, count] : symbolCounts) {
+        if (symbolCount++ < 5) {
+            PME_LOG_INFO(log_, "    " << symbol << ": " << count);
+        } else {
+            break;
+        }
+    }
+    
+    PME_LOG_INFO(log_, "  Event types:");
+    for (const auto& [type, count] : typeCounts) {
+        PME_LOG_INFO(log_, "    " << static_cast<int>(type) << ": " << count);
+    }
+}
+This implementation:
+
+Creates a clean protocol parser interface with factory pattern
+Provides a concrete example parser for NASDAQ ITCH
+Builds a UDPPacketHandler that uses the protocol factory
+Integrates with your existing PacketParser through the payload callback
+Updates the Engine to use the UDP handler and analyze results
+
+The beauty of this design is that you can add support for new UDP protocols by simply:
+
+Creating a new class that implements the ProtocolParser interface
+Registering it with the factory in UDPPacketHandler's constructor
+
+No changes are needed to the core packet processing or Engine logic.Add to Conversation
