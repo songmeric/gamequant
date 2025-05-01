@@ -1,0 +1,81 @@
+Short answer up-front
+Both skeletons will compile and run, but the earlier one I posted is a bit closer to “production-ready plumbing” while the new draft you pasted goes farther toward “business-logic placeholders.” Which is superior for you right now depends on what you value most:
+
+Goal today	Prefer
+Clean separation of concerns, deterministic ordering, fewer surprises in edge-cases	my earlier skeleton
+Having more scaffolding for proprietary-protocol parsing already in place (even if some details are leaky/incomplete)	your new draft
+Copy-paste-and-run minimal changes (no extra helpers, smaller binaries)	your new draft
+Easier to extend later with async/threads, strong const-correctness, smaller critical sections	my earlier skeleton
+
+Below is an apples-to-apples comparison, followed by concrete suggestions to cherry-pick the best parts of each.
+
+1 Directory scanning & prioritisation (PcapFileHandler.cpp)
+Aspect	Earlier skeleton	New draft
+Change detection	Maintains a snapshot (m_fileStates) and re-builds m_files only when something changed – avoids re-sorting every poll.	Always rebuilds potentialFiles on every scan (fine for small dirs, can be O(N²) churn on huge dirs).
+Growing-file check	Stores previous size in a static map, so a single scanDirectory() call is O(1) (no 100 ms sleep).	Calls std::this_thread::sleep_for(100 ms) per file to see if the size grows – blocks the polling thread and can hurt latency.
+Multiple-growing detection	Throws immediately if >1 growing file after rebuild.	Counts after rebuild (equivalent) but because it sleeps, a second writer that updates during the 100 ms window can slip through unnoticed.
+Ordering of UNPROCESSED_STATIC	Oldest first using last_write_time, identical to draft.	Same.
+Transition callback	Fired only when the selected file really changes (selectNextFile() guard).	Fires in both startProcessing() and markCurrentFileProcessed() regardless of whether selection actually changed – minor noise.
+
+Verdict: earlier code is more efficient and non-blocking; adopt its isFileGrowing() snapshot trick and remove the 100 ms sleep.
+
+2 Engine loop & concurrency
+Aspect	Earlier skeleton	New draft
+Processing strategy	Synchronous call to PcapFileProcessor::process() right inside the transition handler (easy to move to a worker later).	Opens the file and calls processNextPacket() in a while loop every second (ties the main thread to parsing; directory scans stall until file fully parsed).
+Polling period	200 ms (constant)	1 s
+Handling of long-running parse + new files	Would need a thread to parse concurrently; but you can add it in processCurrentFile().	Will not scan during parse; new files may pile up.
+
+Verdict: if you plan to parse and keep scanning simultaneously, the earlier separation (scanDirectory() + optional worker thread) is cleaner. Your draft is easier to read but couples concerns.
+
+3 Packet processing (PcapFileProcessor)
+Aspect	Earlier skeleton	New draft
+Header layout	Very slim: only what’s proven; leaves TODOs.	Much larger stubs: UDP/TCP flow contexts, sequence tracking, partial message buffers, etc.
+TCP reassembly	Uses PcapPlusPlus, registers only onTcpMessageReady.	Registers all four callbacks (start, end, ready) – more observability, good for debugging.
+Notification payload	LogicalPacketInfo (protocol string + bytes).	Two parameters (protocolType, length) – similar.
+UDP multi-packet logic	Not implemented (explicit TODO).	Starts implementing length extraction, sequence check, instrument map (but still TODO for actual formats).
+Memory ownership	unique_ptr<PcapFileProcessor>; object-lifetime obvious.	Uses new/delete for TcpReassembly – fine but could use std::unique_ptr.
+Error handling	Reader open failure returns false, logged.	Same; plus extra debug logs.
+
+Verdict: Your draft goes further toward the final state machine. It is more verbose but gives you a head-start on real protocol parsing. Keep most of that.
+
+4 Modern-C++ hygiene
+Check	Earlier	New draft
+std::make_unique / RAII	Yes	Uses naked new in a couple spots
+[[nodiscard]] for bool functions	Yes for process()	Not used
+const-correctness	More (e.g. selectNextFile() bool )	Slightly less
+Thread-safety comments	Mentions future but no global statics	Has a global sleep; otherwise similar
+
+Recommendations – combining the best
+Adopt the non-blocking isFileGrowing() snapshot (no sleep) and the change-only rebuild logic from the earlier skeleton.
+
+Keep your richer UDP/TCP flow contexts and callbacks, but wrap the TcpReassembly in std::unique_ptr and mark reassembly callbacks static.
+
+Drive parsing in a worker thread so that Engine can keep scanning while parsing – start with the earlier skeleton’s plan:
+
+cpp
+복사
+편집
+m_worker = std::thread([this]{ m_processor->process(); onFileProcessed(); });
+(join in destructor / stop).
+
+Reduce logging noise: fire transition callback only when the chosen file actually changes.
+
+Add unit-tests for:
+
+multiple-growing-file error
+
+ordering of static files
+
+detection of packet gaps per instrument.
+
+With those tweaks you’ll have the efficiency of the earlier skeleton and the protocol scaffolding of your draft, producing the best of both.
+
+Bottom line
+The question isn’t which skeleton “wins,” it’s which parts you cherry-pick for the next sprint.
+If you merge them as suggested above, you’ll land on a design that is:
+
+non-blocking & deterministic in directory polling,
+
+parser-ready for your proprietary protocols, and
+
+threading-friendly for future low-latency work.
