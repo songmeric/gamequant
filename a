@@ -1,0 +1,821 @@
+Component Design for Packet Matching Engine
+I'll design the three components as requested: PcapFileHandler.cpp, Engine.cpp, and PcapFileProcessor.cpp/h, following the specifications and style conventions from your existing code.
+
+PcapFileHandler.cpp
+cpp
+
+Copy
+#include "PcapFileHandler.h"
+#include <thread>
+#include <chrono>
+#include <stdexcept>
+
+void PcapFileHandler::scanDirectory() 
+{
+    if (m_directory.empty()) {
+        PME_LOG_INFO(log_, "No directory specified, skipping scan");
+        return;
+    }
+
+    std::filesystem::path dirPath(m_directory);
+    if (!std::filesystem::exists(dirPath) || !std::filesystem::is_directory(dirPath)) {
+        PME_LOG_ERROR(log_, "Directory " << m_directory << " does not exist or is not a directory");
+        return;
+    }
+
+    std::unordered_map<std::string, FileState> updatedFileStates;
+    std::vector<std::string> potentialFiles;
+    bool hasGrowingFile = false;
+    std::string growingFilePath;
+
+    // Scan all files in the directory
+    for (const auto& entry : std::filesystem::directory_iterator(dirPath)) {
+        if (!entry.is_regular_file()) continue;
+
+        std::string filePath = entry.path().string();
+        
+        // Check if we already know about this file
+        auto it = m_fileStates.find(filePath);
+        if (it != m_fileStates.end()) {
+            // File is already known, update its state if needed
+            if (it->second == FileState::GROWING) {
+                if (isFileGrowing(filePath)) {
+                    updatedFileStates[filePath] = FileState::GROWING;
+                    hasGrowingFile = true;
+                    growingFilePath = filePath;
+                } else {
+                    // File is no longer growing
+                    updatedFileStates[filePath] = FileState::UNPROCESSED_STATIC;
+                    potentialFiles.push_back(filePath);
+                }
+            } else {
+                // Keep its current state
+                updatedFileStates[filePath] = it->second;
+                if (it->second == FileState::UNPROCESSED_STATIC) {
+                    potentialFiles.push_back(filePath);
+                }
+            }
+        } else {
+            // New file, determine its state
+            if (!isValidPcapFile(filePath)) {
+                updatedFileStates[filePath] = FileState::INVALID;
+                continue;
+            }
+
+            if (isFileGrowing(filePath)) {
+                updatedFileStates[filePath] = FileState::GROWING;
+                hasGrowingFile = true;
+                growingFilePath = filePath;
+            } else {
+                updatedFileStates[filePath] = FileState::UNPROCESSED_STATIC;
+                potentialFiles.push_back(filePath);
+            }
+        }
+    }
+
+    // Check if there are multiple growing files (error condition)
+    if (hasGrowingFile) {
+        int growingFileCount = 0;
+        for (const auto& pair : updatedFileStates) {
+            if (pair.second == FileState::GROWING) {
+                growingFileCount++;
+            }
+        }
+
+        if (growingFileCount > 1) {
+            PME_LOG_ERROR(log_, "Multiple growing files detected, this is an error scenario");
+            throw std::runtime_error("Multiple growing files detected");
+        }
+
+        // Prioritize the growing file
+        m_files.clear();
+        m_files.push_back(growingFilePath);
+    } else {
+        // No growing files, sort unprocessed static files by timestamp (process older files first)
+        std::sort(potentialFiles.begin(), potentialFiles.end(), 
+            [](const std::string& a, const std::string& b) {
+                return std::filesystem::last_write_time(a) < std::filesystem::last_write_time(b);
+            });
+        
+        m_files = potentialFiles;
+    }
+
+    // Update the file states
+    m_fileStates = std::move(updatedFileStates);
+
+    // If we were processing a file that has changed state, reset
+    if (m_currentFileIndex >= 0 && 
+        m_currentFileIndex < static_cast<int>(m_files.size()) && 
+        m_files[m_currentFileIndex] != m_currentFilePath) {
+        m_currentFileIndex = -1;
+        m_currentFilePath = "";
+    }
+}
+
+void PcapFileHandler::startProcessing() 
+{
+    if (m_files.empty()) {
+        PME_LOG_INFO(log_, "No files to process");
+        return;
+    }
+
+    if (m_currentFileIndex == -1) {
+        if (selectNextFile()) {
+            if (m_transitionHandler) {
+                m_transitionHandler(m_currentFilePath);
+            }
+        }
+    }
+}
+
+void PcapFileHandler::markCurrentFileProcessed() 
+{
+    if (m_currentFileIndex >= 0 && m_currentFileIndex < static_cast<int>(m_files.size())) {
+        m_fileStates[m_currentFilePath] = FileState::PROCESSED_STATIC;
+        PME_LOG_INFO(log_, "Marked file as processed: " << m_currentFilePath);
+        
+        if (selectNextFile()) {
+            if (m_transitionHandler) {
+                m_transitionHandler(m_currentFilePath);
+            }
+        }
+    }
+}
+
+bool PcapFileHandler::isFileGrowing(const std::string& filePath) const 
+{
+    // Check if file is growing by comparing size at two points in time
+    try {
+        auto initialSize = std::filesystem::file_size(filePath);
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        auto laterSize = std::filesystem::file_size(filePath);
+        
+        return laterSize > initialSize;
+    } catch (const std::filesystem::filesystem_error& e) {
+        PME_LOG_ERROR(log_, "Error checking if file is growing: " << e.what());
+        return false;
+    }
+}
+
+bool PcapFileHandler::selectNextFile() 
+{
+    m_currentFileIndex++;
+    
+    if (m_currentFileIndex >= static_cast<int>(m_files.size())) {
+        m_currentFileIndex = -1;
+        m_currentFilePath = "";
+        return false;
+    }
+    
+    m_currentFilePath = m_files[m_currentFileIndex];
+    PME_LOG_INFO(log_, "Selected file for processing: " << m_currentFilePath);
+    return true;
+}
+
+bool PcapFileHandler::isValidPcapFile(const std::string& filePath) const 
+{
+    // Basic check for pcap file format by extension
+    // In a real implementation, we would check the file header
+    try {
+        std::filesystem::path path(filePath);
+        std::string extension = path.extension().string();
+        return extension == ".pcap" || extension == ".pcapng";
+    } catch (const std::filesystem::filesystem_error& e) {
+        PME_LOG_ERROR(log_, "Error checking if file is valid pcap: " << e.what());
+        return false;
+    }
+}
+PcapFileProcessor.h
+cpp
+
+Copy
+#pragma once
+
+#include <string>
+#include <functional>
+#include <memory>
+#include <unordered_map>
+#include <vector>
+#include <pcap++/PcapFileDevice.h>
+#include <pcap++/Packet.h>
+#include <pcap++/TcpReassembly.h>
+#include <pcap++/IPv4Layer.h>
+#include <pcap++/IPv6Layer.h>
+#include <pcap++/TcpLayer.h>
+#include <pcap++/UdpLayer.h>
+#include "Log.h"
+
+// Forward declarations for internal structures
+struct UdpFlowContext;
+struct TcpFlowContext;
+
+class PcapFileProcessor
+{
+public:
+    PcapFileProcessor();
+    ~PcapFileProcessor();
+
+    bool openFile(const std::string& filePath);
+    void closeFile();
+    bool processNextPacket();
+
+    void setPacketCallback(std::function<void(const std::string&, size_t)> callback);
+
+private:
+    // Packet processing
+    void onUdpPacket(pcpp::Packet& packet);
+    void onTcpPacket(pcpp::Packet& packet);
+    
+    // TCP reassembly callbacks
+    static void onTcpMessageReady(pcpp::TcpStreamData tcpData, void* userCookie);
+    static void onTcpConnectionStart(pcpp::ConnectionData connectionData, void* userCookie);
+    static void onTcpConnectionEnd(pcpp::ConnectionData connectionData, pcpp::TcpReassembly::ConnectionEndReason reason, void* userCookie);
+    
+    // Protocol analysis functions
+    std::string determineFlowId(const pcpp::IPAddress& srcIP, uint16_t srcPort, 
+                              const pcpp::IPAddress& dstIP, uint16_t dstPort, 
+                              bool isInbound);
+    
+    bool canParseProtocol(const std::string& flowId, const uint8_t* data, size_t dataLength);
+    void parseProtocolPayload(const std::string& flowId, const uint8_t* data, size_t dataLength);
+
+    // Flow context management
+    UdpFlowContext& getUdpFlowContext(const std::string& flowId);
+    void handleUdpSequence(const std::string& flowId, const std::string& instrument, 
+                         uint32_t sequenceNumber, const uint8_t* data, size_t dataLength);
+
+    // Member variables
+    pcpp::IFileReaderDevice* m_reader;
+    pcpp::TcpReassembly* m_tcpReassembly;
+    
+    std::function<void(const std::string&, size_t)> m_packetCallback;
+    
+    std::unordered_map<std::string, UdpFlowContext> m_udpFlowContexts;
+    std::unordered_map<std::string, TcpFlowContext> m_tcpFlowContexts;
+    
+    px::Log* log_;
+};
+
+// UDP flow tracking
+struct UdpFlowContext {
+    std::unordered_map<std::string, uint32_t> lastSequencePerInstrument;
+    std::vector<uint8_t> partialData;
+    size_t expectedTotalLength;
+    bool processingChunk;
+    
+    UdpFlowContext() : expectedTotalLength(0), processingChunk(false) {}
+};
+
+// TCP flow tracking
+struct TcpFlowContext {
+    std::vector<uint8_t> partialData;
+    size_t expectedTotalLength;
+    bool processingChunk;
+    
+    TcpFlowContext() : expectedTotalLength(0), processingChunk(false) {}
+};
+PcapFileProcessor.cpp
+cpp
+
+Copy
+#include "PcapFileProcessor.h"
+#include <pcap++/PayloadLayer.h>
+#include <pcap++/PacketUtils.h>
+
+PcapFileProcessor::PcapFileProcessor()
+    : m_reader(nullptr),
+      m_tcpReassembly(nullptr),
+      log_(PME_GET_LOGGER("PcapFileProcessor"))
+{
+}
+
+PcapFileProcessor::~PcapFileProcessor()
+{
+    closeFile();
+}
+
+bool PcapFileProcessor::openFile(const std::string& filePath)
+{
+    closeFile();
+
+    // Create a pcap file reader
+    m_reader = pcpp::IFileReaderDevice::getReader(filePath);
+    if (!m_reader) {
+        PME_LOG_ERROR(log_, "Cannot create file reader for file " << filePath);
+        return false;
+    }
+
+    // Open the pcap file for reading
+    if (!m_reader->open()) {
+        PME_LOG_ERROR(log_, "Cannot open file " << filePath << " for reading");
+        delete m_reader;
+        m_reader = nullptr;
+        return false;
+    }
+
+    // Create TCP reassembly for handling TCP streams
+    m_tcpReassembly = new pcpp::TcpReassembly(onTcpMessageReady, this, onTcpConnectionStart, onTcpConnectionEnd);
+
+    PME_LOG_INFO(log_, "Opened file " << filePath << " for processing");
+    return true;
+}
+
+void PcapFileProcessor::closeFile()
+{
+    if (m_tcpReassembly) {
+        delete m_tcpReassembly;
+        m_tcpReassembly = nullptr;
+    }
+
+    if (m_reader) {
+        m_reader->close();
+        delete m_reader;
+        m_reader = nullptr;
+    }
+    
+    // Clear all contexts
+    m_udpFlowContexts.clear();
+    m_tcpFlowContexts.clear();
+}
+
+bool PcapFileProcessor::processNextPacket()
+{
+    if (!m_reader) {
+        PME_LOG_ERROR(log_, "Pcap file not open for reading");
+        return false;
+    }
+
+    // Read the next packet
+    pcpp::RawPacket rawPacket;
+    if (!m_reader->getNextPacket(rawPacket)) {
+        PME_LOG_INFO(log_, "End of pcap file reached");
+        return false;
+    }
+
+    // Parse the packet
+    pcpp::Packet parsedPacket(&rawPacket);
+
+    // Check if it's a TCP or UDP packet
+    pcpp::TcpLayer* tcpLayer = parsedPacket.getLayerOfType<pcpp::TcpLayer>();
+    pcpp::UdpLayer* udpLayer = parsedPacket.getLayerOfType<pcpp::UdpLayer>();
+
+    if (tcpLayer) {
+        onTcpPacket(parsedPacket);
+    } else if (udpLayer) {
+        onUdpPacket(parsedPacket);
+    }
+
+    return true;
+}
+
+void PcapFileProcessor::setPacketCallback(std::function<void(const std::string&, size_t)> callback)
+{
+    m_packetCallback = callback;
+}
+
+void PcapFileProcessor::onUdpPacket(pcpp::Packet& packet)
+{
+    // Get IP layer
+    pcpp::IPv4Layer* ipv4Layer = packet.getLayerOfType<pcpp::IPv4Layer>();
+    pcpp::IPv6Layer* ipv6Layer = packet.getLayerOfType<pcpp::IPv6Layer>();
+    pcpp::UdpLayer* udpLayer = packet.getLayerOfType<pcpp::UdpLayer>();
+
+    if (!udpLayer || (!ipv4Layer && !ipv6Layer)) {
+        PME_LOG_ERROR(log_, "UDP packet missing IP or UDP layer");
+        return;
+    }
+
+    pcpp::IPAddress srcIP, dstIP;
+    if (ipv4Layer) {
+        srcIP = ipv4Layer->getSrcIPAddress();
+        dstIP = ipv4Layer->getDstIPAddress();
+    } else {
+        srcIP = ipv6Layer->getSrcIPAddress();
+        dstIP = ipv6Layer->getDstIPAddress();
+    }
+
+    uint16_t srcPort = udpLayer->getSrcPort();
+    uint16_t dstPort = udpLayer->getDstPort();
+
+    // Determine if inbound or outbound (placeholder logic - to be replaced)
+    // For example: multicast addresses are typically inbound market data
+    bool isInbound = srcIP.isMulticast() || 
+                     (dstPort >= 15000 && dstPort <= 16000);  // Example port range
+
+    // Create a flow ID
+    std::string flowId = determineFlowId(srcIP, srcPort, dstIP, dstPort, isInbound);
+
+    // Get payload data
+    const uint8_t* data = udpLayer->getLayerPayload();
+    size_t dataLength = udpLayer->getLayerPayloadSize();
+
+    if (dataLength == 0) {
+        PME_LOG_DEBUG(log_, "Empty UDP payload for flow " << flowId);
+        return;
+    }
+
+    // Check if we can parse this protocol
+    if (!canParseProtocol(flowId, data, dataLength)) {
+        PME_LOG_DEBUG(log_, "Cannot parse protocol for flow " << flowId);
+        return;
+    }
+
+    // Parse the protocol payload (application-specific logic)
+    parseProtocolPayload(flowId, data, dataLength);
+}
+
+void PcapFileProcessor::onTcpPacket(pcpp::Packet& packet)
+{
+    if (!m_tcpReassembly) {
+        PME_LOG_ERROR(log_, "TCP reassembly not initialized");
+        return;
+    }
+
+    // Process the packet with TCP reassembly
+    m_tcpReassembly->reassemblePacket(packet);
+}
+
+void PcapFileProcessor::onTcpMessageReady(pcpp::TcpStreamData tcpData, void* userCookie)
+{
+    PcapFileProcessor* processor = static_cast<PcapFileProcessor*>(userCookie);
+    if (!processor) {
+        return;
+    }
+
+    // Determine inbound/outbound (placeholder logic)
+    bool isInbound = (tcpData.getConnectionData().dstPort >= 8000 && 
+                     tcpData.getConnectionData().dstPort <= 9000);
+
+    // Create flow ID
+    std::string flowId = processor->determineFlowId(
+        tcpData.getConnectionData().srcIP, tcpData.getConnectionData().srcPort,
+        tcpData.getConnectionData().dstIP, tcpData.getConnectionData().dstPort,
+        isInbound);
+
+    // Check if we can parse this protocol
+    if (!processor->canParseProtocol(flowId, tcpData.getData(), tcpData.getDataLength())) {
+        PME_LOG_DEBUG(processor->log_, "Cannot parse TCP protocol for flow " << flowId);
+        return;
+    }
+
+    // Parse the protocol payload
+    processor->parseProtocolPayload(flowId, tcpData.getData(), tcpData.getDataLength());
+}
+
+void PcapFileProcessor::onTcpConnectionStart(pcpp::ConnectionData connectionData, void* userCookie)
+{
+    PcapFileProcessor* processor = static_cast<PcapFileProcessor*>(userCookie);
+    if (!processor) {
+        return;
+    }
+
+    PME_LOG_DEBUG(processor->log_, "TCP connection started: " 
+        << connectionData.srcIP.toString() << ":" << connectionData.srcPort
+        << " -> " 
+        << connectionData.dstIP.toString() << ":" << connectionData.dstPort);
+}
+
+void PcapFileProcessor::onTcpConnectionEnd(pcpp::ConnectionData connectionData, pcpp::TcpReassembly::ConnectionEndReason reason, void* userCookie)
+{
+    PcapFileProcessor* processor = static_cast<PcapFileProcessor*>(userCookie);
+    if (!processor) {
+        return;
+    }
+
+    PME_LOG_DEBUG(processor->log_, "TCP connection ended: " 
+        << connectionData.srcIP.toString() << ":" << connectionData.srcPort
+        << " -> " 
+        << connectionData.dstIP.toString() << ":" << connectionData.dstPort
+        << ", reason: " << static_cast<int>(reason));
+}
+
+std::string PcapFileProcessor::determineFlowId(const pcpp::IPAddress& srcIP, uint16_t srcPort,
+                                             const pcpp::IPAddress& dstIP, uint16_t dstPort,
+                                             bool isInbound)
+{
+    // Create a unique flow ID based on source and destination IP:port
+    // If inbound, use src as remote and dst as local
+    // If outbound, use dst as remote and src as local
+    std::string flowId;
+    
+    if (isInbound) {
+        flowId = "IN_" + srcIP.toString() + ":" + std::to_string(srcPort) + 
+                 "_" + dstIP.toString() + ":" + std::to_string(dstPort);
+    } else {
+        flowId = "OUT_" + dstIP.toString() + ":" + std::to_string(dstPort) + 
+                 "_" + srcIP.toString() + ":" + std::to_string(srcPort);
+    }
+    
+    return flowId;
+}
+
+bool PcapFileProcessor::canParseProtocol(const std::string& flowId, const uint8_t* data, size_t dataLength)
+{
+    // First layer: Check if the flow ID indicates a known protocol
+    // This is a placeholder - replace with actual flow identification logic
+    
+    // Example condition for market data feed on UDP
+    if (flowId.find("IN_") == 0 && flowId.find(":5000") != std::string::npos) {
+        // Market data feed protocol
+        
+        // Second layer: Check byte structure of the message payload
+        if (dataLength >= 8) {
+            // Example check: first byte pattern for a particular protocol
+            if (data[0] == 0x01) {
+                return true;
+            }
+        }
+    }
+    
+    // Example condition for order gateway on TCP
+    if (flowId.find("OUT_") == 0 && flowId.find(":8000") != std::string::npos) {
+        // Order gateway protocol
+        
+        // Second layer check
+        if (dataLength >= 12) {
+            // Example check: specific protocol header pattern
+            if (data[0] == 0x02 && data[1] == 0x00) {
+                return true;
+            }
+        }
+    }
+    
+    return false;  // Default: cannot parse
+}
+
+UdpFlowContext& PcapFileProcessor::getUdpFlowContext(const std::string& flowId)
+{
+    return m_udpFlowContexts[flowId];
+}
+
+void PcapFileProcessor::handleUdpSequence(const std::string& flowId, const std::string& instrument, 
+                                        uint32_t sequenceNumber, const uint8_t* data, size_t dataLength)
+{
+    auto& flowContext = getUdpFlowContext(flowId);
+    auto& lastSeq = flowContext.lastSequencePerInstrument[instrument];
+    
+    if (lastSeq != 0 && sequenceNumber != lastSeq + 1) {
+        // Packet drop detected
+        PME_LOG_WARN(log_, "UDP packet drop detected for instrument " << instrument 
+                    << ", last seq: " << lastSeq << ", current seq: " << sequenceNumber);
+        
+        // Reset any ongoing chunk processing
+        flowContext.partialData.clear();
+        flowContext.processingChunk = false;
+    }
+    
+    lastSeq = sequenceNumber;
+}
+
+void PcapFileProcessor::parseProtocolPayload(const std::string& flowId, const uint8_t* data, size_t dataLength)
+{
+    // Placeholder for proprietary protocol parsing logic
+    std::string protocolType;
+    
+    if (flowId.find("IN_") == 0 && flowId.find(":5000") != std::string::npos) {
+        protocolType = "MarketDataFeed";
+        
+        // Example parsing for market data protocol
+        // Extract sequence number and instrument
+        uint32_t sequenceNumber = 0;
+        std::string instrument = "UNKNOWN";
+        
+        // Assume protocol header format with sequence at offset 4
+        if (dataLength >= 8) {
+            sequenceNumber = data[4] | (data[5] << 8) | (data[6] << 16) | (data[7] << 24);
+            
+            // Check for dropped packets
+            handleUdpSequence(flowId, instrument, sequenceNumber, data, dataLength);
+            
+            // Check if this is the start of a multi-packet message
+            size_t messageLength = 0;  // Extract from header based on protocol format
+            auto& flowContext = getUdpFlowContext(flowId);
+            
+            if (flowContext.processingChunk) {
+                // We're in the middle of a chunked message
+                flowContext.partialData.insert(flowContext.partialData.end(), data, data + dataLength);
+                
+                if (flowContext.partialData.size() >= flowContext.expectedTotalLength) {
+                    // We have a complete message
+                    if (m_packetCallback) {
+                        m_packetCallback(protocolType, flowContext.partialData.size());
+                    }
+                    
+                    // Reset for next message
+                    flowContext.partialData.clear();
+                    flowContext.processingChunk = false;
+                }
+            } else {
+                // New message - check if it spans multiple packets
+                if (messageLength > dataLength) {
+                    // Multi-packet message - start collecting
+                    flowContext.partialData.assign(data, data + dataLength);
+                    flowContext.expectedTotalLength = messageLength;
+                    flowContext.processingChunk = true;
+                } else {
+                    // Complete message in a single packet
+                    if (m_packetCallback) {
+                        m_packetCallback(protocolType, dataLength);
+                    }
+                }
+            }
+        }
+    } 
+    else if (flowId.find("OUT_") == 0 && flowId.find(":8000") != std::string::npos) {
+        protocolType = "OrderGateway";
+        
+        // Parse order gateway protocol
+        // Example: Message length at offset 8
+        if (dataLength >= 12) {
+            size_t messageLength = data[8] | (data[9] << 8) | (data[10] << 16) | (data[11] << 24);
+            
+            if (m_packetCallback) {
+                m_packetCallback(protocolType, messageLength);
+            }
+        }
+    }
+    else {
+        PME_LOG_DEBUG(log_, "Unknown protocol for flow " << flowId);
+    }
+}
+Engine.cpp
+cpp
+
+Copy
+#include "Engine.h"
+#include "PcapFileHandler.h"
+#include "PcapFileProcessor.h"
+#include <thread>
+#include <chrono>
+
+void Engine::init() 
+{
+    PME_LOG_INFO(log_, "Initializing Engine");
+    
+    // Initialize file handler
+    m_fileHandler = std::make_shared<PcapFileHandler>(m_inputDir);
+    m_fileHandler->setFileTransitionHandler([this](const std::string& filePath) {
+        onFileReady(filePath);
+    });
+    
+    // Initialize packet processor
+    m_processor = std::make_shared<PcapFileProcessor>();
+    m_processor->setPacketCallback([this](const std::string& protocolType, size_t byteLength) {
+        // This callback will be extended with matching logic later
+        PME_LOG_DEBUG(log_, "Processed logical packet: " << protocolType << ", length: " << byteLength);
+    });
+    
+    PME_LOG_INFO(log_, "Engine initialized");
+}
+
+void Engine::start() 
+{
+    PME_LOG_INFO(log_, "Starting Engine");
+    m_shutdown.store(false, std::memory_order_relaxed);
+    
+    // Start processing files if any are available
+    m_fileHandler->startProcessing();
+}
+
+void Engine::stop() 
+{
+    PME_LOG_INFO(log_, "Stopping Engine");
+    m_shutdown.store(true, std::memory_order_relaxed);
+}
+
+void Engine::run() 
+{
+    PME_LOG_INFO(log_, "Engine running");
+    
+    while (!shouldStop()) {
+        // Periodically scan directory for new files
+        m_fileHandler->scanDirectory();
+        
+        // Process any available files
+        if (m_fileHandler->hasMoreFiles()) {
+            m_fileHandler->startProcessing();
+        }
+        
+        // Sleep to avoid busy-waiting
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+    }
+    
+    PME_LOG_INFO(log_, "Engine shutting down");
+}
+
+void Engine::onFileReady(const std::string& filePath) 
+{
+    PME_LOG_INFO(log_, "File ready for processing: " << filePath);
+    
+    m_currentFilePath = filePath;
+    
+    // Process the file
+    try {
+        processCurrentFile();
+    } catch (const std::exception& e) {
+        PME_LOG_ERROR(log_, "Error processing file: " << e.what());
+    }
+}
+
+void Engine::onFileProcessed() 
+{
+    PME_LOG_INFO(log_, "File processing complete");
+    
+    // Mark the current file as processed
+    m_fileHandler->markCurrentFileProcessed();
+}
+
+void Engine::processCurrentFile() 
+{
+    if (!m_processor) {
+        PME_LOG_ERROR(log_, "Processor not initialized");
+        return;
+    }
+    
+    bool processing = m_processor->openFile(m_currentFilePath);
+    if (!processing) {
+        PME_LOG_ERROR(log_, "Failed to open file for processing: " << m_currentFilePath);
+        return;
+    }
+    
+    // Process all packets in the file
+    while (processing && !shouldStop()) {
+        processing = m_processor->processNextPacket();
+    }
+    
+    m_processor->closeFile();
+    
+    // Notify that file processing is complete
+    onFileProcessed();
+}
+Engine.h Update
+cpp
+
+Copy
+#pragma once
+
+#include "IPcapFileHandler.h"
+#include "PcapFileProcessor.h"
+#include "Log.h"
+#include <memory>
+#include <string>
+#include <atomic>
+#include <chrono>
+
+class Engine
+{
+public:
+    Engine(const std::string& inputDir):
+    m_inputDir(inputDir),
+    m_shutdown(false),
+    log_(PME_GET_LOGGER("Engine"))
+    {}
+
+    ~Engine() = default;
+
+    void init();
+
+    void start();
+
+    void stop();
+
+    bool shouldStop() const 
+    {
+        return m_shutdown.load(std::memory_order_relaxed);
+    }
+
+    void run();
+    
+private:
+    //handle file transitions
+    void onFileReady(const std::string& filePath);
+
+    //handle file process complete
+    void onFileProcessed();
+
+    //process packets from current pcap file
+    void processCurrentFile();
+
+    std::string m_inputDir;
+
+    std::shared_ptr<IPcapFileHandler> m_fileHandler;
+    
+    std::shared_ptr<PcapFileProcessor> m_processor;
+    
+    std::string m_currentFilePath;
+
+    std::atomic<bool> m_shutdown;
+
+    px::Log* log_;
+};
+This design provides a robust foundation for your packet matching engine. The components work together to:
+
+Monitor a directory for new PCAP files
+Process files according to priority rules
+Parse UDP and TCP packets appropriately
+Handle TCP reassembly for proper packet ordering
+Detect dropped UDP packets using sequence numbers
+Process multi-packet logical messages
+Provide callbacks for packet analysis
+The placeholder protocol parsing logic can be extended with your specific protocol implementations as needed.
+
