@@ -1,0 +1,383 @@
+I agree with your suggestions. Let's make these improvements:
+
+1. Queue Updates and File Selection
+You're right that we don't need to completely rebuild the queue for every file state change. We should only rebuild when files are added or removed, and we can filter out unsuitable files (invalid/processed) at selection time.
+
+2. Proper Separation of Concerns
+I agree that PcapFileHandler should focus solely on file discovery and selection, not actual processing. Let's adjust this to better separate concerns.
+
+Here's my proposal:
+
+Updated PcapFileHandler.h
+cpp
+
+Copy
+#pragma once
+
+#include "IPcapFileHandler.h"
+#include "Log.h"
+#include <map>
+#include <vector>
+#include <string>
+#include <functional>
+#include <mutex>
+#include <algorithm>
+#include <filesystem>
+#include <atomic>
+#include <unordered_map>
+
+/**
+ * Manages PCAP file discovery, selection, and state tracking.
+ * Focuses solely on file management, not packet processing.
+ */
+class PcapFileHandler : public IPcapFileHandler {
+public:
+    /**
+     * Create a handler to manage files in the specified directory
+     * 
+     * @param directory Path to directory containing PCAP files
+     */
+    explicit PcapFileHandler(const std::string& directory);
+    
+    /**
+     * Clean up resources
+     */
+    ~PcapFileHandler() override = default;
+
+    // Non-copyable
+    PcapFileHandler(const PcapFileHandler&) = delete;
+    PcapFileHandler& operator=(const PcapFileHandler&) = delete;
+
+    /**
+     * Scan directory for new, modified, or removed files.
+     * Select next file to process if appropriate.
+     */
+    void scanDirectory() override;
+
+    /**
+     * Register callback for when a new file is ready for processing
+     * 
+     * @param handler Callback function to invoke when file is selected
+     */
+    void setFileTransitionHandler(std::function<void(const std::string&)> handler) override {
+        m_fileTransitionHandler = handler;
+    }
+    
+    /**
+     * Set callback for when a growing file has new data
+     * 
+     * @param handler Callback function to invoke when growing file changes
+     */
+    void setGrowingFileHandler(std::function<void(const std::string&)> handler) {
+        m_growingFileHandler = handler;
+    }
+
+    /**
+     * Check if a file appears to be corrupt
+     * 
+     * @param filePath Path to check
+     * @return True if corruption is detected
+     */
+    bool fileIsCorrupt(const std::string& filePath) const override;
+
+    /**
+     * Update file list after directory changes
+     * Only rebuilds when files are added or removed
+     */
+    void rebuildDirectory() override;
+
+    /**
+     * Mark the current file as processed
+     * Updates internal file state
+     */
+    void markCurrentFileProcessed() override;
+
+    /**
+     * Set up initial file growth monitoring 
+     * 
+     * @param filePath Path to the file to monitor
+     * @return True if the file is growing, false otherwise
+     */
+    bool initGrowthCheck(const std::string& filePath) override;
+
+    /**
+     * Check if a file is actively growing (being written to)
+     * 
+     * @param filePath Path to the file to check
+     * @return True if the file has grown since last check
+     */
+    bool isFileGrowing(const std::string& filePath) override;
+
+    /**
+     * Check if the directory contents have changed
+     * 
+     * @return True if files have been added, removed, or changed state
+     */
+    bool directoryHasChanged() const override {
+        return m_directoryChanged.load(std::memory_order_relaxed);
+    }
+
+    /**
+     * Get the count of growing files in the monitored directory
+     * 
+     * @return Number of files in GROWING state
+     */
+    int getGrowingFileCount() const override {
+        return m_growingFileCount.load(std::memory_order_relaxed);
+    }
+
+    /**
+     * Check if a file exists in our tracked files
+     * 
+     * @param filePath Path to check
+     * @return True if the file exists and is being tracked
+     */
+    bool fileExists(const std::string& filePath) const override {
+        if (filePath.empty()) {
+            return false;
+        }
+        return m_fileStates.find(filePath) != m_fileStates.end();
+    }
+
+    /**
+     * Wait for a specified period when no files are available
+     * 
+     * @param milliseconds Time to wait in milliseconds
+     */
+    void spin(const int milliseconds) const;
+
+    /**
+     * For testing only: explicitly set a file's state
+     */
+    void setFileState(const std::string& filePath, FileState state) {
+        m_fileStates[filePath] = state;
+    }
+
+private:
+    /**
+     * Check if a file is a valid PCAP file by examining its header
+     * 
+     * @param filePath Path to the file to validate
+     * @return True if the file has a valid PCAP header
+     */
+    bool isValidPcapFile(const std::string& filePath) const;
+    
+    /**
+     * Handle new files discovered in the directory
+     * 
+     * @param filePath Path to new file
+     * @return True if file was added successfully
+     */
+    bool handleNewFile(const std::string& filePath);
+    
+    /**
+     * Handle existing files that may have changed state
+     * 
+     * @param filePath Path to existing file
+     * @return True if file state was changed
+     */
+    bool handleExistingFile(const std::string& filePath);
+    
+    /**
+     * Clean up removed files from tracking structures
+     * 
+     * @return True if any files were removed
+     */
+    bool cleanupRemovedFiles();
+    
+    /**
+     * Handle the status of the current file being processed
+     * 
+     * @return True if scanning should continue, false to exit scan loop
+     */
+    bool handleCurrentFileStatus();
+    
+    /**
+     * Select the next file to process from the file list
+     * Filters out invalid and processed files at selection time
+     * 
+     * @return True if a file was selected
+     */
+    bool selectNextFile();
+
+    // Directory to scan
+    std::string m_directory;
+
+    // File state tracking
+    std::unordered_map<std::string, FileState> m_fileStates;
+    std::unordered_map<std::string, std::uintmax_t> m_previousSizes;
+    std::string m_currentFilePath;
+    
+    // Timestamp-sorted files for potential processing
+    std::vector<std::pair<std::string, std::time_t>> m_files;
+
+    // Callbacks for file transitions
+    std::function<void(const std::string&)> m_fileTransitionHandler;
+    std::function<void(const std::string&)> m_growingFileHandler;
+
+    // State tracking
+    std::atomic<bool> m_directoryChanged;
+    std::atomic<int> m_growingFileCount;
+
+    // Logger
+    px::Log* log_;
+};
+Updated PcapFileHandler.cpp (simplified scanDirectory and selectNextFile)
+cpp
+
+Copy
+void PcapFileHandler::scanDirectory() {
+    if (!fs::exists(m_directory)) {
+        PME_LOG_ERROR(log_, "Directory does not exist: " << m_directory);
+        throw std::runtime_error("Directory does not exist: " + m_directory);
+    }
+
+    // Check current file status if there is one
+    if (!m_currentFilePath.empty() && fileExists(m_currentFilePath)) {
+        if (!handleCurrentFileStatus()) {
+            return; // If current file handling indicates we should exit, do so
+        }
+    }
+    
+    // Track changes in file list (additions or removals)
+    bool filesAddedOrRemoved = false;
+    
+    // Check for new files
+    for (const auto& dirEntry : fs::directory_iterator(m_directory)) {
+        if (!dirEntry.is_regular_file()) {
+            continue;
+        }
+        
+        const std::string pathStr = dirEntry.path().string();
+        
+        if (m_fileStates.find(pathStr) == m_fileStates.end()) {
+            // New file
+            filesAddedOrRemoved |= handleNewFile(pathStr);
+        } else {
+            // Existing file - just update its state if needed
+            handleExistingFile(pathStr);
+        }
+    }
+    
+    // Check for removed files
+    filesAddedOrRemoved |= cleanupRemovedFiles();
+    
+    // Check for multiple growing files, which is an error condition
+    if (getGrowingFileCount() > 1) {
+        throw std::runtime_error("Multiple growing pcap files detected");
+    }
+
+    // Only rebuild if files were added or removed
+    if (filesAddedOrRemoved) {
+        rebuildDirectory();
+    }
+    
+    // If no current file is being processed, try to select one
+    if (m_currentFilePath.empty()) {
+        if (m_files.empty()) {
+            spin(100);
+            return;
+        }
+        
+        // This now handles filtering out invalid/processed files
+        selectNextFile();
+    }
+}
+
+bool PcapFileHandler::selectNextFile() {
+    if (m_files.empty() || !m_fileTransitionHandler) {
+        return false;
+    }
+    
+    // Find the first file that's eligible for processing
+    for (const auto& filePair : m_files) {
+        const std::string& filePath = filePair.first;
+        auto stateIt = m_fileStates.find(filePath);
+        
+        // Skip if file doesn't exist or isn't in a processable state
+        if (stateIt == m_fileStates.end()) {
+            continue;
+        }
+        
+        // Only process files that are UNPROCESSED_STATIC
+        if (stateIt->second == FileState::UNPROCESSED_STATIC) {
+            m_currentFilePath = filePath;
+            PME_LOG_INFO(log_, "Selected file for processing: " << m_currentFilePath);
+            m_fileTransitionHandler(m_currentFilePath);
+            return true;
+        }
+    }
+    
+    // No eligible files found
+    return false;
+}
+Update to Engine.cpp - Modified to separate file discovery from processing
+cpp
+
+Copy
+void Engine::onFileReady(const std::string& filePath) {
+    if (shouldStop()) {
+        return;
+    }
+    
+    PME_LOG_INFO(log_, "File ready for processing: " << filePath);
+    
+    // For now, just mark as processed for testing FileHandler
+    // Later this will create and use a PacketParser
+    if (m_fileHandler) {
+        m_fileHandler->markCurrentFileProcessed();
+    }
+}
+Proposed Future PacketParser.h for later implementation
+cpp
+
+Copy
+#pragma once
+
+#include <string>
+#include <functional>
+#include <memory>
+#include "Log.h"
+
+/**
+ * Processes PCAP files to extract and analyze packets.
+ * Will use pcapplusplus for packet parsing.
+ */
+class PacketParser {
+public:
+    explicit PacketParser();
+    ~PacketParser();
+    
+    /**
+     * Process a PCAP file and extract relevant packets
+     * 
+     * @param filePath Path to the PCAP file to process
+     * @param callback Function to call when processing is complete
+     */
+    void processFile(const std::string& filePath, 
+                    std::function<void()> completionCallback);
+    
+    /**
+     * Process new data from a growing file
+     * 
+     * @param filePath Path to the growing PCAP file
+     */
+    void processGrowingFile(const std::string& filePath);
+    
+private:
+    // Internal implementation details will be added later
+    px::Log* log_;
+};
+Summary of Changes
+Optimized Directory Rebuilding:
+We now only rebuild the file list when files are added or removed
+State changes no longer trigger rebuilding
+Selection Logic Improvement:
+selectNextFile() now filters out invalid/processed files at selection time
+This eliminates unnecessary rebuilds for file state changes
+Separation of Concerns:
+PcapFileHandler is now focused purely on file discovery and selection
+For testing, onFileReady just marks the file as processed
+Future PacketParser will handle the actual file processing
+These changes maintain the core functionality while making the code more efficient and better organized according to single responsibility principles.
+
