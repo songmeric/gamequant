@@ -101,7 +101,43 @@ Summary
 
 This not only uses portable C++ <csignal>, but also unifies shutdown coordination into a single, easy-to-inspect place.
 
+void Engine::run() {
+    PME_LOG_INFO(log_, "Engine running");
 
+    while (!SignalUtils::shutdownRequested.load(std::memory_order_relaxed)) {
+        bool didProcess = false;
+
+        // 1) Try exactly one completed (static) file
+        if (auto nextStatic = 
+                m_fileDiscovery->getNextFile(/* non-blocking */)) 
+        {
+            processFile(*nextStatic);
+            didProcess = true;
+        }
+        else {
+            // 2) No static file right now → look for exactly one growing file
+            auto growingFiles = m_fileDiscovery->getFilesInState(FileState::GROWING);
+            for (auto& f : growingFiles) {
+                if (m_fileDiscovery->hasNewData(f)) {
+                    processGrowingFile(f);
+                    didProcess = true;
+                    break;   // only one
+                }
+            }
+        }
+
+        if (!didProcess) {
+            // 3) Nothing to do right now → block briefly for static files
+            if (auto nextStatic = m_fileDiscovery->waitForNextFile(500)) {
+                processFile(*nextStatic);
+            }
+            // else just loop again (or you could sleep here)
+        }
+    }
+
+    stop();
+    PME_LOG_INFO(log_, "Engine exiting");
+}
 
 
 
