@@ -1,17 +1,108 @@
-I agree with your suggestions. Let's make these improvements:
+# Full Code for All Files
 
-1. Queue Updates and File Selection
-You're right that we don't need to completely rebuild the queue for every file state change. We should only rebuild when files are added or removed, and we can filter out unsuitable files (invalid/processed) at selection time.
+Below is the complete code for each file in the refactored system.
 
-2. Proper Separation of Concerns
-I agree that PcapFileHandler should focus solely on file discovery and selection, not actual processing. Let's adjust this to better separate concerns.
+## IPcapFileHandler.h
 
-Here's my proposal:
+```cpp
+#pragma once
 
-Updated PcapFileHandler.h
-cpp
+#include <string>
+#include <optional>
 
-Copy
+/**
+ * Interface for managing PCAP file discovery, selection, and state tracking.
+ * Provides an abstraction for file system operations and file state management.
+ */
+class IPcapFileHandler {
+public:
+    /**
+     * File processing states
+     */
+    enum class FileState {
+        INVALID,            // File is not a valid PCAP file
+        GROWING,            // File is actively being written to
+        UNPROCESSED_STATIC, // File is complete but hasn't been processed
+        PROCESSED_STATIC    // File has been processed
+    };
+
+    /**
+     * Virtual destructor for proper cleanup in derived classes
+     */
+    virtual ~IPcapFileHandler() = default;
+
+    /**
+     * Scan directory for new, modified, or removed files.
+     * Select next file to process if appropriate.
+     * 
+     * @return Path to the next file to process, or empty optional if none available
+     */
+    virtual std::optional<std::string> scanDirectory() = 0;
+
+    /**
+     * Set up initial file growth monitoring 
+     * 
+     * @param filePath Path to the file to monitor
+     * @return True if the file is growing, false otherwise
+     */
+    virtual bool initGrowthCheck(const std::string& filePath) = 0;
+    
+    /**
+     * Check if a file is actively growing (being written to)
+     * 
+     * @param filePath Path to the file to check
+     * @return True if the file has grown since last check
+     */
+    virtual bool isFileGrowing(const std::string& filePath) = 0;
+
+    /**
+     * Rebuild directory state after changes
+     * Updates the sorted list of files to process
+     */
+    virtual void rebuildDirectory() = 0;
+
+    /**
+     * Mark the specified file as processed
+     * 
+     * @param filePath Path to the file to mark as processed
+     */
+    virtual void markFileProcessed(const std::string& filePath) = 0;
+
+    /**
+     * Get the count of growing files in the monitored directory
+     * 
+     * @return Number of files in GROWING state
+     */
+    virtual int getGrowingFileCount() const = 0;
+
+    /**
+     * Check if the directory contents have changed
+     * 
+     * @return True if files have been added, removed, or changed state
+     */
+    virtual bool directoryHasChanged() const = 0;
+    
+    /**
+     * Check if a file exists in our tracked files
+     * 
+     * @param filePath Path to check
+     * @return True if the file exists and is being tracked
+     */
+    virtual bool fileExists(const std::string& filePath) const = 0;
+    
+    /**
+     * Check if a file appears to be corrupt
+     * 
+     * @param filePath Path to check
+     * @return True if corruption is detected
+     */
+    virtual bool fileIsCorrupt(const std::string& filePath) const = 0;
+};
+```
+
+## PcapFileHandler.h
+
+```cpp
 #pragma once
 
 #include "IPcapFileHandler.h"
@@ -19,12 +110,12 @@ Copy
 #include <map>
 #include <vector>
 #include <string>
-#include <functional>
 #include <mutex>
 #include <algorithm>
 #include <filesystem>
 #include <atomic>
 #include <unordered_map>
+#include <optional>
 
 /**
  * Manages PCAP file discovery, selection, and state tracking.
@@ -51,26 +142,10 @@ public:
     /**
      * Scan directory for new, modified, or removed files.
      * Select next file to process if appropriate.
-     */
-    void scanDirectory() override;
-
-    /**
-     * Register callback for when a new file is ready for processing
      * 
-     * @param handler Callback function to invoke when file is selected
+     * @return Path to the next file to process, or empty optional if none available
      */
-    void setFileTransitionHandler(std::function<void(const std::string&)> handler) override {
-        m_fileTransitionHandler = handler;
-    }
-    
-    /**
-     * Set callback for when a growing file has new data
-     * 
-     * @param handler Callback function to invoke when growing file changes
-     */
-    void setGrowingFileHandler(std::function<void(const std::string&)> handler) {
-        m_growingFileHandler = handler;
-    }
+    std::optional<std::string> scanDirectory() override;
 
     /**
      * Check if a file appears to be corrupt
@@ -87,10 +162,11 @@ public:
     void rebuildDirectory() override;
 
     /**
-     * Mark the current file as processed
-     * Updates internal file state
+     * Mark a specified file as processed
+     * 
+     * @param filePath Path to the file to mark as processed
      */
-    void markCurrentFileProcessed() override;
+    void markFileProcessed(const std::string& filePath) override;
 
     /**
      * Set up initial file growth monitoring 
@@ -191,14 +267,6 @@ private:
      * @return True if scanning should continue, false to exit scan loop
      */
     bool handleCurrentFileStatus();
-    
-    /**
-     * Select the next file to process from the file list
-     * Filters out invalid and processed files at selection time
-     * 
-     * @return True if a file was selected
-     */
-    bool selectNextFile();
 
     // Directory to scan
     std::string m_directory;
@@ -211,10 +279,6 @@ private:
     // Timestamp-sorted files for potential processing
     std::vector<std::pair<std::string, std::time_t>> m_files;
 
-    // Callbacks for file transitions
-    std::function<void(const std::string&)> m_fileTransitionHandler;
-    std::function<void(const std::string&)> m_growingFileHandler;
-
     // State tracking
     std::atomic<bool> m_directoryChanged;
     std::atomic<int> m_growingFileCount;
@@ -222,11 +286,58 @@ private:
     // Logger
     px::Log* log_;
 };
-Updated PcapFileHandler.cpp (simplified scanDirectory and selectNextFile)
-cpp
+```
 
-Copy
-void PcapFileHandler::scanDirectory() {
+## PcapFileHandler.cpp
+
+```cpp
+#include "PcapFileHandler.h"
+#include <fstream>
+#include <unordered_map>
+#include <chrono>
+#include <thread>
+#include <fcntl.h>
+#include <unistd.h>
+#include <string.h>
+#include <stdexcept>
+
+namespace fs = std::filesystem;
+
+// -------- helpers ----------------
+namespace {
+    /**
+     * Convert filesystem timestamp to time_t for sorting
+     */
+    std::time_t toTimeT(const fs::file_time_type& ftime) {
+        using namespace std::chrono;
+        return system_clock::to_time_t(
+            time_point_cast<system_clock::duration>(
+                ftime - fs::file_time_type::clock::now() + system_clock::now()
+            )
+        );
+    }
+}
+
+// -------- Constructor ----------------
+PcapFileHandler::PcapFileHandler(const std::string& directory)
+    : m_directory(directory),
+      m_directoryChanged(false),
+      m_growingFileCount(0),
+      log_(PME_GET_LOGGER("PcapFileHandler")) 
+{
+    if (!fs::exists(directory)) {
+        throw std::runtime_error("Directory does not exist: " + directory);
+    }
+    
+    if (!fs::is_directory(directory)) {
+        throw std::runtime_error("Path is not a directory: " + directory);
+    }
+    
+    PME_LOG_INFO(log_, "PcapFileHandler initialized with directory: " << directory);
+}
+
+// -------- Public interface ----------------
+std::optional<std::string> PcapFileHandler::scanDirectory() {
     if (!fs::exists(m_directory)) {
         PME_LOG_ERROR(log_, "Directory does not exist: " << m_directory);
         throw std::runtime_error("Directory does not exist: " + m_directory);
@@ -235,7 +346,11 @@ void PcapFileHandler::scanDirectory() {
     // Check current file status if there is one
     if (!m_currentFilePath.empty() && fileExists(m_currentFilePath)) {
         if (!handleCurrentFileStatus()) {
-            return; // If current file handling indicates we should exit, do so
+            // If we're processing a growing file, return it for continued processing
+            if (m_fileStates[m_currentFilePath] == FileState::GROWING) {
+                return m_currentFilePath;
+            }
+            return std::nullopt; // Nothing to do right now
         }
     }
     
@@ -272,24 +387,7 @@ void PcapFileHandler::scanDirectory() {
         rebuildDirectory();
     }
     
-    // If no current file is being processed, try to select one
-    if (m_currentFilePath.empty()) {
-        if (m_files.empty()) {
-            spin(100);
-            return;
-        }
-        
-        // This now handles filtering out invalid/processed files
-        selectNextFile();
-    }
-}
-
-bool PcapFileHandler::selectNextFile() {
-    if (m_files.empty() || !m_fileTransitionHandler) {
-        return false;
-    }
-    
-    // Find the first file that's eligible for processing
+    // Find next file to process and return it
     for (const auto& filePair : m_files) {
         const std::string& filePath = filePair.first;
         auto stateIt = m_fileStates.find(filePath);
@@ -303,81 +401,535 @@ bool PcapFileHandler::selectNextFile() {
         if (stateIt->second == FileState::UNPROCESSED_STATIC) {
             m_currentFilePath = filePath;
             PME_LOG_INFO(log_, "Selected file for processing: " << m_currentFilePath);
-            m_fileTransitionHandler(m_currentFilePath);
-            return true;
+            return m_currentFilePath;
         }
     }
     
     // No eligible files found
-    return false;
+    spin(100);
+    return std::nullopt;
 }
-Update to Engine.cpp - Modified to separate file discovery from processing
-cpp
 
-Copy
-void Engine::onFileReady(const std::string& filePath) {
-    if (shouldStop()) {
+void PcapFileHandler::rebuildDirectory() {
+    PME_LOG_INFO(log_, "Rebuilding file list after directory changes");
+    
+    std::vector<std::pair<std::string, std::time_t>> newFiles;
+    
+    for (const auto& [file, state] : m_fileStates) {
+        if (state == FileState::UNPROCESSED_STATIC || state == FileState::GROWING) {
+            PME_LOG_INFO(log_, "Adding file to processing queue: " << file);
+            newFiles.emplace_back(file, toTimeT(fs::last_write_time(file)));
+        }
+    }
+
+    // Sort by timestamp (oldest first)
+    std::sort(newFiles.begin(), newFiles.end(), 
+        [](const auto& a, const auto& b) {
+            return a.second < b.second;
+        }
+    );
+
+    m_files = std::move(newFiles);
+}
+
+void PcapFileHandler::markFileProcessed(const std::string& filePath) {
+    if (filePath.empty()) {
+        PME_LOG_WARNING(log_, "Cannot mark empty file path as processed");
         return;
     }
     
-    PME_LOG_INFO(log_, "File ready for processing: " << filePath);
+    PME_LOG_INFO(log_, "Marking file as processed: " << filePath);
     
-    // For now, just mark as processed for testing FileHandler
-    // Later this will create and use a PacketParser
-    if (m_fileHandler) {
-        m_fileHandler->markCurrentFileProcessed();
+    auto it = m_fileStates.find(filePath);
+    if (it != m_fileStates.end()) {
+        it->second = FileState::PROCESSED_STATIC;
+    } else {
+        PME_LOG_WARNING(log_, "Tried to mark non-existent file as processed: " << filePath);
     }
 }
-Proposed Future PacketParser.h for later implementation
-cpp
 
-Copy
+bool PcapFileHandler::fileIsCorrupt(const std::string& filePath) const {
+    // Simple implementation for now
+    return !isValidPcapFile(filePath);
+}
+
+bool PcapFileHandler::initGrowthCheck(const std::string& filePath) {
+    if (!fs::exists(filePath)) {
+        throw std::runtime_error("Cannot check growth of non-existent file: " + filePath);
+    }
+
+    auto initialSize = fs::file_size(filePath);
+    
+    // Wait a bit to see if the file grows
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    
+    auto currentSize = fs::file_size(filePath);
+    m_previousSizes[filePath] = currentSize;
+    
+    if (initialSize < currentSize) {
+        PME_LOG_INFO(log_, "File is growing: " << filePath);
+        return true;
+    } else if (initialSize > currentSize) {
+        PME_LOG_ERROR(log_, "File size decreased from " << initialSize << " to " << currentSize);
+        throw std::runtime_error("File size decreased");
+    }
+    
+    return false;
+}
+
+bool PcapFileHandler::isFileGrowing(const std::string& filePath) {
+    if (!fs::exists(filePath)) {
+        throw std::runtime_error("Cannot check growth of non-existent file: " + filePath);
+    }
+    
+    auto currentSize = fs::file_size(filePath);
+    auto it = m_previousSizes.find(filePath);
+    
+    // If we haven't seen this file before, store initial size and check again later
+    if (it == m_previousSizes.end()) {
+        m_previousSizes[filePath] = currentSize;
+        return true; // Assume growing until proven otherwise
+    }
+    
+    // Check if size has changed
+    bool isGrowing = (currentSize > it->second);
+    
+    // Update saved size
+    m_previousSizes[filePath] = currentSize;
+    
+    return isGrowing;
+}
+
+void PcapFileHandler::spin(const int milliseconds) const {
+    PME_LOG_INFO(log_, "No new valid PCAP files to process, re-scanning after " << milliseconds << "ms");
+    std::this_thread::sleep_for(std::chrono::milliseconds(milliseconds));
+}
+
+// -------- Private methods ----------------
+
+bool PcapFileHandler::handleNewFile(const std::string& filePath) {
+    PME_LOG_INFO(log_, "New file discovered: " << filePath);
+    
+    if (!isValidPcapFile(filePath)) {
+        m_fileStates[filePath] = FileState::INVALID;
+        return false;
+    }
+
+    bool isGrowing = initGrowthCheck(filePath);
+    m_fileStates[filePath] = isGrowing ? FileState::GROWING : FileState::UNPROCESSED_STATIC;
+    
+    if (isGrowing) {
+        ++m_growingFileCount;
+    }
+    
+    m_directoryChanged.store(true, std::memory_order_relaxed);
+    return true;
+}
+
+bool PcapFileHandler::handleExistingFile(const std::string& filePath) {
+    bool changed = false;
+    auto currentState = m_fileStates.at(filePath);
+    
+    // Check if growing file has stopped growing
+    if (currentState == FileState::GROWING && !isFileGrowing(filePath)) {
+        --m_growingFileCount;
+        m_fileStates[filePath] = FileState::UNPROCESSED_STATIC;
+        m_directoryChanged.store(true, std::memory_order_relaxed);
+        changed = true;
+    }
+    // Check if invalid file is now valid
+    else if (currentState == FileState::INVALID && isValidPcapFile(filePath) && !fileIsCorrupt(filePath)) {
+        m_fileStates[filePath] = FileState::UNPROCESSED_STATIC;
+        m_directoryChanged.store(true, std::memory_order_relaxed);
+        changed = true;
+    }
+    
+    return changed;
+}
+
+bool PcapFileHandler::cleanupRemovedFiles() {
+    bool hasRemovedFiles = false;
+    
+    for (auto it = m_fileStates.begin(); it != m_fileStates.end();) {
+        if (!fs::exists(it->first)) {
+            PME_LOG_INFO(log_, "Removing deleted file from tracking: " << it->first);
+            
+            // Adjust growing file count if needed
+            if (it->second == FileState::GROWING) {
+                --m_growingFileCount;
+            }
+            
+            // Clear current file path if it's the one being removed
+            if (m_currentFilePath == it->first) {
+                m_currentFilePath.clear();
+            }
+            
+            // Remove from all tracking data structures
+            it = m_fileStates.erase(it);
+            hasRemovedFiles = true;
+            m_directoryChanged.store(true, std::memory_order_relaxed);
+        } else {
+            ++it;
+        }
+    }
+    
+    return hasRemovedFiles;
+}
+
+bool PcapFileHandler::handleCurrentFileStatus() {
+    auto state = m_fileStates.at(m_currentFilePath);
+    
+    switch(state) {
+        case FileState::UNPROCESSED_STATIC:
+            // This is normal, continue with scan
+            break;
+            
+        case FileState::GROWING:
+            if (fileIsCorrupt(m_currentFilePath)) {
+                PME_LOG_ERROR(log_, "Growing file corrupted: " << m_currentFilePath);
+                throw std::runtime_error("Growing file corrupted: " + m_currentFilePath);
+            }
+            
+            if (isFileGrowing(m_currentFilePath)) {
+                // Still growing, will return this file for continued processing
+                return false; // Exit scan loop
+            } else {
+                // No longer growing, update state
+                --m_growingFileCount;
+                m_fileStates[m_currentFilePath] = FileState::UNPROCESSED_STATIC;
+                m_directoryChanged.store(true, std::memory_order_relaxed);
+            }
+            break;
+            
+        case FileState::PROCESSED_STATIC:
+            // Move to next file in the next iteration
+            m_currentFilePath.clear();
+            break;
+            
+        case FileState::INVALID:
+            PME_LOG_ERROR(log_, "Current file is invalid: " << m_currentFilePath);
+            m_currentFilePath.clear();
+            break;
+    }
+    
+    return true; // Continue scan
+}
+
+bool PcapFileHandler::isValidPcapFile(const std::string& filePath) const {
+    if (!fs::exists(filePath)) {
+        PME_LOG_ERROR(log_, "File does not exist: " << filePath);
+        return false;
+    }
+    
+    if (fs::file_size(filePath) < 24) {
+        PME_LOG_ERROR(log_, "File too small to be a PCAP file: " << filePath);
+        return false;
+    }
+    
+    // Open the file to check its header
+    bool isValid = true;
+    int fd = open(filePath.c_str(), O_RDONLY);
+    
+    if (fd == -1) {
+        PME_LOG_ERROR(log_, "Cannot open file: " << filePath << " - " << strerror(errno));
+        return false;
+    }
+    
+    // Read the PCAP global header (24 bytes)
+    uint8_t header[24];
+    ssize_t bytesRead = read(fd, header, sizeof(header));
+    close(fd);
+    
+    if (bytesRead != sizeof(header)) {
+        PME_LOG_ERROR(log_, "Failed to read PCAP header from: " << filePath);
+        return false;
+    }
+    
+    // Check magic number (0xa1b2c3d4 or 0xd4c3b2a1)
+    uint32_t magic = *reinterpret_cast<uint32_t*>(header);
+    if (magic != 0xa1b2c3d4 && magic != 0xd4c3b2a1) {
+        PME_LOG_ERROR(log_, "Invalid PCAP magic number in file: " << filePath << " (0x" << std::hex << magic << ")");
+        return false;
+    }
+    
+    return true;
+}
+```
+
+## Engine.h
+
+```cpp
+#pragma once
+
+#include "IPcapFileHandler.h"
+#include "Log.h"
+#include <memory>
+#include <string>
+#include <atomic>
+#include <chrono>
+
+// Forward declaration
+class PacketProcessor;
+
+/**
+ * Core engine that orchestrates the packet processing pipeline.
+ * Responsible for:
+ * - Initializing and coordinating components
+ * - Managing the processing lifecycle
+ */
+class Engine {
+public:
+    /**
+     * Construct an engine that processes files from the given directory
+     * 
+     * @param inputDir Directory containing PCAP files to process
+     */
+    explicit Engine(const std::string& inputDir);
+    
+    /**
+     * Default destructor 
+     */
+    ~Engine() = default;
+
+    // Non-copyable
+    Engine(const Engine&) = delete;
+    Engine& operator=(const Engine&) = delete;
+
+    /**
+     * Initialize engine components and prepare for processing
+     */
+    void init();
+
+    /**
+     * Signal the engine to stop processing
+     */
+    void stop();
+
+    /**
+     * Check if the engine should stop processing
+     * 
+     * @return True if shutdown has been requested
+     */
+    bool shouldStop() const {
+        return m_shutdown.load(std::memory_order_relaxed);
+    }
+
+    /**
+     * Run the main processing loop
+     */
+    void run();
+
+private:
+    // Input directory
+    std::string m_inputDir;
+
+    // Components
+    std::shared_ptr<IPcapFileHandler> m_fileHandler;
+    std::shared_ptr<PacketProcessor> m_packetProcessor; // Will be implemented later
+
+    // State
+    std::atomic<bool> m_shutdown;
+
+    // Logger
+    px::Log* log_;
+};
+```
+
+## Engine.cpp
+
+```cpp
+#include "Engine.h"
+#include "PcapFileHandler.h"
+// #include "PacketProcessor.h" // To be included later
+#include <iostream>
+#include <thread>
+#include <stdexcept>
+
+Engine::Engine(const std::string& inputDir)
+    : m_inputDir(inputDir),
+      m_shutdown(false),
+      log_(PME_GET_LOGGER("Engine")) 
+{
+    // Constructor initializer list handles all initialization
+}
+
+void Engine::init() {
+    PME_LOG_INFO(log_, "Initializing Engine with input directory: " << m_inputDir);
+
+    try {
+        // Create file handler
+        m_fileHandler = std::make_shared<PcapFileHandler>(m_inputDir);
+        
+        // PacketProcessor will be initialized later
+        // m_packetProcessor = std::make_shared<PacketProcessor>();
+
+        PME_LOG_INFO(log_, "Engine initialized successfully");
+    }
+    catch (const std::exception& e) {
+        PME_LOG_ERROR(log_, "Failed to initialize engine: " << e.what());
+        throw;
+    }
+}
+
+void Engine::stop() {
+    PME_LOG_INFO(log_, "Stopping engine");
+
+    // Set shutdown flag
+    m_shutdown.store(true, std::memory_order_relaxed);
+
+    PME_LOG_INFO(log_, "Engine stopped");
+}
+
+void Engine::run() {
+    PME_LOG_INFO(log_, "Engine running");
+
+    try {
+        while (!shouldStop()) {
+            if (m_fileHandler) {
+                // Scan directory and get next file to process
+                std::optional<std::string> filePath = m_fileHandler->scanDirectory();
+                
+                if (filePath) {
+                    PME_LOG_INFO(log_, "Processing file: " << *filePath);
+                    
+                    // For now, just mark as processed for testing
+                    // Later we'll use the PacketProcessor here
+                    m_fileHandler->markFileProcessed(*filePath);
+                    
+                    // TODO: When PacketProcessor is implemented:
+                    // if (m_packetProcessor) {
+                    //     m_packetProcessor->processFile(*filePath);
+                    // }
+                }
+            }
+            else {
+                PME_LOG_ERROR(log_, "No fileHandler, retrying init().");
+                init();
+            }
+            
+            // Small sleep to prevent CPU spinning
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+    } 
+    catch (const std::exception& e) {
+        PME_LOG_ERROR(log_, "Exception in engine loop: " << e.what());
+        stop();
+        throw; // Rethrow to allow main to handle fatal errors
+    }
+
+    PME_LOG_INFO(log_, "Engine run loop exited");
+}
+```
+
+## main.cpp
+
+```cpp
+#include <iostream>
+#include <cstdlib>
+#include <csignal>
+#include <string>
+#include <memory>
+#include "PacketMatchingEngine/Engine.h"
+#include "Log.h"
+#include <spapp/logging/logging.hpp>
+
+namespace {
+    std::shared_ptr<Engine> g_engine;
+    px::Log* log_ = PME_GET_LOGGER("main");
+
+    void signalHandler(int signal) {
+        PME_LOG_INFO(log_, "Received signal: " << signal << ", initiating shutdown.");
+        if (g_engine) {
+            g_engine->stop();
+        }
+    }
+}
+
+int main(int argc, char** argv) {
+    // Set up signal handlers
+    std::signal(SIGTERM, signalHandler);
+    std::signal(SIGINT, signalHandler);
+
+    // Default input directory
+    std::string inputDir = "/lxhome/songjoon/SBS/pme/tests/pcaps";
+
+    // Override from arguments if provided
+    if (argc > 1) {
+        inputDir = argv[1];
+    }
+
+    // Initialize logging
+    sp::logging::start(sp::logging::stdout_config());
+    sp::logging::set_override(sp::logging::level::DEBUG);
+    
+    try {
+        PME_LOG_INFO(log_, "Creating Packet Matching Engine");
+        g_engine = std::make_shared<Engine>(inputDir);
+        PME_LOG_INFO(log_, "Engine created");
+        
+        // Initialize and start the engine
+        g_engine->init();
+
+        PME_LOG_INFO(log_, "Running Engine");
+        g_engine->run();
+    }
+    catch (const std::exception& e) {
+        PME_LOG_ERROR(log_, "Error: " << e.what());
+        sp::logging::stop();
+        return 1;
+    }
+
+    PME_LOG_INFO(log_, "Exiting normally");
+    // Clean shutdown
+    sp::logging::stop();
+    return 0;
+}
+```
+
+## PacketProcessor.h (Forward Declaration Only)
+
+```cpp
 #pragma once
 
 #include <string>
-#include <functional>
-#include <memory>
 #include "Log.h"
 
 /**
- * Processes PCAP files to extract and analyze packets.
- * Will use pcapplusplus for packet parsing.
+ * Processes PCAP files to extract and analyze packet data.
+ * Will be implemented using pcapplusplus library.
  */
-class PacketParser {
+class PacketProcessor {
 public:
-    explicit PacketParser();
-    ~PacketParser();
+    /**
+     * Create a packet processor
+     */
+    PacketProcessor();
     
     /**
-     * Process a PCAP file and extract relevant packets
+     * Clean up resources
+     */
+    ~PacketProcessor();
+    
+    /**
+     * Process a PCAP file to extract packet data
      * 
      * @param filePath Path to the PCAP file to process
-     * @param callback Function to call when processing is complete
      */
-    void processFile(const std::string& filePath, 
-                    std::function<void()> completionCallback);
+    void processFile(const std::string& filePath);
     
     /**
-     * Process new data from a growing file
+     * Process new data in a growing PCAP file
      * 
      * @param filePath Path to the growing PCAP file
      */
     void processGrowingFile(const std::string& filePath);
     
 private:
-    // Internal implementation details will be added later
+    // Logger
     px::Log* log_;
+    
+    // Internal implementation details will be added later
 };
-Summary of Changes
-Optimized Directory Rebuilding:
-We now only rebuild the file list when files are added or removed
-State changes no longer trigger rebuilding
-Selection Logic Improvement:
-selectNextFile() now filters out invalid/processed files at selection time
-This eliminates unnecessary rebuilds for file state changes
-Separation of Concerns:
-PcapFileHandler is now focused purely on file discovery and selection
-For testing, onFileReady just marks the file as processed
-Future PacketParser will handle the actual file processing
-These changes maintain the core functionality while making the code more efficient and better organized according to single responsibility principles.
+```
 
+These files provide a complete implementation of the refactored architecture with the key change of having `scanDirectory()` return a filepath rather than using callbacks. The `PcapFileHandler` focuses solely on file discovery and state management, while the `PacketProcessor` (forward-declared for now) will be responsible for the actual packet processing.
