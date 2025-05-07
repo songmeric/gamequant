@@ -1,0 +1,108 @@
+// SignalUtils.h
+#pragma once
+
+#include <atomic>
+#include <csignal>
+
+namespace SignalUtils {
+    // These get set when SIGINT or SIGTERM arrives
+    extern std::atomic<bool> shutdownRequested;
+
+    // Single C‐style handler
+    inline void handleSignal(int /*signum*/) {
+        shutdownRequested.store(true, std::memory_order_relaxed);
+    }
+
+    // Install the handler for both SIGINT and SIGTERM
+    inline void install() {
+        std::signal(SIGINT,  handleSignal);
+        std::signal(SIGTERM, handleSignal);
+    }
+}
+
+// SignalUtils.cpp
+#include "SignalUtils.h"
+
+namespace SignalUtils {
+    std::atomic<bool> shutdownRequested{false};
+}
+
+
+
+#include "SignalUtils.h"
+#include "Engine.h"
+#include "Log.h"
+// …
+
+int main(int argc, char** argv) {
+    SignalUtils::install();  // now std::signal() is set up
+
+    // logging setup…
+    // parse inputDir…
+    auto engine = std::make_unique<Engine>(inputDir);
+    engine->init();
+    engine->run();  // will now exit when shutdownRequested == true
+    engine->stop();
+    return 0;
+}
+
+#include "SignalUtils.h"
+// …
+
+void Engine::run() {
+    PME_LOG_INFO(log_, "Engine running");
+    while (!SignalUtils::shutdownRequested.load(std::memory_order_relaxed)) {
+        // 1) Wait for next ready file (or timeout)
+        auto opt = m_fileDiscovery->waitForNextFile(500);
+        if (opt) processFile(*opt);
+
+        // 2) Handle growing files
+        for (auto& f : m_fileDiscovery->getFilesInState(FileState::GROWING)) {
+            if (m_fileDiscovery->hasNewData(f)) {
+                processGrowingFile(f);
+            }
+        }
+    }
+    stop();
+    PME_LOG_INFO(log_, "Engine exiting");
+}
+
+Remove your existing setupSignalHandlers() and all sigaction or s_engineSignalReceived bits.  In the run loop:
+
+4. In PcapFileDiscovery, also watch the same flag
+
+Remove its own setupSignalHandlers() and s_shuttingDown atomic.  In both the inotify watch thread and the worker thread, simply check:
+
+
+#include "SignalUtils.h"
+// …
+
+void InotifyDirectoryWatcher::watchThread() {
+    while (m_running.load() && !SignalUtils::shutdownRequested.load()) {
+        // … poll/read/process …
+    }
+    PME_LOG_INFO(log_, "Watch thread exiting");
+}
+
+void PcapFileDiscovery::workerThread() {
+    while (m_running.load() && !SignalUtils::shutdownRequested.load()) {
+        checkGrowingFiles();
+        std::this_thread::sleep_for(
+            std::chrono::milliseconds(m_config.growthCheckIntervalMs));
+    }
+    PME_LOG_INFO(log_, "Worker thread exiting");
+}
+
+
+Summary
+	•	We replaced every sigaction and S_* flag with one std::signal call via <csignal>.
+	•	A single SignalUtils::shutdownRequested atomic is visible to all threads.
+	•	Both Engine and Discovery threads simply bail out when that flag goes high, then call their stop() logic.
+
+This not only uses portable C++ <csignal>, but also unifies shutdown coordination into a single, easy-to-inspect place.
+
+
+
+
+
+
