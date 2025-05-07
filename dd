@@ -1,4 +1,369 @@
+#include "PcapFileHandler.h"
+#include <fstream>
+#include <unordered_map>
+#include <chrono>
+#include <thread>
+#include <fcntl.h>
+#include <unistd.h>
+#include <string.h>
+#include <stdexcept>
+
+namespace fs = std::filesystem;
+
+// -------- helpers ----------------
+namespace {
+    /**
+     * Convert filesystem timestamp to time_t for sorting
+     */
+    std::time_t toTimeT(const fs::file_time_type& ftime) {
+        using namespace std::chrono;
+        return system_clock::to_time_t(
+            time_point_cast<system_clock::duration>(
+                ftime - fs::file_time_type::clock::now() + system_clock::now()
+            )
+        );
+    }
+}
+
+// -------- Constructor ----------------
+PcapFileHandler::PcapFileHandler(const std::string& directory)
+    : m_directory(directory),
+      m_directoryChanged(false),
+      m_growingFileCount(0),
+      log_(PME_GET_LOGGER("PcapFileHandler")) 
+{
+    if (!fs::exists(directory)) {
+        throw std::runtime_error("Directory does not exist: " + directory);
+    }
+    
+    if (!fs::is_directory(directory)) {
+        throw std::runtime_error("Path is not a directory: " + directory);
+    }
+    
+    PME_LOG_INFO(log_, "PcapFileHandler initialized with directory: " << directory);
+}
+
+// -------- Public interface ----------------
+std::optional<std::string> PcapFileHandler::scanDirectory() {
+    if (!fs::exists(m_directory)) {
+        PME_LOG_ERROR(log_, "Directory does not exist: " << m_directory);
+        throw std::runtime_error("Directory does not exist: " + m_directory);
+    }
+
+    // Check current file status if there is one
+    if (!m_currentFilePath.empty() && fileExists(m_currentFilePath)) {
+        if (!handleCurrentFileStatus()) {
+            // Return current file for reprocessing or continued processing
+            return m_currentFilePath;
+        }
+    }
+    
+    // Track changes in file list (additions or removals)
+    bool filesAddedOrRemoved = false;
+    
+    // Check for new files
+    for (const auto& dirEntry : fs::directory_iterator(m_directory)) {
+        if (!dirEntry.is_regular_file()) {
+            continue;
+        }
+        
+        const std::string pathStr = dirEntry.path().string();
+        
+        if (m_fileStates.find(pathStr) == m_fileStates.end()) {
+            // New file
+            filesAddedOrRemoved |= handleNewFile(pathStr);
+        } else {
+            // Existing file - just update its state if needed
+            handleExistingFile(pathStr);
+        }
+    }
+    
+    // Check for removed files
+    filesAddedOrRemoved |= cleanupRemovedFiles();
+    
+    // Check for multiple growing files, which is an error condition
+    if (getGrowingFileCount() > 1) {
+        throw std::runtime_error("Multiple growing pcap files detected");
+    }
+
+    // Only rebuild if files were added or removed
+    if (filesAddedOrRemoved) {
+        rebuildDirectory();
+    }
+    
+    // Find next file to process and return it
+    for (const auto& filePair : m_files) {
+        const std::string& filePath = filePair.first;
+        auto stateIt = m_fileStates.find(filePath);
+        
+        // Skip if file doesn't exist or isn't in a processable state
+        if (stateIt == m_fileStates.end()) {
+            continue;
+        }
+        
+        // Only process files that are UNPROCESSED_STATIC
+        if (stateIt->second == FileState::UNPROCESSED_STATIC) {
+            m_currentFilePath = filePath;
+            PME_LOG_INFO(log_, "Selected file for processing: " << m_currentFilePath);
+            return m_currentFilePath;
+        }
+    }
+    
+    // No eligible files found
+    spin(100);
+    return std::nullopt;
+}
+
+void PcapFileHandler::rebuildDirectory() {
+    PME_LOG_INFO(log_, "Rebuilding file list after directory changes");
+    
+    std::vector<std::pair<std::string, std::time_t>> newFiles;
+    
+    for (const auto& [file, state] : m_fileStates) {
+        if (state == FileState::UNPROCESSED_STATIC || state == FileState::GROWING) {
+            PME_LOG_INFO(log_, "Adding file to processing queue: " << file);
+            newFiles.emplace_back(file, toTimeT(fs::last_write_time(file)));
+        }
+    }
+
+    // Sort by timestamp (oldest first)
+    std::sort(newFiles.begin(), newFiles.end(), 
+        [](const auto& a, const auto& b) {
+            return a.second < b.second;
+        }
+    );
+
+    m_files = std::move(newFiles);
+}
+
+void PcapFileHandler::markFileProcessed(const std::string& filePath) {
+    if (filePath.empty()) {
+        PME_LOG_WARNING(log_, "Cannot mark empty file path as processed");
+        return;
+    }
+    
+    PME_LOG_INFO(log_, "Marking file as processed: " << filePath);
+    
+    auto it = m_fileStates.find(filePath);
+    if (it != m_fileStates.end()) {
+        it->second = FileState::PROCESSED_STATIC;
+    } else {
+        PME_LOG_WARNING(log_, "Tried to mark non-existent file as processed: " << filePath);
+    }
+}
+
+bool PcapFileHandler::fileIsCorrupt(const std::string& filePath) const {
+    // Simple implementation for now
+    return !isValidPcapFile(filePath);
+}
+
+bool PcapFileHandler::initGrowthCheck(const std::string& filePath) {
+    if (!fs::exists(filePath)) {
+        throw std::runtime_error("Cannot check growth of non-existent file: " + filePath);
+    }
+
+    auto initialSize = fs::file_size(filePath);
+    
+    // Wait a bit to see if the file grows
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    
+    auto currentSize = fs::file_size(filePath);
+    m_previousSizes[filePath] = currentSize;
+    
+    if (initialSize < currentSize) {
+        PME_LOG_INFO(log_, "File is growing: " << filePath);
+        return true;
+    } else if (initialSize > currentSize) {
+        PME_LOG_ERROR(log_, "File size decreased from " << initialSize << " to " << currentSize);
+        throw std::runtime_error("File size decreased");
+    }
+    
+    return false;
+}
+
+bool PcapFileHandler::isFileGrowing(const std::string& filePath) {
+    if (!fs::exists(filePath)) {
+        throw std::runtime_error("Cannot check growth of non-existent file: " + filePath);
+    }
+    
+    auto currentSize = fs::file_size(filePath);
+    auto it = m_previousSizes.find(filePath);
+    
+    // If we haven't seen this file before, store initial size and check again later
+    if (it == m_previousSizes.end()) {
+        m_previousSizes[filePath] = currentSize;
+        return true; // Assume growing until proven otherwise
+    }
+    
+    // Check if size has changed
+    bool isGrowing = (currentSize > it->second);
+    
+    // Update saved size
+    m_previousSizes[filePath] = currentSize;
+    
+    return isGrowing;
+}
+
+void PcapFileHandler::spin(const int milliseconds) const {
+    PME_LOG_INFO(log_, "No new valid PCAP files to process, re-scanning after " << milliseconds << "ms");
+    std::this_thread::sleep_for(std::chrono::milliseconds(milliseconds));
+}
+
+// -------- Private methods ----------------
+
+bool PcapFileHandler::handleNewFile(const std::string& filePath) {
+    PME_LOG_INFO(log_, "New file discovered: " << filePath);
+    
+    if (!isValidPcapFile(filePath)) {
+        m_fileStates[filePath] = FileState::INVALID;
+        return false;
+    }
+
+    bool isGrowing = initGrowthCheck(filePath);
+    m_fileStates[filePath] = isGrowing ? FileState::GROWING : FileState::UNPROCESSED_STATIC;
+    
+    if (isGrowing) {
+        ++m_growingFileCount;
+    }
+    
+    m_directoryChanged.store(true, std::memory_order_relaxed);
+    return true;
+}
+
+bool PcapFileHandler::handleExistingFile(const std::string& filePath) {
+    bool changed = false;
+    auto currentState = m_fileStates.at(filePath);
+    
+    // Check if growing file has stopped growing
+    if (currentState == FileState::GROWING && !isFileGrowing(filePath)) {
+        --m_growingFileCount;
+        m_fileStates[filePath] = FileState::UNPROCESSED_STATIC;
+        m_directoryChanged.store(true, std::memory_order_relaxed);
+        changed = true;
+    }
+    // Check if invalid file is now valid
+    else if (currentState == FileState::INVALID && isValidPcapFile(filePath) && !fileIsCorrupt(filePath)) {
+        m_fileStates[filePath] = FileState::UNPROCESSED_STATIC;
+        m_directoryChanged.store(true, std::memory_order_relaxed);
+        changed = true;
+    }
+    
+    return changed;
+}
+
+bool PcapFileHandler::cleanupRemovedFiles() {
+    bool hasRemovedFiles = false;
+    
+    for (auto it = m_fileStates.begin(); it != m_fileStates.end();) {
+        if (!fs::exists(it->first)) {
+            PME_LOG_INFO(log_, "Removing deleted file from tracking: " << it->first);
+            
+            // Adjust growing file count if needed
+            if (it->second == FileState::GROWING) {
+                --m_growingFileCount;
+            }
+            
+            // Clear current file path if it's the one being removed
+            if (m_currentFilePath == it->first) {
+                m_currentFilePath.clear();
+            }
+            
+            // Remove from all tracking data structures
+            it = m_fileStates.erase(it);
+            hasRemovedFiles = true;
+            m_directoryChanged.store(true, std::memory_order_relaxed);
+        } else {
+            ++it;
+        }
+    }
+    
+    return hasRemovedFiles;
+}
+
+bool PcapFileHandler::handleCurrentFileStatus() {
+    auto state = m_fileStates.at(m_currentFilePath);
+    
+    switch(state) {
+        case FileState::UNPROCESSED_STATIC:
+            // This indicates the file was selected but not processed properly
+            PME_LOG_WARNING(log_, "File " << m_currentFilePath << " was previously selected but not marked as processed");
+            // Return the same file again for another processing attempt
+            return false; // Exit scan loop, returning current file path
+            
+        case FileState::GROWING:
+            if (fileIsCorrupt(m_currentFilePath)) {
+                PME_LOG_ERROR(log_, "Growing file corrupted: " << m_currentFilePath);
+                throw std::runtime_error("Growing file corrupted: " + m_currentFilePath);
+            }
+            
+            if (isFileGrowing(m_currentFilePath)) {
+                // Still growing, will return this file for continued processing
+                return false; // Exit scan loop
+            } else {
+                // No longer growing, update state
+                --m_growingFileCount;
+                m_fileStates[m_currentFilePath] = FileState::UNPROCESSED_STATIC;
+                m_directoryChanged.store(true, std::memory_order_relaxed);
+            }
+            break;
+            
+        case FileState::PROCESSED_STATIC:
+            // Move to next file in the next iteration
+            m_currentFilePath.clear();
+            break;
+            
+        case FileState::INVALID:
+            PME_LOG_ERROR(log_, "Current file is invalid: " << m_currentFilePath);
+            m_currentFilePath.clear();
+            break;
+    }
+    
+    return true; // Continue scan
+}
+
+bool PcapFileHandler::isValidPcapFile(const std::string& filePath) const {
+    if (!fs::exists(filePath)) {
+        PME_LOG_ERROR(log_, "File does not exist: " << filePath);
+        return false;
+    }
+    
+    if (fs::file_size(filePath) < 24) {
+        PME_LOG_ERROR(log_, "File too small to be a PCAP file: " << filePath);
+        return false;
+    }
+    
+    // Open the file to check its header
+    bool isValid = true;
+    int fd = open(filePath.c_str(), O_RDONLY);
+    
+    if (fd == -1) {
+        PME_LOG_ERROR(log_, "Cannot open file: " << filePath << " - " << strerror(errno));
+        return false;
+    }
+    
+    // Read the PCAP global header (24 bytes)
+    uint8_t header[24];
+    ssize_t bytesRead = read(fd, header, sizeof(header));
+    close(fd);
+    
+    if (bytesRead != sizeof(header)) {
+        PME_LOG_ERROR(log_, "Failed to read PCAP header from: " << filePath);
+        return false;
+    }
+    
+    // Check magic number (0xa1b2c3d4 or 0xd4c3b2a1)
+    uint32_t magic = *reinterpret_cast<uint32_t*>(header);
+    if (magic != 0xa1b2c3d4 && magic != 0xd4c3b2a1) {
+        PME_LOG_ERROR(log_, "Invalid PCAP magic number in file: " << filePath << " (0x" << std::hex << magic << ")");
+        return false;
+    }
+    
+    return true;
+}
+
 # Full Code for All Files
+
+
 
 Below is the complete code for each file in the refactored system.
 
