@@ -1,0 +1,405 @@
+# ───────────────────────────
+#  Project layout
+# ───────────────────────────
+#  CMakeLists.txt
+#  include/
+#      Log.h                 ← keep your original file here
+#      SpscQueue.h
+#      Watcher.h
+#      Discovery.h
+#      ThreadPool.h
+#      PacketProcessor.h
+#      Engine.h
+#  src/
+#      Watcher.cpp
+#      Discovery.cpp
+#      ThreadPool.cpp
+#      PacketProcessor.cpp   ← put your latency logic inside the loop
+#      Engine.cpp
+#      main.cpp
+# ───────────────────────────
+
+
+#─────────────────  CMakeLists.txt  ─────────────────
+cmake_minimum_required(VERSION 3.25)
+project(pme LANGUAGES CXX)
+
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+add_executable(pme
+    src/Watcher.cpp
+    src/Discovery.cpp
+    src/ThreadPool.cpp
+    src/PacketProcessor.cpp
+    src/Engine.cpp
+    src/main.cpp)
+
+target_include_directories(pme PRIVATE include)
+
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(PCAP REQUIRED libpcap)
+target_link_libraries(pme PRIVATE ${PCAP_LIBRARIES})
+target_include_directories(pme PRIVATE ${PCAP_INCLUDE_DIRS})
+
+
+#─────────────────  include/SpscQueue.h  ─────────────────
+#pragma once
+#include <array>
+#include <atomic>
+#include <optional>
+
+/** lock-free single-producer / single-consumer ring buffer.  
+ *  CAPACITY **must** be power-of-two. */
+template<typename T, std::size_t CAPACITY>
+class SpscQueue {
+    static_assert((CAPACITY & (CAPACITY - 1)) == 0,
+                  "CAPACITY must be power-of-2");
+    static constexpr std::size_t MASK = CAPACITY - 1;
+
+public:
+    bool push(T v) {
+        auto h = head_.load(std::memory_order_relaxed);
+        auto n = (h + 1) & MASK;
+        if (n == tail_.load(std::memory_order_acquire)) return false;  // full
+        buf_[h] = std::move(v);
+        head_.store(n, std::memory_order_release);
+        return true;
+    }
+
+    bool pop(T& out) {
+        auto t = tail_.load(std::memory_order_relaxed);
+        if (t == head_.load(std::memory_order_acquire)) return false;  // empty
+        out = std::move(buf_[t]);
+        tail_.store((t + 1) & MASK, std::memory_order_release);
+        return true;
+    }
+
+    /** Linear scan; used only on rare delete events. */
+    void remove(const std::string& path) {
+        std::size_t t = tail_.load(std::memory_order_acquire);
+        std::size_t h = head_.load(std::memory_order_acquire);
+        while (t != h) {
+            if (buf_[t] == path) buf_[t].clear();      // tombstone
+            t = (t + 1) & MASK;
+        }
+    }
+
+private:
+    std::array<T, CAPACITY>      buf_{};
+    std::atomic<std::size_t>     head_{0}, tail_{0};
+};
+
+
+#─────────────────  include/Watcher.h  ─────────────────
+#pragma once
+#include <functional>
+#include <string>
+#include <sys/inotify.h>
+
+class Watcher {
+public:
+    using Callback = std::function<void(std::string_view, uint32_t)>;
+
+    Watcher(std::string directory, Callback cb);
+    ~Watcher();
+
+    int                 fd()  const noexcept { return fd_; }
+    const std::string&  dir() const noexcept { return dir_; }
+    void handleEvents();      // call when fd is readable
+
+private:
+    int         fd_{-1}, wd_{-1};
+    std::string dir_;
+    Callback    cb_;
+};
+
+
+#─────────────────  src/Watcher.cpp  ─────────────────
+#include "Watcher.h"
+#include <filesystem>
+#include <array>
+#include <unistd.h>
+#include <stdexcept>
+
+Watcher::Watcher(std::string d, Callback cb)
+    : dir_(std::move(d)), cb_(std::move(cb))
+{
+    if (!std::filesystem::is_directory(dir_))
+        throw std::runtime_error("Watcher: not a directory: " + dir_);
+
+    fd_ = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
+    if (fd_ == -1) throw std::runtime_error("inotify_init1 failed");
+
+    wd_ = inotify_add_watch(fd_, dir_.c_str(),
+            IN_CREATE | IN_MOVED_TO | IN_DELETE | IN_MOVED_FROM);
+    if (wd_ == -1) throw std::runtime_error("inotify_add_watch failed");
+}
+
+Watcher::~Watcher() {
+    if (fd_ != -1) close(fd_);
+}
+
+void Watcher::handleEvents() {
+    std::array<char, 4096> buf{};
+    auto n = read(fd_, buf.data(), buf.size());
+    if (n <= 0) return;
+
+    for (char* p = buf.data(); p < buf.data() + n; ) {
+        auto* ev = reinterpret_cast<inotify_event*>(p);
+        if (ev->len) cb_({ev->name, ev->len}, ev->mask);
+        p += sizeof(inotify_event) + ev->len;
+    }
+}
+
+
+#─────────────────  include/Discovery.h  ─────────────────
+#pragma once
+#include "Watcher.h"
+#include "SpscQueue.h"
+#include "Log.h"
+
+class Discovery {
+public:
+    explicit Discovery(const std::string& dir);
+
+    bool popReady(std::string& out) { return ready_.pop(out); }
+    int  watchFd() const noexcept   { return watcher_.fd();   }
+    void onReadable()               { watcher_.handleEvents(); }
+
+private:
+    void onEvent(std::string_view name, uint32_t mask);
+
+    Watcher                     watcher_;
+    SpscQueue<std::string, 8192> ready_;
+    px::Log*                    log_;
+};
+
+
+#─────────────────  src/Discovery.cpp  ─────────────────
+#include "Discovery.h"
+#include <filesystem>
+
+Discovery::Discovery(const std::string& dir)
+    : watcher_(dir, [this](auto n, auto m){ onEvent(n, m); }),
+      log_(PME_GET_LOGGER("Discovery"))
+{
+    PME_LOG_INFO(log_, "watching " << dir);
+
+    /* bootstrap: queue any .pcap already in directory */
+    for (auto& e : std::filesystem::directory_iterator(dir)) {
+        if (e.is_regular_file() && e.path().string().ends_with(".pcap"))
+            ready_.push(e.path().string());
+    }
+}
+
+void Discovery::onEvent(std::string_view name, uint32_t mask) {
+    std::string path = watcher_.dir() + "/" + std::string(name);
+
+    if (mask & (IN_DELETE | IN_MOVED_FROM)) {
+        ready_.remove(path);
+        return;
+    }
+    if (!(mask & (IN_CREATE | IN_MOVED_TO))) return;
+    if (!path.ends_with(".pcap"))            return;
+
+    if (!ready_.push(path))
+        PME_LOG_WARNING(log_, "queue full, dropping " << path);
+}
+
+
+#─────────────────  include/ThreadPool.h  ─────────────────
+#pragma once
+#include <queue>
+#include <thread>
+#include <vector>
+#include <condition_variable>
+#include <functional>
+
+class ThreadPool {
+public:
+    explicit ThreadPool(unsigned n = std::thread::hardware_concurrency());
+    ~ThreadPool();
+
+    template<typename F>
+    void enqueue(F&& f) {
+        {
+            std::lock_guard lk(m_);
+            q_.emplace(std::forward<F>(f));
+        }
+        cv_.notify_one();
+    }
+
+private:
+    void worker();
+
+    std::mutex                         m_;
+    std::condition_variable            cv_;
+    std::queue<std::function<void()>>  q_;
+    std::vector<std::thread>           threads_;
+    bool                               stop_{false};
+};
+
+
+#─────────────────  src/ThreadPool.cpp  ─────────────────
+#include "ThreadPool.h"
+
+ThreadPool::ThreadPool(unsigned n) {
+    for (unsigned i = 0; i < n; ++i)
+        threads_.emplace_back([this]{ worker(); });
+}
+
+ThreadPool::~ThreadPool() {
+    {
+        std::lock_guard lk(m_);
+        stop_ = true;
+    }
+    cv_.notify_all();
+    for (auto& t : threads_) t.join();
+}
+
+void ThreadPool::worker() {
+    while (true) {
+        std::function<void()> job;
+        {
+            std::unique_lock lk(m_);
+            cv_.wait(lk, [this]{ return stop_ || !q_.empty(); });
+            if (stop_ && q_.empty()) return;
+            job = std::move(q_.front());
+            q_.pop();
+        }
+        job();
+    }
+}
+
+
+#─────────────────  include/PacketProcessor.h  ─────────────────
+#pragma once
+#include <string>
+void processPcap(const std::string& file);   // implement your latency math here
+
+
+#─────────────────  src/PacketProcessor.cpp  ─────────────────
+#include "PacketProcessor.h"
+#include "Log.h"
+#include <pcap/pcap.h>
+
+void processPcap(const std::string& file)
+{
+    auto log_ = PME_GET_LOGGER("PacketProcessor");
+
+    char err[PCAP_ERRBUF_SIZE]{};
+    pcap_t* p = pcap_open_offline(file.c_str(), err);
+    if (!p) {
+        PME_LOG_ERROR(log_, "open " << file << " failed: " << err);
+        return;
+    }
+
+    PME_LOG_INFO(log_, "processing " << file);
+
+    const u_char* data;
+    struct pcap_pkthdr* hdr;
+
+    while (pcap_next_ex(p, &hdr, &data) == 1) {
+        /* ─── YOUR PACKET-LEVEL LATENCY LOGIC GOES HERE ─── */
+    }
+
+    pcap_close(p);
+    PME_LOG_INFO(log_, "done " << file);
+}
+
+
+#─────────────────  include/Engine.h  ─────────────────
+#pragma once
+#include "Discovery.h"
+#include "ThreadPool.h"
+#include "Log.h"
+#include <atomic>
+
+class Engine {
+public:
+    explicit Engine(const std::string& dir);
+    void run();                     // blocks until SIGINT/SIGTERM
+
+private:
+    void handleSignal(int);
+
+    Discovery   discovery_;
+    ThreadPool  pool_;
+    int         epfd_{-1};
+    std::atomic<bool> stop_{false};
+    px::Log*    log_;
+};
+
+
+#─────────────────  src/Engine.cpp  ─────────────────
+#include "Engine.h"
+#include "PacketProcessor.h"
+#include <sys/epoll.h>
+#include <signal.h>
+#include <unistd.h>
+#include <stdexcept>
+
+static Engine* self = nullptr;
+static void sigHandler(int) { if (self) self->handleSignal(0); }
+
+Engine::Engine(const std::string& dir)
+    : discovery_(dir),
+      log_(PME_GET_LOGGER("Engine"))
+{
+    self = this;
+
+    epfd_ = epoll_create1(0);
+    if (epfd_ == -1) throw std::runtime_error("epoll_create1 failed");
+
+    epoll_event ev{ .events = EPOLLIN, .data = {.ptr = &discovery_} };
+    epoll_ctl(epfd_, EPOLL_CTL_ADD, discovery_.watchFd(), &ev);
+
+    struct sigaction sa{};
+    sa.sa_handler = sigHandler;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGINT,  &sa, nullptr);
+    sigaction(SIGTERM, &sa, nullptr);
+}
+
+void Engine::handleSignal(int) {
+    stop_.store(true, std::memory_order_relaxed);
+}
+
+void Engine::run() {
+    PME_LOG_INFO(log_, "engine running");
+    std::string f;
+
+    while (!stop_.load(std::memory_order_relaxed)) {
+        epoll_event ev;
+        if (epoll_wait(epfd_, &ev, 1, 500) > 0)
+            static_cast<Discovery*>(ev.data.ptr)->onReadable();
+
+        while (discovery_.popReady(f))
+            pool_.enqueue([path = std::move(f)]{ processPcap(path); });
+    }
+
+    PME_LOG_INFO(log_, "engine shutdown");
+}
+
+
+#─────────────────  src/main.cpp  ─────────────────
+#include "Engine.h"
+#include "Log.h"
+#include <spapp/logging/logging.hpp>
+
+int main(int argc, char** argv) {
+    std::string dir = (argc > 1) ? argv[1] : "./pcaps";
+
+    sp::logging::start(sp::logging::stdout_config());
+    sp::logging::set_override(sp::logging::level::INFO);
+
+    try {
+        Engine eng(dir);
+        eng.run();
+    } catch (const std::exception& e) {
+        PME_LOG_ERROR(PME_GET_LOGGER("main"), e.what());
+        return 1;
+    }
+    return 0;
+}
