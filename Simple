@@ -1,3 +1,73 @@
+#─────────────────────────────────────────────────────────────────────────────
+#  Clean, modern CMakeLists.txt  —  C++23, PcapPlusPlus, Google Mock
+#─────────────────────────────────────────────────────────────────────────────
+cmake_minimum_required(VERSION 3.25)
+project(pme LANGUAGES CXX)
+
+# ── Build flags ─────────────────────────────────────────────────────────────
+set(CMAKE_CXX_STANDARD 23)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+if(NOT CMAKE_BUILD_TYPE)
+    set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
+endif()
+
+# ── PcapPlusPlus (local install) ────────────────────────────────────────────
+#
+# Default install dir is $HOME/pcpp-install, but let caller override:
+set(PCPP_ROOT "$ENV{HOME}/pcpp-install" CACHE PATH "PcapPlusPlus install root")
+
+set(PCPP_INCLUDE_DIR "${PCPP_ROOT}/include")
+set(PCPP_LIB_DIR     "${PCPP_ROOT}/lib64")
+
+# Three static libs we usually link against; adjust names if you built shared.
+foreach(lib IN ITEMS Common++ Packet++ Pcap++)
+    find_library(PCPP_${lib}_LIB ${lib}
+                 PATHS "${PCPP_LIB_DIR}" NO_DEFAULT_PATH REQUIRED)
+endforeach()
+
+add_library(PcapPlusPlus INTERFACE)
+target_include_directories(PcapPlusPlus INTERFACE "${PCPP_INCLUDE_DIR}")
+target_link_libraries(PcapPlusPlus INTERFACE
+    ${PCPP_Common++_LIB}
+    ${PCPP_Packet++_LIB}
+    ${PCPP_Pcap++_LIB})
+
+# ── GoogleTest / GoogleMock ─────────────────────────────────────────────────
+#
+# Most modern distros ship a single gtest-dev / gmock-dev that exports
+# GTest::gmock and GTest::gtest.
+#
+find_package(GTest REQUIRED)   # brings both gtest + gmock targets
+
+# ── Project sources ─────────────────────────────────────────────────────────
+file(GLOB_RECURSE SOURCES CONFIGURE_DEPENDS
+     "src/*.cpp"
+)
+
+add_executable(pme ${SOURCES})
+target_include_directories(pme PRIVATE include)
+target_link_libraries(pme PRIVATE PcapPlusPlus)
+
+# ── Tests (optional) ────────────────────────────────────────────────────────
+option(PME_ENABLE_TESTS "Build unit tests" ON)
+
+if(PME_ENABLE_TESTS)
+    enable_testing()
+    file(GLOB_RECURSE TEST_SOURCES CONFIGURE_DEPENDS "tests/*.cpp")
+
+    add_executable(pme_tests ${TEST_SOURCES})
+    target_include_directories(pme_tests PRIVATE include)
+    target_link_libraries(pme_tests PRIVATE
+        PcapPlusPlus
+        GTest::gmock
+        GTest::gtest
+        GTest::gmock_main
+    )
+
+    add_test(NAME all_tests COMMAND pme_tests)
+endif()
+
 # ───────────────────────────
 #  Project layout
 # ───────────────────────────
