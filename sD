@@ -1,0 +1,186 @@
+#include <iostream>
+#include <vector>
+#include <map>
+#include <arpa/inet.h>
+
+#include "PcapFileDevice.h"
+#include "Packet.h"
+#include "TcpReassembly.h"
+#include "PayloadLayer.h"
+#include "Layer.h"
+
+// -----------------------------------------------------------------------------
+// 1) Define custom Application-Layer Protocols as PcapPlusPlus Layers
+//    - TCP protocol: razeprotocol
+//    - UDP protocol: spcast
+// -----------------------------------------------------------------------------
+
+// Base header structure for both protocols
+struct CustomProtoHeader {
+    uint16_t type;
+    uint16_t length;
+};
+
+// RazeProtocolLayer for TCP-based proprietary protocol
+class RazeProtocolLayer : public pcpp::Layer {
+public:
+    RazeProtocolLayer(uint8_t* data, size_t dataLen, pcpp::Packet* packet, pcpp::Layer* prevLayer)
+        : Layer(data, dataLen, packet, prevLayer)
+    {
+        m_Protocol = pcpp::UnknownProtocol;
+        if (dataLen >= sizeof(CustomProtoHeader)) {
+            header.type   = ntohs(*reinterpret_cast<uint16_t*>(data));
+            header.length = ntohs(*reinterpret_cast<uint16_t*>(data + 2));
+        } else {
+            header.type = header.length = 0;
+        }
+    }
+
+    CustomProtoHeader* getHeader() { return &header; }
+    uint8_t* getPayload() { return m_Data + sizeof(CustomProtoHeader); }
+    size_t   getPayloadLength() { return header.length; }
+
+    void parseNextLayer() override {}
+    void computeCalculateFields() override {}
+
+    static bool isRazeProtocol(pcpp::Packet& packet) {
+        // heuristic: payload length at least header size
+        if (auto* pl = packet.getLayerOfType<pcpp::PayloadLayer>()) {
+            return pl->getPayloadLen() >= sizeof(CustomProtoHeader);
+        }
+        return false;
+    }
+
+private:
+    CustomProtoHeader header;
+};
+
+// SpcastLayer for UDP-based proprietary protocol
+class SpcastLayer : public pcpp::Layer {
+public:
+    SpcastLayer(uint8_t* data, size_t dataLen, pcpp::Packet* packet, pcpp::Layer* prevLayer)
+        : Layer(data, dataLen, packet, prevLayer)
+    {
+        m_Protocol = pcpp::UnknownProtocol;
+        if (dataLen >= sizeof(CustomProtoHeader)) {
+            header.type   = ntohs(*reinterpret_cast<uint16_t*>(data));
+            header.length = ntohs(*reinterpret_cast<uint16_t*>(data + 2));
+        } else {
+            header.type = header.length = 0;
+        }
+    }
+
+    CustomProtoHeader* getHeader() { return &header; }
+    uint8_t* getPayload() { return m_Data + sizeof(CustomProtoHeader); }
+    size_t   getPayloadLength() { return header.length; }
+
+    void parseNextLayer() override {}
+    void computeCalculateFields() override {}
+
+    static bool isSpcast(pcpp::Packet& packet) {
+        if (auto* udpLayer = packet.getLayerOfType<pcpp::UdpLayer>()) {
+            return udpLayer->getDataLen() >= sizeof(CustomProtoHeader);
+        }
+        return false;
+    }
+
+private:
+    CustomProtoHeader header;
+};
+
+// -----------------------------------------------------------------------------
+// 2) Buffer for each TCP flow: accumulate reassembled bytes until full messages
+// -----------------------------------------------------------------------------
+static std::map<pcpp::ConnectionData, std::vector<uint8_t>> streamBuffers;
+
+// -----------------------------------------------------------------------------
+// 3) TCP reassembly callback: get new in-order bytes, parse full razeprotocol msgs
+// -----------------------------------------------------------------------------
+void onTcpMessageReady(int8_t /* side */, pcpp::TcpStreamData& tcpData, void* /* userCookie */)
+{
+    auto conn = tcpData.getConnectionData();
+    auto& buf = streamBuffers[conn];
+
+    // Append newly reassembled bytes
+    buf.insert(buf.end(), tcpData.getData(), tcpData.getData() + tcpData.getDataLength());
+
+    // Extract complete RazeProtocol messages
+    size_t offset = 0;
+    while (buf.size() - offset >= sizeof(CustomProtoHeader)) {
+        uint16_t msgLen = ntohs(*reinterpret_cast<uint16_t*>(buf.data() + offset + 2));
+        size_t total = sizeof(CustomProtoHeader) + msgLen;
+        if (buf.size() - offset < total)
+            break; // incomplete
+
+        // Wrap as Packet
+        pcpp::RawPacket rawApp(buf.data() + offset, total, 0, pcpp::LINKTYPE_RAW);
+        pcpp::Packet appPacket(&rawApp);
+        auto* layer = new RazeProtocolLayer(rawApp.getRawData(), rawApp.getRawDataLen(), &appPacket, nullptr);
+        appPacket.addLayer(layer);
+
+        auto header = layer->getHeader();
+        std::cout << "[RazeProtocol/TCP] type=" << header->type
+                  << ", length=" << header->length << std::endl;
+
+        offset += total;
+    }
+
+    if (offset > 0)
+        buf.erase(buf.begin(), buf.begin() + offset);
+}
+
+// -----------------------------------------------------------------------------
+// 4) Main: open pcap, feed TCP/UDP into handlers
+// -----------------------------------------------------------------------------
+int main(int argc, char* argv[])
+{
+    if (argc != 2) {
+        std::cerr << "Usage: " << argv[0] << " <pcap-file>" << std::endl;
+        return 1;
+    }
+
+    // Setup TCP reassembly
+    pcpp::TcpReassembly tcpReassembly(
+        nullptr,            // onConnectionStart
+        onTcpMessageReady,  // onDataReady
+        nullptr             // onConnectionEnd
+    );
+
+    // Open PCAP file
+    pcpp::PcapFileReaderDevice reader(argv[1]);
+    if (!reader.open()) {
+        std::cerr << "Error opening pcap file " << argv[1] << std::endl;
+        return 1;
+    }
+
+    pcpp::RawPacket rawPacket;
+    while (reader.getNextPacket(rawPacket)) {
+        pcpp::Packet packet(&rawPacket);
+
+        // Handle TCP (reassembly)
+        if (packet.isPacketOfType(pcpp::TCP)) {
+            tcpReassembly.reassemblePacket(packet);
+            continue;
+        }
+
+        // Handle UDP (per-datagram parsing)
+        if (packet.isPacketOfType(pcpp::UDP) && SpcastLayer::isSpcast(packet)) {
+            auto* pl = packet.getLayerOfType<pcpp::PayloadLayer>();
+            uint8_t* data = pl->getPayload();
+            size_t len = pl->getPayloadLen();
+
+            // Wrap datagram
+            pcpp::RawPacket rawApp(data, len, 0, pcpp::LINKTYPE_RAW);
+            pcpp::Packet appPacket(&rawApp);
+            auto* layer = new SpcastLayer(rawApp.getRawData(), rawApp.getRawDataLen(), &appPacket, nullptr);
+            appPacket.addLayer(layer);
+
+            auto header = layer->getHeader();
+            std::cout << "[Spcast/UDP] type=" << header->type
+                      << ", length=" << header->length << std::endl;
+        }
+    }
+
+    reader.close();
+    return 0;
+}
