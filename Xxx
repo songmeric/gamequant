@@ -1,3 +1,55 @@
+#────────────────────────────  src/FileQueue.h  ──────────────────────────────
+#pragma once
+#include "ShutdownUtils.h"
+#include <rigtorp/MPMCQueue.h>
+#include <condition_variable>
+#include <mutex>
+#include <string>
+
+class FileQueue {
+public:
+    explicit FileQueue(std::size_t cap = 1024) : q_(cap) {}
+
+    /* push blocks when full, returns false if shutdown hit while waiting */
+    bool push(std::string path) {
+        std::unique_lock lk(m_);
+        cv_not_full_.wait(lk, [&]{
+            return !q_.full() || shutdown::requested();
+        });
+        if (shutdown::requested()) return false;
+        q_.push(std::move(path));
+        lk.unlock();
+        cv_not_empty_.notify_one();
+        return true;
+    }
+
+    /* pop blocks when empty, returns false if shutdown hit while waiting */
+    bool pop(std::string &out) {
+        std::unique_lock lk(m_);
+        cv_not_empty_.wait(lk, [&]{
+            return !q_.empty() || shutdown::requested();
+        });
+        if (shutdown::requested()) return false;
+        (void)q_.try_pop(out);                 // guaranteed to succeed
+        lk.unlock();
+        cv_not_full_.notify_one();
+        return true;
+    }
+
+    /* wake every waiter (called once by Engine after SIGINT/SIGTERM) */
+    void wakeAll() {
+        cv_not_empty_.notify_all();
+        cv_not_full_.notify_all();
+    }
+
+private:
+    rigtorp::MPMCQueue<std::string> q_;
+    std::mutex                      m_;
+    std::condition_variable         cv_not_full_;
+    std::condition_variable         cv_not_empty_;
+};
+
+
 #────────────────────────────  src/Engine.h  ────────────────────────────────
 #pragma once
 #include <string>
