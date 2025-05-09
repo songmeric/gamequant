@@ -1,0 +1,88 @@
+```cpp
+// src/Engine.h
+#pragma once
+
+#include <string>
+#include <vector>
+#include <thread>
+#include "Discovery.h"
+#include "FileQueue.h"
+#include "ShutdownUtils.h"
+
+struct EngineCfg {
+    unsigned watchers = 1;
+    unsigned workers  = std::thread::hardware_concurrency();
+};
+
+class Engine {
+public:
+    Engine(std::string dir, EngineCfg cfg = {});
+    void run();  // blocks until shutdown
+
+private:
+    std::string              dir_;
+    EngineCfg                cfg_;
+    FileQueue                queue_{1024};
+    std::vector<std::thread> watcherThreads_;
+    std::vector<std::thread> workerThreads_;
+};
+```
+```cpp
+// src/Engine.cpp
+#include "Engine.h"
+#include "Log.h"
+#include "PacketProcessor.h"
+#include <filesystem>
+#include <chrono>
+#include <thread>
+
+Engine::Engine(std::string dir, EngineCfg cfg)
+    : dir_(std::move(dir)), cfg_(cfg), queue_(1024)
+{
+    auto lg = PME_GET_LOGGER("Engine");
+    PME_LOG_INFO(lg, "spawning " << cfg_.watchers
+                     << " watchers & " << cfg_.workers << " workers");
+
+    // start watcher threads
+    for(unsigned i = 0; i < cfg_.watchers; ++i) {
+        watcherThreads_.emplace_back([this] {
+            Discovery(dir_, queue_).run();
+        });
+    }
+
+    // start worker threads
+    for(unsigned i = 0; i < cfg_.workers; ++i) {
+        workerThreads_.emplace_back([this] {
+            auto lgw = PME_GET_LOGGER("Worker");
+            std::string path;
+            while(queue_.pop(path)) {
+                // validate
+                if(!std::filesystem::is_regular_file(path) ||
+                   std::filesystem::file_size(path) == 0)
+                    continue;
+                try {
+                    processPcap(path);
+                } catch(const std::exception &e) {
+                    PME_LOG_ERROR(lgw, "exception on " << path << ": " << e.what());
+                } catch(...) {
+                    PME_LOG_ERROR(lgw, "unknown exception on " << path);
+                }
+            }
+        });
+    }
+}
+
+void Engine::run() {
+    // simply wait for shutdown signal
+    while(!shutdown::requested()) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    }
+
+    PME_LOG_INFO(PME_GET_LOGGER("Engine"), "shutdown requested, joining threads");
+
+    // join watchers
+    for(auto &t : watcherThreads_) t.join();
+    // join workers
+    for(auto &t : workerThreads_)  t.join();
+}
+```
