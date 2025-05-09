@@ -1,0 +1,407 @@
+###############################################################################
+#             Packet-File Latency Engine  —  Multi-Watcher / Multi-Worker
+#             C++23  •  rigtorp::MPMCQueue  •  spapp logger  •  Graceful Ctrl-C
+#
+#  Highlights
+#  ─────────────────────────────────────────────────────────────────────────────
+#  • Any number of Watcher threads (each owns its inotify FD) push finished
+#    *.pcap paths into a single rigtorp::MPMCQueue.
+#  • Worker ThreadPool pops filenames, validates they still exist, and calls
+#    your PacketProcessor.
+#  • spapp/logger is wired through `PME_LOG_*` convenience macros.
+#  • ShutdownUtils installs SIGINT/SIGTERM handlers once; all threads poll
+#    `shutdown::requested()` to exit cleanly.
+#
+#  Directory layout
+#  ────────────────
+#  CMakeLists.txt
+#  extern/rigtorp/MPMCQueue.h      (copy from upstream repo)
+#  src/
+#     Log.h
+#     ShutdownUtils.h  ShutdownUtils.cpp
+#     FileQueue.h
+#     ThreadPool.h
+#     Watcher.h  Watcher.cpp
+#     Discovery.h  Discovery.cpp
+#     PacketProcessor.h  PacketProcessor.cpp
+#     Engine.h  Engine.cpp
+#     main.cpp
+###############################################################################
+
+#──────────────────────────────────────────────────────────────────────────────
+#  CMakeLists.txt
+#──────────────────────────────────────────────────────────────────────────────
+cmake_minimum_required(VERSION 3.25)
+project(pme LANGUAGES CXX)
+
+set(CMAKE_CXX_STANDARD 23)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+if(NOT CMAKE_BUILD_TYPE)
+    set(CMAKE_BUILD_TYPE Release CACHE STRING "build type" FORCE)
+endif()
+
+# ── PcapPlusPlus (local install) --------------------------------------------
+set(PCPP_ROOT "$ENV{HOME}/pcpp-install" CACHE PATH "PcapPlusPlus install root")
+set(PCPP_INCLUDE_DIR "${PCPP_ROOT}/include")
+set(PCPP_LIB_DIR     "${PCPP_ROOT}/lib64")
+
+foreach(lib IN ITEMS Common++ Packet++ Pcap++)
+    find_library(PCPP_${lib}_LIB ${lib}
+        PATHS "${PCPP_LIB_DIR}" NO_DEFAULT_PATH REQUIRED)
+endforeach()
+
+add_library(PcapPlusPlus INTERFACE)
+target_include_directories(PcapPlusPlus INTERFACE "${PCPP_INCLUDE_DIR}")
+target_link_libraries   (PcapPlusPlus INTERFACE
+    ${PCPP_Common++_LIB} ${PCPP_Packet++_LIB} ${PCPP_Pcap++_LIB})
+
+# ── Sources ------------------------------------------------------------------
+file(GLOB_RECURSE SRC CONFIGURE_DEPENDS "src/*.cpp")
+add_executable(pme ${SRC})
+target_include_directories(pme PRIVATE src extern/rigtorp)
+target_link_libraries      (pme PRIVATE PcapPlusPlus)
+
+###############################################################################
+#                                 source files
+###############################################################################
+
+#──────────────────────────────  src/Log.h  ───────────────────────────────────
+#pragma once
+#include <spapp/logging/logging.hpp>
+
+/* wrap spapp logging with PME_* macros */
+#define PME_GET_LOGGER(name) sp::logging::get_logger(name)
+
+#define PME_LOG_DEBUG(lg,msg) SPLOG_DEBUG(lg,msg)
+#define PME_LOG_INFO(lg,msg)  SPLOG_INFO (lg,msg)
+#define PME_LOG_WARN(lg,msg)  SPLOG_WARN (lg,msg)
+#define PME_LOG_ERROR(lg,msg) SPLOG_ERROR(lg,msg)
+
+#───────────────────────────  src/ShutdownUtils.h  ───────────────────────────
+#pragma once
+#include <atomic>
+
+namespace shutdown {
+    extern std::atomic<bool> g_shutdown;
+
+    void installSignalHandlers();          // call once at program start
+
+    inline bool requested() {
+        return g_shutdown.load(std::memory_order_relaxed);
+    }
+}
+
+#──────────────────────────  src/ShutdownUtils.cpp  ──────────────────────────
+#include "ShutdownUtils.h"
+#include <csignal>
+
+namespace shutdown {
+    std::atomic<bool> g_shutdown{false};
+
+    static void handler(int) { g_shutdown.store(true,std::memory_order_relaxed); }
+
+    void installSignalHandlers() {
+        struct sigaction sa{};
+        sa.sa_handler = handler;
+        sigemptyset(&sa.sa_mask);
+        sigaction(SIGINT,  &sa, nullptr);
+        sigaction(SIGTERM, &sa, nullptr);
+    }
+}
+
+#────────────────────────────  src/FileQueue.h  ───────────────────────────────
+#pragma once
+#include <rigtorp/MPMCQueue.h>
+#include <condition_variable>
+#include <mutex>
+#include <string>
+
+#include "ShutdownUtils.h"
+
+class FileQueue {
+public:
+    explicit FileQueue(std::size_t cap = 1024) : q_(cap) {}
+
+    void push(std::string p) noexcept {
+        q_.push(std::move(p));
+        cv_.notify_one();
+    }
+
+    /* blocking pop – returns false if shutdown requested */
+    bool pop(std::string &out) {
+        std::unique_lock lk(m_);
+        cv_.wait(lk, [&]{ return !q_.empty() || shutdown::requested(); });
+        return q_.try_pop(out);
+    }
+
+private:
+    rigtorp::MPMCQueue<std::string> q_;
+    std::mutex                      m_;
+    std::condition_variable         cv_;
+};
+
+#────────────────────────────  src/ThreadPool.h  ─────────────────────────────
+#pragma once
+#include "ShutdownUtils.h"
+#include <condition_variable>
+#include <functional>
+#include <mutex>
+#include <queue>
+#include <thread>
+#include <vector>
+
+class ThreadPool {
+public:
+    explicit ThreadPool(unsigned n = std::thread::hardware_concurrency()) {
+        for(unsigned i=0;i<n;++i) threads_.emplace_back([this]{ worker(); });
+    }
+    ~ThreadPool() {
+        {
+            std::lock_guard lk(m_);
+            stop_ = true;
+        }
+        cv_.notify_all();
+        for(auto &t:threads_) t.join();
+    }
+    template<typename F> void enqueue(F &&f) {
+        {
+            std::lock_guard lk(m_);
+            q_.emplace(std::forward<F>(f));
+        }
+        cv_.notify_one();
+    }
+private:
+    void worker() {
+        while(true){
+            std::function<void()> job;
+            {
+                std::unique_lock lk(m_);
+                cv_.wait(lk,[this]{ return stop_ || !q_.empty(); });
+                if((stop_ || shutdown::requested()) && q_.empty()) return;
+                job = std::move(q_.front()); q_.pop();
+            }
+            job();
+        }
+    }
+    std::mutex m_; std::condition_variable cv_;
+    std::queue<std::function<void()>> q_;
+    std::vector<std::thread> threads_;
+    bool stop_{false};
+};
+
+#────────────────────────────  src/Watcher.h  ────────────────────────────────
+#pragma once
+#include <functional>
+#include <string>
+#include <sys/inotify.h>
+
+class Watcher {
+public:
+    using CB = std::function<void(std::string_view,uint32_t)>;
+
+    Watcher(std::string dir, CB cb);
+    ~Watcher();
+
+    int  fd() const noexcept { return fd_; }
+    void handle();                          // call when fd readable
+    const std::string& dir() const noexcept { return dir_; }
+
+private:
+    int         fd_{-1}, wd_{-1};
+    std::string dir_;
+    CB          cb_;
+};
+
+#────────────────────────────  src/Watcher.cpp  ──────────────────────────────
+#include "Watcher.h"
+#include "Log.h"
+#include <array>
+#include <filesystem>
+#include <stdexcept>
+#include <unistd.h>
+
+Watcher::Watcher(std::string d, CB cb)
+    : dir_(std::move(d)), cb_(std::move(cb))
+{
+    if(!std::filesystem::is_directory(dir_))
+        throw std::runtime_error("not directory: " + dir_);
+    fd_ = inotify_init1(IN_NONBLOCK|IN_CLOEXEC);
+    if(fd_==-1) throw std::runtime_error("inotify_init1");
+    wd_ = inotify_add_watch(fd_,dir_.c_str(),
+            IN_CREATE|IN_MOVED_TO|IN_DELETE|IN_MOVED_FROM);
+    if(wd_==-1) throw std::runtime_error("add_watch");
+}
+
+Watcher::~Watcher(){ if(fd_!=-1) close(fd_); }
+
+void Watcher::handle(){
+    std::array<char,4096> buf{};
+    auto n=read(fd_,buf.data(),buf.size()); if(n<=0) return;
+    for(char* p=buf.data(); p<buf.data()+n;){
+        auto* ev=reinterpret_cast<inotify_event*>(p);
+        if(ev->len) cb_({ev->name,ev->len}, ev->mask);
+        p+=sizeof(inotify_event)+ev->len;
+    }
+}
+
+#────────────────────────────  src/Discovery.h  ──────────────────────────────
+#pragma once
+#include "Watcher.h"
+#include "FileQueue.h"
+#include "ShutdownUtils.h"
+#include <sys/epoll.h>
+#include <vector>
+
+class Discovery {
+public:
+    Discovery(std::string dir, FileQueue &q);
+    void run();                // blocks until shutdown::requested()
+
+private:
+    void onEvent(std::string_view,uint32_t);
+    Watcher    watcher_;
+    FileQueue &queue_;
+};
+
+#────────────────────────────  src/Discovery.cpp  ────────────────────────────
+#include "Discovery.h"
+#include "Log.h"
+#include <filesystem>
+#include <unistd.h>
+
+Discovery::Discovery(std::string dir, FileQueue &q)
+    : watcher_(std::move(dir), [this](auto n,auto m){ onEvent(n,m);} ),
+      queue_(q)
+{
+    for(auto& e:std::filesystem::directory_iterator(watcher_.dir()))
+        if(e.is_regular_file() && e.path().string().ends_with(".pcap"))
+            queue_.push(e.path().string());
+}
+
+void Discovery::run(){
+    int ep = epoll_create1(0);
+    epoll_event ev{.events=EPOLLIN,.data={.ptr=this}};
+    epoll_ctl(ep,EPOLL_CTL_ADD,watcher_.fd(),&ev);
+
+    while(!shutdown::requested()){
+        epoll_event e;
+        if(epoll_wait(ep,&e,1,500)>0)
+            static_cast<Discovery*>(e.data.ptr)->watcher_.handle();
+    }
+    close(ep);
+}
+
+void Discovery::onEvent(std::string_view name,uint32_t mask){
+    if(!(mask&(IN_CREATE|IN_MOVED_TO))) return;        // ignore deletes
+    std::string path = watcher_.dir()+'/'+std::string(name);
+    if(path.ends_with(".pcap")) queue_.push(std::move(path));
+}
+
+#───────────────────────────  src/PacketProcessor.h  ─────────────────────────
+#pragma once
+#include <string>
+void processPcap(const std::string& file);
+
+#──────────────────────────  src/PacketProcessor.cpp  ────────────────────────
+#include "PacketProcessor.h"
+#include "Log.h"
+#include <pcap/pcap.h>
+#include <cstdio>
+
+void processPcap(const std::string& file){
+    auto lg = PME_GET_LOGGER("PacketProcessor");
+    char err[PCAP_ERRBUF_SIZE]{};
+    if(auto* p = pcap_open_offline(file.c_str(),err)){
+        /* TODO your latency logic here */
+        pcap_close(p);
+        PME_LOG_INFO(lg,"processed "<<file);
+    }else{
+        PME_LOG_ERROR(lg,"open "<<file<<" failed: "<<err);
+    }
+}
+
+#──────────────────────────────  src/Engine.h  ───────────────────────────────
+#pragma once
+#include "Discovery.h"
+#include "ThreadPool.h"
+#include "FileQueue.h"
+#include "ShutdownUtils.h"
+#include <vector>
+
+struct EngineCfg{
+    unsigned watchers = 1;
+    unsigned workers  = std::thread::hardware_concurrency();
+};
+
+class Engine {
+public:
+    Engine(std::string dir, EngineCfg cfg = {});
+    void run();                       // blocking until shutdown::requested()
+
+private:
+    std::string              dir_;
+    EngineCfg                cfg_;
+    FileQueue                queue_{1024};
+    ThreadPool               pool_;
+    std::vector<std::thread> watcherThreads_;
+};
+
+#──────────────────────────────  src/Engine.cpp  ─────────────────────────────
+#include "Engine.h"
+#include "PacketProcessor.h"
+#include "Log.h"
+#include <filesystem>
+
+Engine::Engine(std::string d, EngineCfg cfg)
+    : dir_(std::move(d)), cfg_(cfg), pool_(cfg.workers)
+{
+    auto lg = PME_GET_LOGGER("Engine");
+    PME_LOG_INFO(lg,"spawning "<<cfg_.watchers<<" watcher(s) & "
+                     <<cfg_.workers<<" worker(s)");
+
+    for(unsigned i=0;i<cfg_.watchers;++i)
+        watcherThreads_.emplace_back([this]{ Discovery(dir_,queue_).run(); });
+}
+
+void Engine::run(){
+    auto lg = PME_GET_LOGGER("Engine");
+    std::string path;
+
+    while(!shutdown::requested()){
+        if(!queue_.pop(path)) break;                       // woke because shutdown
+        if(!std::filesystem::is_regular_file(path)) continue;
+        if(std::filesystem::file_size(path)==0)            continue;
+
+        pool_.enqueue([p=std::move(path)]{ processPcap(p); });
+    }
+    PME_LOG_INFO(lg,"engine exiting, joining threads");
+
+    for(auto &t:watcherThreads_) t.join();
+}
+
+#──────────────────────────────  src/main.cpp  ───────────────────────────────
+#include "Log.h"
+#include "Engine.h"
+#include "ShutdownUtils.h"
+#include <spapp/logging/logging.hpp>
+#include <iostream>
+
+int main(int argc,char** argv){
+    if(argc<2){
+        std::cerr<<"usage: pme <pcap-dir>\n";
+        return 1;
+    }
+    /* logger to stdout */
+    sp::logging::start(sp::logging::stdout_config());
+    sp::logging::set_override(sp::logging::level::INFO);
+
+    shutdown::installSignalHandlers();
+
+    EngineCfg cfg; cfg.watchers=2; cfg.workers=8; // tweak or read from CLI/env
+    Engine eng(argv[1], cfg);
+    eng.run();
+
+    sp::logging::stop();
+    return 0;
+}
