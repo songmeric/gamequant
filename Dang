@@ -1,0 +1,50 @@
+// FileQueue.h
+#pragma once
+#include <rigtorp/MPMCQueue.h>
+#include <condition_variable>
+#include <mutex>
+#include <string>
+#include "ShutdownUtils.h"
+
+class FileQueue {
+public:
+    explicit FileQueue(std::size_t cap = 1024)
+      : q_(cap), capacity_(cap) {}
+
+    // Producer: will block (without burning CPU) if queue is full
+    void push(std::string path) {
+        std::unique_lock<std::mutex> lk(mtx_);
+        // wait until there's room or we’re shutting down
+        not_full_.wait(lk, [&] {
+            return shutdown::requested() || q_.size_approx() < capacity_;
+        });
+        if (shutdown::requested()) return;
+        q_.push(std::move(path));
+        // wake one consumer
+        not_empty_.notify_one();
+    }
+
+    // Consumer: blocks until there’s something to pop, or shutdown
+    // returns false if waking only to shutdown with empty queue
+    bool pop(std::string &out) {
+        std::unique_lock<std::mutex> lk(mtx_);
+        not_empty_.wait(lk, [&] {
+            return shutdown::requested() || q_.size_approx() > 0;
+        });
+        // if no work left and shutting down, exit
+        if (shutdown::requested() && q_.size_approx() == 0)
+            return false;
+
+        // we know there’s at least one element
+        q_.pop(out);
+        // wake one producer that might be waiting for space
+        not_full_.notify_one();
+        return true;
+    }
+
+private:
+    rigtorp::MPMCQueue<std::string> q_;
+    const std::size_t               capacity_;
+    std::mutex                      mtx_;
+    std::condition_variable         not_empty_, not_full_;
+};
