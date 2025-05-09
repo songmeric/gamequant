@@ -1,13 +1,101 @@
-```cpp
-// src/Engine.h
+#────────────────────────────  src/Engine.h  ────────────────────────────────
 #pragma once
-
 #include <string>
-#include <vector>
 #include <thread>
+#include <vector>
 #include "Discovery.h"
 #include "FileQueue.h"
 #include "ShutdownUtils.h"
+
+struct EngineCfg {
+    unsigned watchers = 1;
+    unsigned workers  = std::thread::hardware_concurrency();
+};
+
+class Engine {
+public:
+    Engine(std::string dir, EngineCfg cfg = {});
+    ~Engine() = default;
+
+    /** blocks until Ctrl-C / SIGTERM */
+    void run();
+
+private:
+    void watcherLoop();   // one per watcher thread
+    void workerLoop();    // one per worker thread
+
+    std::string              dir_;
+    EngineCfg                cfg_;
+    FileQueue                queue_{1024};
+
+    std::vector<std::thread> watcherThreads_;
+    std::vector<std::thread> workerThreads_;
+};
+
+
+
+#────────────────────────────  src/Engine.cpp  ──────────────────────────────
+#include "Engine.h"
+#include "PacketProcessor.h"
+#include "Log.h"
+#include <filesystem>
+#include <chrono>
+
+Engine::Engine(std::string dir, EngineCfg cfg)
+    : dir_(std::move(dir)), cfg_(cfg)
+{ }
+
+void Engine::run() {
+    auto lg = PME_GET_LOGGER("Engine");
+    PME_LOG_INFO(lg, "spawn " << cfg_.watchers << " watcher(s) / "
+                              << cfg_.workers  << " worker(s)");
+
+    /* 1 ─ Watchers */
+    for (unsigned i = 0; i < cfg_.watchers; ++i)
+        watcherThreads_.emplace_back(&Engine::watcherLoop, this);
+
+    /* 2 ─ Workers */
+    for (unsigned i = 0; i < cfg_.workers; ++i)
+        workerThreads_.emplace_back(&Engine::workerLoop, this);
+
+    /* 3 ─ Main thread just waits for signal */
+    while (!shutdown::requested())
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+
+    PME_LOG_INFO(lg, "shutdown requested, joining…");
+
+    for (auto &t : watcherThreads_) t.join();
+    for (auto &t : workerThreads_)  t.join();
+
+    PME_LOG_INFO(lg, "exit complete");
+}
+
+void Engine::watcherLoop() {
+    /* each Discovery instance owns its own inotify FD */
+    Discovery(dir_, queue_).run();          // blocks until shutdown::requested()
+}
+
+void Engine::workerLoop() {
+    auto lg = PME_GET_LOGGER("Worker");
+    std::string path;
+
+    while (!shutdown::requested()) {
+        if (!queue_.pop(path)) break;       // pop returns false on shutdown
+
+        if (!std::filesystem::is_regular_file(path) ||
+            std::filesystem::file_size(path) == 0)
+            continue;
+
+        try {
+            processPcap(path);
+        } catch (const std::exception &e) {
+            PME_LOG_ERROR(lg, "error on " << path << ": " << e.what());
+        } catch (...) {
+            PME_LOG_ERROR(lg, "unknown error on " << path);
+        }
+    }
+}
+
 
 struct EngineCfg {
     unsigned watchers = 1;
