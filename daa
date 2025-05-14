@@ -15,12 +15,14 @@ Engine::Engine(const std::vector<std::string>& dirs_to_watch, unsigned num_worke
 {
     PME_LOG_INFO(log_, "Engine initialized. Dirs: " << directories_to_watch_.size() << ", Workers: " << num_worker_threads_ << ", Queue Cap: " << queue_capacity_ << ".");
     
-    // Revised initialization for discoverySuccessFlags_
     size_t num_discovery_threads = directories_to_watch_.size();
     if (num_discovery_threads > 0) {
-        discoverySuccessFlags_.reserve(num_discovery_threads);
+        // Resize will default-construct std::atomic<bool> elements (to false).
+        // This is a fundamental operation for vector with non-copy/non-move types.
+        discoverySuccessFlags_.resize(num_discovery_threads); 
+        // Then explicitly set their initial desired state.
         for (size_t i = 0; i < num_discovery_threads; ++i) {
-            discoverySuccessFlags_.emplace_back(true); // Constructs std::atomic<bool>(true) in place
+            discoverySuccessFlags_[i].store(true, std::memory_order_relaxed); 
         }
     }
 }
