@@ -1,0 +1,102 @@
+#pragma once
+#include <MPMCQueue.h>
+#include <condition_variable>
+#include <mutex>
+#include <string>
+#include "ShutdownUtils.h"
+#include "Log.h" // For logging in the revised push
+
+class FileQueue
+{
+public:
+    explicit FileQueue(std::size_t cap = 1024):
+    q_(cap), capacity_(cap), log_(PME_GET_LOGGER("FileQueue")) {
+        if (capacity_ == 0) {
+            PME_LOG_ERROR(log_, "FileQueue capacity cannot be zero.");
+            throw std::invalid_argument("FileQueue capacity cannot be zero.");
+        }
+    }
+
+    void push(std::string path) // path is pass-by-value
+    {
+        std::unique_lock<std::mutex> lk(mtx_);
+        // Wait until shutdown or (potentially) space available
+        not_full_.wait(lk, [&] {
+            return shutdown::requested() || q_.size() < capacity_; 
+        });
+
+        if (shutdown::requested()) {
+            return;
+        }
+
+        std::string original_path_for_log = path; // Keep original for logging if path is moved
+        while (!shutdown::requested()) {
+            // Pass 'path' as an lvalue. If rigtorp::try_push has a const std::string& overload,
+            // it will copy. If it has an rvalue overload std::string&&, this won't select it.
+            // This avoids moving from 'path' multiple times if it's a loop-carried variable.
+            if (q_.try_push(path)) { 
+                lk.unlock(); 
+                not_empty_.notify_one();
+                return;
+            }
+            // 'path' is still in its original state (for this function scope) after a failed try_push here.
+            PME_LOG_TRACE(log_, "try_push failed after wake for path '" << original_path_for_log << "'; re-waiting not_full_.");
+            not_full_.wait(lk, [&] {
+                return shutdown::requested() || q_.size() < capacity_;
+            });
+        }
+    }
+
+    bool pop(std::string &out) // Revised pop using try_pop loop
+    {
+        std::unique_lock<std::mutex> lk(mtx_);
+        // Wait until shutdown or (potentially) item available
+        not_empty_.wait(lk, [&] {
+            return shutdown::requested() || !q_.empty(); 
+        });
+
+        if (shutdown::requested() && q_.empty()) { 
+             return false;
+        }
+
+        while (!shutdown::requested()) {
+            if (q_.try_pop(out)) { 
+                lk.unlock(); 
+                not_full_.notify_one();
+                return true;
+            }
+            
+            PME_LOG_TRACE(log_, "try_pop failed after wake; re-waiting not_empty_.");
+            not_empty_.wait(lk, [&] {
+                return shutdown::requested() || !q_.empty();
+            });
+
+            if (shutdown::requested() && q_.empty()) {
+                return false;
+            }
+        }
+        
+        if (q_.try_pop(out)) {
+            lk.unlock();
+            not_full_.notify_one();
+            return true; 
+        }
+        return false; 
+    }
+
+    void wakeAll() // Acquire lock before notify_all based on discussion
+    {
+        std::unique_lock<std::mutex> lk(mtx_); // Acquire lock
+        PME_LOG_TRACE(log_, "wakeAll called, notifying all waiters.");
+        not_full_.notify_all();
+        not_empty_.notify_all();
+        // Lock is released by lk destructor
+    }
+
+private:
+    rigtorp::MPMCQueue<std::string> q_;
+    const std::size_t capacity_;
+    std::mutex mtx_;
+    std::condition_variable not_full_, not_empty_;    
+    px::Log* log_; // Initialized in constructor
+};
