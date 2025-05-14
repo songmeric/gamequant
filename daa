@@ -3,6 +3,7 @@
 #include <condition_variable>
 #include <mutex>
 #include <string>
+#include <memory>
 #include "ShutdownUtils.h"
 #include "Log.h" // For logging in the revised push
 
@@ -17,11 +18,15 @@ public:
         }
     }
 
-    void push(std::string path) // path is pass-by-value
+    void push(std::string path_str)
     {
+        auto uptr_to_push = std::make_unique<std::string>(std::move(path_str));
+        // path_str is now moved-from, log its original value if needed before move or handle inside push.
+        // For simplicity, we assume logging the moved-from uptr_to_push->c_str() in trace is acceptable if it happens.
+
         std::unique_lock<std::mutex> lk(mtx_);
-        // Wait until shutdown or (potentially) space available
         not_full_.wait(lk, [&] {
+            // size() on queue of unique_ptrs is fine
             return shutdown::requested() || q_.size() < capacity_; 
         });
 
@@ -29,28 +34,26 @@ public:
             return;
         }
 
-        std::string original_path_for_log = path; // Keep original for logging if path is moved
         while (!shutdown::requested()) {
-            // Pass 'path' as an lvalue. If rigtorp::try_push has a const std::string& overload,
-            // it will copy. If it has an rvalue overload std::string&&, this won't select it.
-            // This avoids moving from 'path' multiple times if it's a loop-carried variable.
-            if (q_.try_push(path)) { 
+            // Try to move the unique_ptr into the queue.
+            // MPMCQueue<std::unique_ptr<std::string>> should have try_push(std::unique_ptr<std::string>&&)
+            if (q_.try_push(std::move(uptr_to_push))) { 
                 lk.unlock(); 
                 not_empty_.notify_one();
-                return;
+                return; // uptr_to_push is now nullptr
             }
-            // 'path' is still in its original state (for this function scope) after a failed try_push here.
-            PME_LOG_TRACE(log_, "try_push failed after wake for path '" << original_path_for_log << "'; re-waiting not_full_.");
+            // If try_push failed, uptr_to_push is NOT moved from yet. It's still valid.
+            PME_LOG_TRACE(log_, "try_push (unique_ptr) failed after wake; re-waiting not_full_.");
             not_full_.wait(lk, [&] {
                 return shutdown::requested() || q_.size() < capacity_;
             });
         }
+        // If loop terminates due to shutdown, uptr_to_push will be destroyed, freeing memory.
     }
 
-    bool pop(std::string &out) // Revised pop using try_pop loop
+    bool pop(std::string& out_str)
     {
         std::unique_lock<std::mutex> lk(mtx_);
-        // Wait until shutdown or (potentially) item available
         not_empty_.wait(lk, [&] {
             return shutdown::requested() || !q_.empty(); 
         });
@@ -59,14 +62,25 @@ public:
              return false;
         }
 
+        std::unique_ptr<std::string> uptr_popped;
         while (!shutdown::requested()) {
-            if (q_.try_pop(out)) { 
-                lk.unlock(); 
-                not_full_.notify_one();
-                return true;
+            if (q_.try_pop(uptr_popped)) { 
+                if (uptr_popped) { // Ensure pointer is not null after pop
+                    out_str = std::move(*uptr_popped); // Move the string content
+                    lk.unlock(); 
+                    not_full_.notify_one();
+                    return true;
+                } else {
+                    // This case should ideally not happen if try_pop returns true
+                    // but rigtorp::MPMCQueue::pop(T&v) might set v to default constructed if T is ptr
+                    // Let's assume try_pop(unique_ptr&) will set it to nullptr if it was empty
+                    // or a valid pointer. If it returned true but uptr_popped is null, it's odd.
+                    PME_LOG_WARN(log_, "try_pop succeeded but returned null unique_ptr. Treating as empty.");
+                    // Continue to re-wait as if queue was empty
+                }
             }
             
-            PME_LOG_TRACE(log_, "try_pop failed after wake; re-waiting not_empty_.");
+            PME_LOG_TRACE(log_, "try_pop (unique_ptr) failed after wake; re-waiting not_empty_.");
             not_empty_.wait(lk, [&] {
                 return shutdown::requested() || !q_.empty();
             });
@@ -76,27 +90,30 @@ public:
             }
         }
         
-        if (q_.try_pop(out)) {
-            lk.unlock();
-            not_full_.notify_one();
-            return true; 
+        // Final drain attempt on shutdown
+        if (q_.try_pop(uptr_popped)) {
+            if (uptr_popped) {
+                out_str = std::move(*uptr_popped);
+                lk.unlock(); // Mutex is still locked here from the loop or initial lock
+                not_full_.notify_one();
+                return true; 
+            }
         }
         return false; 
     }
 
-    void wakeAll() // Acquire lock before notify_all based on discussion
+    void wakeAll()
     {
-        std::unique_lock<std::mutex> lk(mtx_); // Acquire lock
+        std::unique_lock<std::mutex> lk(mtx_); 
         PME_LOG_TRACE(log_, "wakeAll called, notifying all waiters.");
         not_full_.notify_all();
         not_empty_.notify_all();
-        // Lock is released by lk destructor
     }
 
 private:
-    rigtorp::MPMCQueue<std::string> q_;
+    rigtorp::MPMCQueue<std::unique_ptr<std::string>> q_;
     const std::size_t capacity_;
     std::mutex mtx_;
     std::condition_variable not_full_, not_empty_;    
-    px::Log* log_; // Initialized in constructor
+    px::Log* log_;
 };
