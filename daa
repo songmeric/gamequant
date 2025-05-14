@@ -1,10 +1,68 @@
+#pragma once
+
+#include <string>
+#include <thread>
+#include <vector>
+#include <atomic>
+#include <mutex>
+#include <unordered_set>
+#include <memory> // For std::unique_ptr, std::make_unique
+// #include <deque> // No longer needed for discoverySuccessFlags_
+#include "Discovery.h"
+#include "FileQueue.h"
+#include "ShutdownUtils.h"
+#include "Log.h"
+// #include "Config.h" // Removed
+
+// AtomicBoolWrapper struct is no longer needed
+
+class Engine
+{
+public:
+    // Constructor now takes directories and worker count directly
+    Engine(const std::vector<std::string>& dirs_to_watch, unsigned num_workers, unsigned queue_capacity);
+    ~Engine(); // Will need to handle thread joining
+
+    void run();
+
+private:
+    // No longer a single watcherLoop, each discovery runs its own.
+    // void watcherLoop(); 
+    void discoveryInstanceLoop(Discovery& discovery_instance, std::atomic<bool>& success_flag);
+    void workerLoop();
+
+    // Store copies of configuration or relevant parts
+    std::vector<std::string> directories_to_watch_;
+    unsigned num_worker_threads_;
+    unsigned queue_capacity_; // Added member for queue capacity
+    
+    FileQueue queue_; // Will be initialized with queue_capacity_
+
+    std::vector<std::thread> discoveryThreads_;
+    // Changed to std::vector<std::unique_ptr<std::atomic<bool>>>
+    std::vector<std::unique_ptr<std::atomic<bool>>> discoverySuccessFlags_;
+    std::vector<std::thread> workerThreads_;
+    px::Log* log_;
+
+    // To signal individual discovery instances to stop, beyond the global shutdown::requested()
+    // This helps in cleanly stopping the Discovery::run() loops.
+    std::atomic<bool> discovery_should_stop_{false};
+
+    // Changed to std::unordered_set for better average time complexity
+    std::unordered_set<std::string> processed_files_;
+    std::mutex processed_files_mutex_;
+};
+
+
 #include "Engine.h"
 #include "ShutdownUtils.h"
 #include "PacketProcessor.h"
 #include <filesystem>
 #include <chrono>
 #include <vector>
+#include <deque>  // For discoverySuccessFlags_
 #include <thread> // For std::this_thread::get_id()
+#include <memory> // For std::make_unique
 
 Engine::Engine(const std::vector<std::string>& dirs_to_watch, unsigned num_workers, unsigned queue_capacity)
     : directories_to_watch_(dirs_to_watch),
@@ -19,7 +77,8 @@ Engine::Engine(const std::vector<std::string>& dirs_to_watch, unsigned num_worke
     if (num_discovery_threads > 0) {
         discoverySuccessFlags_.reserve(num_discovery_threads); 
         for (size_t i = 0; i < num_discovery_threads; ++i) {
-            discoverySuccessFlags_.emplace_back(true); 
+            // Create a unique_ptr to a std::atomic<bool> initialized to true
+            discoverySuccessFlags_.emplace_back(std::make_unique<std::atomic<bool>>(true)); 
         }
     }
 }
@@ -62,8 +121,8 @@ void Engine::run() {
         const auto& dir_path = directories_to_watch_[i];
         if (dir_path.empty()) {
             PME_LOG_WARN(log_, "Empty directory path provided, skipping.");
-            if (i < discoverySuccessFlags_.size()) { // Boundary check
-                discoverySuccessFlags_[i].store(false); 
+            if (i < discoverySuccessFlags_.size() && discoverySuccessFlags_[i]) { 
+                discoverySuccessFlags_[i]->store(false); 
             }
             continue;
         }
@@ -74,13 +133,12 @@ void Engine::run() {
         // }
         discovery_instances.emplace_back(dir_path, queue_, log_); // Pass logger to Discovery
         PME_LOG_INFO(log_, "Creating discovery thread for directory: " << dir_path);
-        if (i < discoverySuccessFlags_.size()) { // Boundary check
+        if (i < discoverySuccessFlags_.size() && discoverySuccessFlags_[i]) { // Check unique_ptr not null
             discoveryThreads_.emplace_back(&Engine::discoveryInstanceLoop, this, 
                                          std::ref(discovery_instances.back()), 
-                                         std::ref(discoverySuccessFlags_[i]));
+                                         std::ref(*discoverySuccessFlags_[i])); // Pass reference to the atomic_bool itself
         } else {
-             PME_LOG_ERROR(log_, "Mismatch between directory count and success flag vector size for dir: " << dir_path);
-             // Handle error: maybe don't launch thread or mark global engine error
+             PME_LOG_ERROR(log_, "Error: discoverySuccessFlags_ element missing or null for dir: " << dir_path);
         }
     }
 
@@ -102,7 +160,7 @@ void Engine::run() {
         // Periodically check discoverySuccessFlags_
         bool all_discovery_ok = true;
         for(size_t i = 0; i < discoverySuccessFlags_.size(); ++i) {
-            if (!discoverySuccessFlags_[i].load()) {
+            if (discoverySuccessFlags_[i] && !discoverySuccessFlags_[i]->load()) { // Check unique_ptr not null before load
                 PME_LOG_ERROR(log_, "Discovery for directory '" << directories_to_watch_[i] << "' reported failure.");
                 all_discovery_ok = false;
                 // Option: If a critical discovery fails, trigger global shutdown.
@@ -122,12 +180,12 @@ void Engine::run() {
     // Thread joining is handled by the destructor when g_engine goes out of scope in main().
 }
 
-void Engine::discoveryInstanceLoop(Discovery& discovery_instance, AtomicBoolWrapper& success_flag) {
+void Engine::discoveryInstanceLoop(Discovery& discovery_instance, std::atomic<bool>& success_flag) {
     PME_LOG_INFO(log_, "Discovery loop started for directory: " << discovery_instance.getDirectory());
     bool success = discovery_instance.run(discovery_should_stop_); 
     if (!success) {
         PME_LOG_ERROR(log_, "Discovery instance for directory '" << discovery_instance.getDirectory() << "' failed.");
-        success_flag.store(false); // Uses AtomicBoolWrapper::store()
+        success_flag.store(false); // Operates on the referenced atomic_bool
     }
     PME_LOG_INFO(log_, "Discovery loop finished for directory: " << discovery_instance.getDirectory() << " (Success: " << success << ")");
 }
@@ -205,3 +263,4 @@ void Engine::workerLoop() {
     }
     PME_LOG_INFO(log_, "Worker loop finished. Thread ID: " << std::this_thread::get_id());
 }
+
