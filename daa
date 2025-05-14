@@ -1,119 +1,208 @@
-#pragma once
-#include <MPMCQueue.h>
-#include <condition_variable>
-#include <mutex>
-#include <string>
-#include <memory>
+#include "Engine.h"
 #include "ShutdownUtils.h"
-#include "Log.h" // For logging in the revised push
+#include "PacketProcessor.h"
+#include <filesystem>
+#include <chrono>
+#include <vector>
+#include <thread> // For std::this_thread::get_id()
 
-class FileQueue
+Engine::Engine(const std::vector<std::string>& dirs_to_watch, unsigned num_workers, unsigned queue_capacity)
+    : directories_to_watch_(dirs_to_watch),
+      num_worker_threads_(num_workers),
+      queue_capacity_(queue_capacity),
+      queue_(queue_capacity_),
+      log_(PME_GET_LOGGER("Engine"))
 {
-public:
-    explicit FileQueue(std::size_t cap = 1024):
-    q_(cap), capacity_(cap), log_(PME_GET_LOGGER("FileQueue")) {
-        if (capacity_ == 0) {
-            PME_LOG_ERROR(log_, "FileQueue capacity cannot be zero.");
-            throw std::invalid_argument("FileQueue capacity cannot be zero.");
+    PME_LOG_INFO(log_, "Engine initialized. Dirs: " << directories_to_watch_.size() << ", Workers: " << num_worker_threads_ << ", Queue Cap: " << queue_capacity_ << ".");
+    
+    // Revised initialization for discoverySuccessFlags_
+    size_t num_discovery_threads = directories_to_watch_.size();
+    if (num_discovery_threads > 0) {
+        discoverySuccessFlags_.reserve(num_discovery_threads);
+        for (size_t i = 0; i < num_discovery_threads; ++i) {
+            discoverySuccessFlags_.emplace_back(true); // Constructs std::atomic<bool>(true) in place
         }
     }
+}
 
-    void push(std::string path_str)
-    {
-        auto uptr_to_push = std::make_unique<std::string>(std::move(path_str));
-        // path_str is now moved-from, log its original value if needed before move or handle inside push.
-        // For simplicity, we assume logging the moved-from uptr_to_push->c_str() in trace is acceptable if it happens.
+Engine::~Engine() {
+    PME_LOG_INFO(log_, "Engine shutting down. Joining threads.");
 
-        std::unique_lock<std::mutex> lk(mtx_);
-        not_full_.wait(lk, [&] {
-            // size() on queue of unique_ptrs is fine
-            return shutdown::requested() || q_.size() < capacity_; 
-        });
+    // Signal discovery instances to stop their loops if they haven't already from global shutdown
+    discovery_should_stop_.store(true, std::memory_order_relaxed);
 
-        if (shutdown::requested()) {
-            return;
+    // Global shutdown flag might also be set, FileQueue::wakeAll helps unblock threads from queue waits
+    queue_.wakeAll(); 
+
+    for (auto& thread : discoveryThreads_) {
+        if (thread.joinable()) {
+            thread.join();
         }
+    }
+    PME_LOG_INFO(log_, "Discovery threads joined.");
 
-        while (!shutdown::requested()) {
-            // Try to move the unique_ptr into the queue.
-            // MPMCQueue<std::unique_ptr<std::string>> should have try_push(std::unique_ptr<std::string>&&)
-            if (q_.try_push(std::move(uptr_to_push))) { 
-                lk.unlock(); 
-                not_empty_.notify_one();
-                return; // uptr_to_push is now nullptr
+    for (auto& thread : workerThreads_) {
+        if (thread.joinable()) {
+            thread.join();
+        }
+    }
+    PME_LOG_INFO(log_, "Worker threads joined.");
+    PME_LOG_INFO(log_, "Engine shutdown complete.");
+}
+
+void Engine::run() {
+    PME_LOG_INFO(log_, "Engine starting...");
+
+    // Need to store Discovery instances because threads will take references to them.
+    // They must live as long as the threads.
+    std::vector<Discovery> discovery_instances;
+    discovery_instances.reserve(directories_to_watch_.size());
+
+    // Start Discovery Threads (one per directory)
+    for (size_t i = 0; i < directories_to_watch_.size(); ++i) {
+        const auto& dir_path = directories_to_watch_[i];
+        if (dir_path.empty()) {
+            PME_LOG_WARN(log_, "Empty directory path provided, skipping.");
+            if (i < discoverySuccessFlags_.size()) { // Boundary check
+                discoverySuccessFlags_[i].store(false); 
             }
-            // If try_push failed, uptr_to_push is NOT moved from yet. It's still valid.
-            PME_LOG_TRACE(log_, "try_push (unique_ptr) failed after wake; re-waiting not_full_.");
-            not_full_.wait(lk, [&] {
-                return shutdown::requested() || q_.size() < capacity_;
-            });
+            continue;
         }
-        // If loop terminates due to shutdown, uptr_to_push will be destroyed, freeing memory.
+        // Simple check if directory exists before starting watcher (optional, Watcher might also log errors)
+        // if (!std::filesystem::is_directory(dir_path)) {
+        //     PME_LOG_ERROR(log_, "Provided path is not a directory or not accessible, skipping: {}", dir_path);
+        //     continue;
+        // }
+        discovery_instances.emplace_back(dir_path, queue_, log_); // Pass logger to Discovery
+        PME_LOG_INFO(log_, "Creating discovery thread for directory: " << dir_path);
+        if (i < discoverySuccessFlags_.size()) { // Boundary check
+            discoveryThreads_.emplace_back(&Engine::discoveryInstanceLoop, this, 
+                                         std::ref(discovery_instances.back()), 
+                                         std::ref(discoverySuccessFlags_[i]));
+        } else {
+             PME_LOG_ERROR(log_, "Mismatch between directory count and success flag vector size for dir: " << dir_path);
+             // Handle error: maybe don't launch thread or mark global engine error
+        }
     }
 
-    bool pop(std::string& out_str)
-    {
-        std::unique_lock<std::mutex> lk(mtx_);
-        not_empty_.wait(lk, [&] {
-            return shutdown::requested() || !q_.empty(); 
-        });
+    // Start Worker Threads
+    workerThreads_.reserve(num_worker_threads_);
+    for (unsigned i = 0; i < num_worker_threads_; ++i) {
+        PME_LOG_INFO(log_, "Creating worker thread #" << (i + 1));
+        workerThreads_.emplace_back(&Engine::workerLoop, this);
+    }
 
-        if (shutdown::requested() && q_.empty()) { 
-             return false;
+    PME_LOG_INFO(log_, "Engine running with " << discoveryThreads_.size() << " discovery thread(s) and " << workerThreads_.size() << " worker thread(s).");
+
+    // Keep main thread alive, or Engine::run() could return while threads are running.
+    // Shutdown will be triggered by signal handlers setting shutdown::g_shutdownRequested
+    // The destructor will handle joining threads when the Engine object is destroyed.
+    // If main() exits and g_engine is destroyed, destructor runs.
+    // If run() is expected to be blocking until shutdown, a loop is needed here:
+    while (!shutdown::requested()) {
+        // Periodically check discoverySuccessFlags_
+        bool all_discovery_ok = true;
+        for(size_t i = 0; i < discoverySuccessFlags_.size(); ++i) {
+            if (!discoverySuccessFlags_[i].load()) {
+                PME_LOG_ERROR(log_, "Discovery for directory '" << directories_to_watch_[i] << "' reported failure.");
+                all_discovery_ok = false;
+                // Option: If a critical discovery fails, trigger global shutdown.
+                // if (is_critical_directory(directories_to_watch_[i])) {
+                //    shutdown::g_shutdownRequested.store(true);
+                //    PME_LOG_CRITICAL(log_, "Critical discovery for '{}' failed. Initiating shutdown.", directories_to_watch_[i]);
+                // }
+            }
+        }
+        // For now, we just log. If all_discovery_ok is false, we might decide to stop the engine.
+        // Or, individual discovery threads that fail will simply exit and log.
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(500)); // Increased sleep
+    }
+
+    PME_LOG_INFO(log_, "Shutdown signal received, Engine run loop ending.");
+    // Thread joining is handled by the destructor when g_engine goes out of scope in main().
+}
+
+void Engine::discoveryInstanceLoop(Discovery& discovery_instance, std::atomic<bool>& success_flag) {
+    PME_LOG_INFO(log_, "Discovery loop started for directory: " << discovery_instance.getDirectory());
+    bool success = discovery_instance.run(discovery_should_stop_); 
+    if (!success) {
+        PME_LOG_ERROR(log_, "Discovery instance for directory '" << discovery_instance.getDirectory() << "' failed.");
+        success_flag.store(false); // Propagate failure
+    }
+    PME_LOG_INFO(log_, "Discovery loop finished for directory: " << discovery_instance.getDirectory() << " (Success: " << success << ")");
+}
+
+void Engine::workerLoop() {
+    PME_LOG_INFO(log_, "Worker loop started. Thread ID: " << std::this_thread::get_id());
+    std::string file_path;
+    bool popped_item;
+
+    while (true) {
+        popped_item = false; // Reset before attempting pop
+        if (shutdown::requested()) { // Check shutdown before trying to pop
+            // Try to pop one last time in case items were added right before shutdown signal
+            // but don't block if queue is empty during shutdown.
+            // FileQueue::pop handles shutdown signal and won't block indefinitely.
+             if (queue_.pop(file_path)) {
+                 popped_item = true;
+             } else {
+                 PME_LOG_INFO(log_, "Worker shutting down (primary loop), queue empty or shutdown pop returned false. Thread ID: " << std::this_thread::get_id());
+                 break; // Exit primary loop to go to drain loop
+             }
+        } else {
+            if (queue_.pop(file_path)) { // Blocking pop
+                popped_item = true;
+            }
+            // If pop returns false here, it means shutdown was signaled during the wait in pop()
+            // and the queue was empty at that point. The outer loop condition will catch this.
         }
 
-        std::unique_ptr<std::string> uptr_popped;
-        while (!shutdown::requested()) {
-            if (q_.try_pop(uptr_popped)) { 
-                if (uptr_popped) { // Ensure pointer is not null after pop
-                    out_str = std::move(*uptr_popped); // Move the string content
-                    lk.unlock(); 
-                    not_full_.notify_one();
-                    return true;
+        if (popped_item) {
+            bool process_this_file = false;
+            {
+                std::lock_guard<std::mutex> guard(processed_files_mutex_);
+                if (processed_files_.find(file_path) == processed_files_.end()) {
+                    // Not found, so mark as being processed and proceed
+                    processed_files_.insert(file_path);
+                    process_this_file = true;
                 } else {
-                    // This case should ideally not happen if try_pop returns true
-                    // but rigtorp::MPMCQueue::pop(T&v) might set v to default constructed if T is ptr
-                    // Let's assume try_pop(unique_ptr&) will set it to nullptr if it was empty
-                    // or a valid pointer. If it returned true but uptr_popped is null, it's odd.
-                    PME_LOG_WARN(log_, "try_pop succeeded but returned null unique_ptr. Treating as empty.");
-                    // Continue to re-wait as if queue was empty
+                    PME_LOG_INFO(log_, "File '" << file_path << "' already processed or currently being processed by another worker. Skipping. Thread ID: " << std::this_thread::get_id());
                 }
             }
-            
-            PME_LOG_TRACE(log_, "try_pop (unique_ptr) failed after wake; re-waiting not_empty_.");
-            not_empty_.wait(lk, [&] {
-                return shutdown::requested() || !q_.empty();
-            });
 
-            if (shutdown::requested() && q_.empty()) {
-                return false;
+            if (process_this_file) {
+                PME_LOG_DEBUG(log_, "Worker (Thread ID: " << std::this_thread::get_id() << ") processing file: " << file_path);
+                processPcap(file_path);
+                // If processing can fail and you want to allow retries, you wouldn't add to processed_files_
+                // until success, or have a more complex state (e.g. retry_count).
+                // For now, assume successful processing means it's "done".
             }
         }
-        
-        // Final drain attempt on shutdown
-        if (q_.try_pop(uptr_popped)) {
-            if (uptr_popped) {
-                out_str = std::move(*uptr_popped);
-                lk.unlock(); // Mutex is still locked here from the loop or initial lock
-                not_full_.notify_one();
-                return true; 
+        // If not popped_item and shutdown is requested, the while(!shutdown::requested()) at top will break.
+        if (!popped_item && !shutdown::requested()) {
+             // This case should ideally not happen frequently if pop is truly blocking
+             // or if it returns false only on shutdown & empty queue. Adding for safety.
+             PME_LOG_TRACE(log_, "Worker pop returned false but not shutting down, yielding. Thread ID: " << std::this_thread::get_id());
+             std::this_thread::yield(); // prevent potential busy loop if pop behaves unexpectedly
+        }
+    }
+
+    // Drain the queue after shutdown signal if items exist
+    PME_LOG_INFO(log_, "Worker (Thread ID: " << std::this_thread::get_id() << ") entering shutdown drain loop.");
+    while (queue_.pop(file_path)) { // pop will return false if empty & shutdown
+        bool process_this_file = false;
+        {
+            std::lock_guard<std::mutex> guard(processed_files_mutex_);
+            if (processed_files_.find(file_path) == processed_files_.end()) {
+                processed_files_.insert(file_path);
+                process_this_file = true;
             }
         }
-        return false; 
+        if (process_this_file) {
+            PME_LOG_DEBUG(log_, "Worker (Thread ID: " << std::this_thread::get_id() << ", shutdown drain) processing remaining file: " << file_path);
+            processPcap(file_path);
+        }
     }
-
-    void wakeAll()
-    {
-        std::unique_lock<std::mutex> lk(mtx_); 
-        PME_LOG_TRACE(log_, "wakeAll called, notifying all waiters.");
-        not_full_.notify_all();
-        not_empty_.notify_all();
-    }
-
-private:
-    rigtorp::MPMCQueue<std::unique_ptr<std::string>> q_;
-    const std::size_t capacity_;
-    std::mutex mtx_;
-    std::condition_variable not_full_, not_empty_;    
-    px::Log* log_;
-};
+    PME_LOG_INFO(log_, "Worker loop finished. Thread ID: " << std::this_thread::get_id());
+}
