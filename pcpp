@@ -1,3 +1,70 @@
+#pragma once
+#include <string>
+#include <vector>
+#include <map>
+#include "PcapFileDevice.h"
+#include "Packet.h"
+#include "EthLayer.h"
+#include "IPv4Layer.h"
+#include "TcpLayer.h"
+#include "UdpLayer.h"
+#include "TcpReassembly.h"
+#include "Log.h"
+
+
+// Forward declaration
+namespace pcpp {
+    class Packet;
+    class TcpStreamData;
+}
+
+class PacketProcessor {
+public:
+    PacketProcessor();
+    ~PacketProcessor();
+
+    void processFile(const std::string& filePath);
+
+private:
+    // TCP Reassembly callbacks
+    static void onTcpMessageReadyCallback(int8_t side, const pcpp::TcpStreamData& tcpData, void* userCookie);
+    static void onTcpConnectionStartCallback(const pcpp::ConnectionData& connectionData, void* userCookie);
+    static void onTcpConnectionEndCallback(const pcpp::ConnectionData& connectionData, pcpp::TcpReassemblyConnectionEndReason reason, void* userCookie);
+
+    // UDP processing
+    void processUdpPacket(pcpp::Packet& packet);
+
+    // TCP processing
+    void processTcpPacket(pcpp::Packet& packet, const pcpp::ConnectionData& connData);
+
+
+    px::Log* log_;
+    pcpp::TcpReassembly tcp_reassembly_;
+    std::map<uint32_t, std::vector<uint8_t>> partial_flow_buffers_; // Buffer for partial messages per flow SID
+
+    // Custom UDP Reassembly related members
+    // Example:
+    // struct UdpMessageFragment {
+    //     uint16_t messageId; // Or some identifier for the message
+    //     uint16_t fragmentOffset;
+    //     bool isLastFragment;
+    //     std::vector<uint8_t> payload;
+    // };
+    // std::map<uint32_t, std::vector<UdpMessageFragment>> udp_message_buffer_; // Key: sourceIP_sourcePort_destIP_destPort hash or similar
+    // void checkForCompleteUdpMessages(uint32_t flowKey);
+
+
+    // Helper to get logger
+    static px::Log* getLogger();
+};
+
+// Replace the old free function with a call to a static method or instance for compatibility,
+// or update Engine to use the class. For now, let's assume Engine will be updated.
+// void processPcap(const std::string& file); // Remove this or adapt Engine
+
+
+cpp
+
 #include "PacketProcessor.h"
 #include "Log.h"
 #include <PcapFileDevice.h>
@@ -26,134 +93,138 @@ px::Log* PacketProcessor::getLogger() {
 }
 
 PacketProcessor::PacketProcessor()
-    : log_(getLogger()), tcp_reassembly_(tcpReassemblyCallback, this) {
+    : log_(getLogger()), 
+      tcp_reassembly_(
+          onTcpMessageReadyCallback, 
+          this,  // userCookie
+          onTcpConnectionStartCallback,
+          onTcpConnectionEndCallback
+      ) {
     PME_LOG_INFO(log_, "PacketProcessor instance created.");
-    partial_flow_buffers_.clear(); // Ensure it's initially empty
-    // Potentially configure tcp_reassembly_ here if needed
-    // e.g., tcp_reassembly_.setConnectionTimeout(desired_timeout_seconds);
+    partial_flow_buffers_.clear();
 }
 
 PacketProcessor::~PacketProcessor() {
     PME_LOG_INFO(log_, "PacketProcessor instance destroyed.");
-    partial_flow_buffers_.clear(); // Clean up any buffered data
-    // Clean up any resources if necessary, TcpReassembly handles its own internal state.
+    partial_flow_buffers_.clear(); 
 }
 
-void PacketProcessor::tcpReassemblyCallback(pcpp::ConnectionData* connectionData, pcpp::TcpReassembly::ReassemblyStatus status, void* userCookie) {
+// New callback for connection start
+void PacketProcessor::onTcpConnectionStartCallback(const pcpp::ConnectionData& connectionData, void* userCookie) {
+    PacketProcessor* self = static_cast<PacketProcessor*>(userCookie);
+    if (!self) return;
+    uint32_t flow_id = connectionData.flowKey;
+    PME_LOG_INFO(self->log_, "TCP Connection Started for flow key: " << flow_id);
+    // It's good practice to ensure no stale buffer exists when a new connection starts
+    self->partial_flow_buffers_.erase(flow_id);
+}
+
+// New callback for connection end
+void PacketProcessor::onTcpConnectionEndCallback(const pcpp::ConnectionData& connectionData, pcpp::TcpReassemblyConnectionEndReason reason, void* userCookie) {
+    PacketProcessor* self = static_cast<PacketProcessor*>(userCookie);
+    if (!self) return;
+    uint32_t flow_id = connectionData.flowKey;
+    std::string reason_str = (reason == pcpp::TcpReassemblyConnectionClosedByFIN_RST) ? "FIN/RST" : "Manually";
+    PME_LOG_INFO(self->log_, "TCP Connection Ended for flow key: " << flow_id << ". Reason: " << reason_str);
+    self->partial_flow_buffers_.erase(flow_id); // Remove any pending buffer for this flow
+}
+
+// Modified callback for when TCP message data is ready
+void PacketProcessor::onTcpMessageReadyCallback(int8_t side, const pcpp::TcpStreamData& tcpData, void* userCookie) {
     PacketProcessor* self = static_cast<PacketProcessor*>(userCookie);
     if (!self) {
-        PME_LOG_ERROR(PME_GET_LOGGER("PacketProcessor"), "TCP Reassembly callback: userCookie is null.");
+        PME_LOG_ERROR(PME_GET_LOGGER("PacketProcessor"), "TCP MessageReady callback: userCookie is null.");
         return;
     }
 
-    uint32_t flow_id = connectionData->getSid(); // Use Session ID as flow identifier
+    const pcpp::ConnectionData& connectionData = tcpData.getConnectionData();
+    uint32_t flow_id = connectionData.flowKey;
 
-    if (status == pcpp::TcpReassembly::ReassemblyStatus::ReassembledDataReady) {
-        std::vector<uint8_t> current_processing_buffer;
+    std::vector<uint8_t> current_processing_buffer;
 
-        // 1. Prepend existing buffered data for this flow (if any)
-        auto it = self->partial_flow_buffers_.find(flow_id);
-        if (it != self->partial_flow_buffers_.end()) {
-            current_processing_buffer = std::move(it->second); // Move data from map to local buffer
-            self->partial_flow_buffers_.erase(it); // Remove entry from map
-            PME_LOG_DEBUG(self->log_, "SID: " << flow_id << " - Prepended " << current_processing_buffer.size() << " previously buffered bytes.");
-        }
-
-        // 2. Append newly received data
-        const uint8_t* new_data_ptr = connectionData->getData();
-        size_t new_data_len = connectionData->getDataLength();
-        if (new_data_ptr && new_data_len > 0) {
-            current_processing_buffer.insert(current_processing_buffer.end(), new_data_ptr, new_data_ptr + new_data_len);
-        }
-
-        if (current_processing_buffer.empty()) {
-            PME_LOG_DEBUG(self->log_, "SID: " << flow_id << " - No data to process in this callback (new data was empty and no pending buffer).");
-            return;
-        }
-
-        const uint8_t* data_ptr = current_processing_buffer.data();
-        size_t total_data_len = current_processing_buffer.size();
-        size_t offset = 0;
-
-        PME_LOG_INFO(self->log_, "TCP Reassembled Data Ready for flow SID: " << flow_id 
-                                << ". Processing buffer size: " << total_data_len << " bytes.");
-
-        while (offset < total_data_len) {
-            const uint8_t* current_msg_ptr = data_ptr + offset;
-            size_t remaining_len = total_data_len - offset;
-
-            if (remaining_len < sizeof(RazeFormatter::Header)) {
-                PME_LOG_DEBUG(self->log_, "SID: " << flow_id << " - Remaining data (" << remaining_len 
-                                     << " bytes) too small for RazeFormatter::Header. Buffering.");
-                if (remaining_len > 0) { // Only buffer if there are actual bytes left
-                    self->partial_flow_buffers_[flow_id].assign(current_msg_ptr, current_msg_ptr + remaining_len);
-                }
-                break; // Stop parsing this chunk
-            }
-
-            const auto* hdr = reinterpret_cast<const RazeFormatter::Header*>(current_msg_ptr);
-            uint16_t message_len = pcpp::netToHost16(hdr->packet_length); 
-
-            if (message_len == 0) {
-                PME_LOG_ERROR(self->log_, "SID: " << flow_id << " - RazeProtocol message_len is 0. Invalid message. Discarding current processing buffer for this flow and stopping.");
-                // Clearing buffer for this flow as it's likely corrupted
-                self->partial_flow_buffers_.erase(flow_id); 
-                break; 
-            }
-            
-            if (message_len > remaining_len) {
-                PME_LOG_DEBUG(self->log_, "SID: " << flow_id << " - RazeProtocol message_len (" << message_len
-                                     << ") > remaining data (" << remaining_len
-                                     << "). Partial message detected. Buffering remaining " << remaining_len << " bytes.");
-                if (remaining_len > 0) { // Should always be true if we are here after header check
-                     self->partial_flow_buffers_[flow_id].assign(current_msg_ptr, current_msg_ptr + remaining_len);
-                }
-                break; // Stop parsing this chunk
-            }
-
-            PME_LOG_DEBUG(self->log_, "SID: " << flow_id << " - RazeProtocol Message: Type=" << static_cast<int>(hdr->packet_type) 
-                                   << ", Declared Length (host order)=" << message_len);
-
-            switch (hdr->packet_type) {
-                case RazeFormatter::PacketType::new_order: {
-                    if (message_len < sizeof(RazeFormatter::NewOrder)) {
-                         PME_LOG_WARN(self->log_, "SID: " << flow_id << " - Declared length " << message_len 
-                                              << " is less than sizeof(RazeFormatter::NewOrder) (" << sizeof(RazeFormatter::NewOrder) 
-                                              << ") for new_order type. Skipping this message.");
-                         // This message is considered malformed or its length field is wrong.
-                         // We will advance by message_len to try to recover, but this segment of data is skipped.
-                         break; 
-                    }
-                    const auto* new_order_msg = reinterpret_cast<const RazeFormatter::NewOrder*>(hdr);
-                    PME_LOG_INFO(self->log_, "SID: " << flow_id << " - Parsed RazeProtocol NewOrder. MsgType: " 
-                                          << static_cast<int>(new_order_msg->message_type) );
-                    // TODO: Add detailed field logging with netToHostXX conversions as needed.
-                    break;
-                }
-                default:
-                    PME_LOG_WARN(self->log_, "SID: " << flow_id << " - Unknown RazeProtocol packet_type: " << static_cast<int>(hdr->packet_type) 
-                                          << ". Skipping " << message_len << " bytes.");
-                    break;
-            }
-            offset += message_len; 
-        }
-
-        // If loop finished because offset >= total_data_len, and there were no partial messages detected INSIDE the loop
-        // that caused a break, it means all data in current_processing_buffer was consumed or skipped appropriately.
-        // Any remaining unparsed data (if offset < total_data_len) would have been handled by the conditions inside the loop
-        // that store to partial_flow_buffers_ and then break.
-
-    } else if (status == pcpp::TcpReassembly::ReassemblyStatus::ConnectionClosed || status == pcpp::TcpReassembly::ReassemblyStatus::ConnectionReset) {
-        PME_LOG_INFO(self->log_, "TCP Connection Closed/Reset for SID: " << flow_id << ". Clearing any partial buffer.");
-        self->partial_flow_buffers_.erase(flow_id); // Remove any pending buffer for this flow
-    } else if (status == pcpp::TcpReassembly::ReassemblyStatus::ConnectionOutOfOrder) {
-         PME_LOG_WARN(self->log_, "TCP Connection Out-Of-Order for SID: " << flow_id);
-    } else if (status == pcpp::TcpReassembly::ReassemblyStatus::ConnectionStart) {
-        PME_LOG_INFO(self->log_, "TCP Connection Started for SID: " << flow_id);
-        // It's good practice to ensure no stale buffer exists when a new connection with the same SID (if possible due to SID reuse) starts
-        self->partial_flow_buffers_.erase(flow_id);
+    // 1. Prepend existing buffered data for this flow (if any)
+    auto it = self->partial_flow_buffers_.find(flow_id);
+    if (it != self->partial_flow_buffers_.end()) {
+        current_processing_buffer = std::move(it->second);
+        self->partial_flow_buffers_.erase(it);
+        PME_LOG_DEBUG(self->log_, "Flow key: " << flow_id << " - Prepended " << current_processing_buffer.size() << " previously buffered bytes. Side: " << (int)side);
     }
-    // Other statuses like MalformedPacket, MaxOutOfOrderFlushed etc. can be handled if needed
+
+    // 2. Append newly received data
+    const uint8_t* new_data_ptr = tcpData.getData();
+    size_t new_data_len = tcpData.getDataLength();
+    if (new_data_ptr && new_data_len > 0) {
+        current_processing_buffer.insert(current_processing_buffer.end(), new_data_ptr, new_data_ptr + new_data_len);
+    }
+
+    if (current_processing_buffer.empty()) {
+        PME_LOG_DEBUG(self->log_, "Flow key: " << flow_id << " - No data to process in this callback. Side: " << (int)side);
+        return;
+    }
+
+    const uint8_t* data_ptr = current_processing_buffer.data();
+    size_t total_data_len = current_processing_buffer.size();
+    size_t offset = 0;
+
+    PME_LOG_INFO(self->log_, "TCP Message Data Ready for flow key: " << flow_id 
+                            << ". Side: " << (int)side << ". Processing buffer size: " << total_data_len << " bytes.");
+
+    while (offset < total_data_len) {
+        const uint8_t* current_msg_ptr = data_ptr + offset;
+        size_t remaining_len = total_data_len - offset;
+
+        if (remaining_len < sizeof(RazeFormatter::Header)) {
+            PME_LOG_DEBUG(self->log_, "Flow key: " << flow_id << " - Remaining data (" << remaining_len 
+                                 << " bytes) too small for RazeFormatter::Header. Buffering.");
+            if (remaining_len > 0) { 
+                self->partial_flow_buffers_[flow_id].assign(current_msg_ptr, current_msg_ptr + remaining_len);
+            }
+            break; 
+        }
+
+        const auto* hdr = reinterpret_cast<const RazeFormatter::Header*>(current_msg_ptr);
+        uint16_t message_len = pcpp::netToHost16(hdr->packet_length); 
+
+        if (message_len == 0) {
+            PME_LOG_ERROR(self->log_, "Flow key: " << flow_id << " - RazeProtocol message_len is 0. Invalid message. Discarding current processing buffer for this flow and stopping.");
+            self->partial_flow_buffers_.erase(flow_id); 
+            break; 
+        }
+        
+        if (message_len > remaining_len) {
+            PME_LOG_DEBUG(self->log_, "Flow key: " << flow_id << " - RazeProtocol message_len (" << message_len
+                                 << ") > remaining data (" << remaining_len
+                                 << "). Partial message detected. Buffering remaining " << remaining_len << " bytes.");
+            if (remaining_len > 0) { 
+                 self->partial_flow_buffers_[flow_id].assign(current_msg_ptr, current_msg_ptr + remaining_len);
+            }
+            break; 
+        }
+
+        PME_LOG_DEBUG(self->log_, "Flow key: " << flow_id << " - RazeProtocol Message: Type=" << static_cast<int>(hdr->packet_type) 
+                               << ", Declared Length (host order)=" << message_len);
+
+        switch (hdr->packet_type) {
+            case RazeFormatter::PacketType::new_order: {
+                if (message_len < sizeof(RazeFormatter::NewOrder)) {
+                     PME_LOG_WARN(self->log_, "Flow key: " << flow_id << " - Declared length " << message_len 
+                                          << " is less than sizeof(RazeFormatter::NewOrder) (" << sizeof(RazeFormatter::NewOrder) 
+                                          << ") for new_order type. Skipping this message.");
+                     break; 
+                }
+                const auto* new_order_msg = reinterpret_cast<const RazeFormatter::NewOrder*>(hdr);
+                PME_LOG_INFO(self->log_, "Flow key: " << flow_id << " - Parsed RazeProtocol NewOrder. MsgType: " 
+                                      << static_cast<int>(new_order_msg->message_type) );
+                // TODO: Add detailed field logging with netToHostXX conversions as needed.
+                break;
+            }
+            default:
+                PME_LOG_WARN(self->log_, "Flow key: " << flow_id << " - Unknown RazeProtocol packet_type: " << static_cast<int>(hdr->packet_type) 
+                                      << ". Skipping " << message_len << " bytes.");
+                break;
+        }
+        offset += message_len; 
+    }
 }
 
 void PacketProcessor::processUdpPacket(pcpp::Packet& packet) {
@@ -215,9 +286,8 @@ void PacketProcessor::processFile(const std::string& filePath) {
 
     PME_LOG_INFO(log_, "Successfully opened PCAP file: " << filePath);
 
-    // Clear any existing TCP reassembly connections and our custom flow buffers
-    tcp_reassembly_.closeAllConnections(); 
-    partial_flow_buffers_.clear();
+    tcp_reassembly_.closeAllConnections(); // This will trigger onTcpConnectionEndCallback for any open connections
+    partial_flow_buffers_.clear(); // Also explicitly clear, though onTcpConnectionEndCallback should handle active ones.
 
     pcpp::RawPacket rawPacket;
     int packetCount = 0;
@@ -229,70 +299,29 @@ void PacketProcessor::processFile(const std::string& filePath) {
         packetCount++;
         pcpp::Packet parsedPacket(&rawPacket);
 
-        pcpp::FiveTuple fiveTuple;
-        bool is_tcp_or_udp = false;
-
         if (parsedPacket.isPacketOfType(pcpp::TCP)) {
             pcpp::TcpLayer* tcpLayer = parsedPacket.getLayerOfType<pcpp::TcpLayer>();
-            pcpp::IPv4Layer* ipv4Layer = parsedPacket.getLayerOfType<pcpp::IPv4Layer>(); // Assuming IPv4 for now
-            // Add IPv6 support if needed
+            pcpp::IPv4Layer* ipv4Layer = parsedPacket.getLayerOfType<pcpp::IPv4Layer>();
             if (tcpLayer && ipv4Layer) {
-                fiveTuple.sourceIp = ipv4Layer->getSrcIPAddress();
-                fiveTuple.destIp = ipv4Layer->getDstIPAddress();
-                fiveTuple.sourceMac = parsedPacket.getLayerOfType<pcpp::EthLayer>() ? parsedPacket.getLayerOfType<pcpp::EthLayer>()->getSourceMac().toString() : "";
-                fiveTuple.destMac = parsedPacket.getLayerOfType<pcpp::EthLayer>() ? parsedPacket.getLayerOfType<pcpp::EthLayer>()->getDestMac().toString() : "";
-                fiveTuple.sourcePort = tcpLayer->getSrcPort();
-                fiveTuple.destPort = tcpLayer->getDstPort();
-                fiveTuple.protocol = pcpp::IPProtocolTypes::PACKETPP_IPPROTO_TCP;
-                is_tcp_or_udp = true;
-
-                // Feed the packet to TCP reassembly module
-                // The flow key is automatically managed by TcpReassembly based on 5-tuple
                 tcp_reassembly_.reassemblePacket(parsedPacket);
-                // The callback `tcpReassemblyCallback` will be invoked when data is ready or connection ends.
-                // Call processTcpPacket if you need to do something with individual TCP packets
-                // For example, for logging or pre-filtering. ConnData needs to be created or fetched.
-                // pcpp::ConnectionData* connData = tcp_reassembly_.getConnectionInformation(fiveTuple);
-                // if(connData) processTcpPacket(parsedPacket, *connData);
-
                 tcpCount++;
             } else {
                 otherCount++;
             }
         } else if (parsedPacket.isPacketOfType(pcpp::UDP)) {
-            pcpp::UdpLayer* udpLayer = parsedPacket.getLayerOfType<pcpp::UdpLayer>();
-            pcpp::IPv4Layer* ipv4Layer = parsedPacket.getLayerOfType<pcpp::IPv4Layer>(); // Assuming IPv4
-            if (udpLayer && ipv4Layer) { // Ensure both layers are present
-                fiveTuple.sourceIp = ipv4Layer->getSrcIPAddress();
-                fiveTuple.destIp = ipv4Layer->getDstIPAddress();
-                fiveTuple.sourceMac = parsedPacket.getLayerOfType<pcpp::EthLayer>() ? parsedPacket.getLayerOfType<pcpp::EthLayer>()->getSourceMac().toString() : "";
-                fiveTuple.destMac = parsedPacket.getLayerOfType<pcpp::EthLayer>() ? parsedPacket.getLayerOfType<pcpp::EthLayer>()->getDestMac().toString() : "";
-                fiveTuple.sourcePort = udpLayer->getSrcPort();
-                fiveTuple.destPort = udpLayer->getDstPort();
-                fiveTuple.protocol = pcpp::IPProtocolTypes::PACKETPP_IPPROTO_UDP;
-                is_tcp_or_udp = true;
-
-                processUdpPacket(parsedPacket);
-                udpCount++;
-            } else {
-                otherCount++;
-            }
+            processUdpPacket(parsedPacket);
+            udpCount++;
         } else {
             otherCount++;
         }
         
-        // Periodically flush closed/timed-out connections if processing very long files
-        // or if many connections are expected that might not close cleanly.
-        if (packetCount % 1000 == 0) { // Example: flush every 1000 packets
-            tcp_reassembly_.closeTimedOutConnections();
+        if (packetCount % 1000 == 0) { 
+            // tcp_reassembly_.closeTimedOutConnections(); // PcapPlusPlus handles this internally or via configuration
         }
     }
 
-    // After processing all packets in the file, explicitly close all remaining connections
-    // This will trigger the callback for any pending reassembled data or to signal connection closure.
-    tcp_reassembly_.closeAllConnections();
-    // Also clear our custom buffers as the file processing is complete.
-    partial_flow_buffers_.clear();
+    tcp_reassembly_.closeAllConnections(); // Ensure all connections are closed and final data processed / callbacks triggered
+    partial_flow_buffers_.clear(); // Final clear for safety
 
     PME_LOG_INFO(log_, "Finished processing PCAP file: " << filePath);
     PME_LOG_INFO(log_, "Summary - Total Packets: " << packetCount 
@@ -304,266 +333,20 @@ void PacketProcessor::processFile(const std::string& filePath) {
     delete reader;
 }
 
-#pragma once
-#include <string>
-#include <vector>
-#include <map>
-#include "PcapFileDevice.h"
-#include "Packet.h"
-#include "EthLayer.h"
-#include "IPv4Layer.h"
-#include "TcpLayer.h"
-#include "UdpLayer.h"
-#include "TcpReassembly.h"
-#include "Log.h"
+/*
+// Remove the old free function and its logger.
+// The Engine will need to be updated to use the PacketProcessor class.
 
-
-// Forward declaration
-namespace pcpp {
-    class Packet;
-    class ConnectionData;
+static px::Log* getPacketProcessorLogger() {
+    static px::Log* logger = PME_GET_LOGGER("PacketProcessor");
+    return logger;
 }
 
-class PacketProcessor {
-public:
-    PacketProcessor();
-    ~PacketProcessor();
+void processPcap(const std::string& file_path) {
+    px::Log* logger = getPacketProcessorLogger();
+    PME_LOG_INFO(logger, "[PLACEHOLDER] Processing PCAP file: " << file_path);
 
-    void processFile(const std::string& filePath);
-
-private:
-    // TCP Reassembly callback
-    static void tcpReassemblyCallback(pcpp::ConnectionData* connectionData, pcpp::TcpReassembly::ReassemblyStatus status, void* userCookie);
-
-    // UDP processing
-    void processUdpPacket(pcpp::Packet& packet);
-
-    // TCP processing
-    void processTcpPacket(pcpp::Packet& packet, const pcpp::ConnectionData& connData);
-
-
-    px::Log* log_;
-    pcpp::TcpReassembly tcp_reassembly_;
-    std::map<uint32_t, std::vector<uint8_t>> partial_flow_buffers_; // Buffer for partial messages per flow SID
-
-    // Custom UDP Reassembly related members
-    // Example:
-    // struct UdpMessageFragment {
-    //     uint16_t messageId; // Or some identifier for the message
-    //     uint16_t fragmentOffset;
-    //     bool isLastFragment;
-    //     std::vector<uint8_t> payload;
-    // };
-    // std::map<uint32_t, std::vector<UdpMessageFragment>> udp_message_buffer_; // Key: sourceIP_sourcePort_destIP_destPort hash or similar
-    // void checkForCompleteUdpMessages(uint32_t flowKey);
-
-
-    // Helper to get logger
-    static px::Log* getLogger();
-};
-
-// Replace the old free function with a call to a static method or instance for compatibility,
-// or update Engine to use the class. For now, let's assume Engine will be updated.
-// void processPcap(const std::string& file); // Remove this or adapt Engine
-
-
-engine.cpp
-
-
-#include "Engine.h"
-#include "ShutdownUtils.h"
-#include "PacketProcessor.h"
-#include <filesystem>
-#include <chrono>
-#include <vector>
-#include <deque>  // For discoverySuccessFlags_
-#include <thread> // For std::this_thread::get_id()
-#include <memory> // For std::make_unique
-
-Engine::Engine(const std::vector<std::string>& dirs_to_watch, unsigned num_workers, unsigned queue_capacity)
-    : directories_to_watch_(dirs_to_watch),
-      num_worker_threads_(num_workers),
-      queue_capacity_(queue_capacity),
-      queue_(queue_capacity_),
-      log_(PME_GET_LOGGER("Engine"))
-{
-    PME_LOG_INFO(log_, "Engine initialized. Dirs: " << directories_to_watch_.size() << ", Workers: " << num_worker_threads_ << ", Queue Cap: " << queue_capacity_ << ".");
-    
-    size_t num_discovery_threads = directories_to_watch_.size();
-    if (num_discovery_threads > 0) {
-        discoverySuccessFlags_.reserve(num_discovery_threads); 
-        for (size_t i = 0; i < num_discovery_threads; ++i) {
-            // Create a unique_ptr to a std::atomic<bool> initialized to true
-            discoverySuccessFlags_.emplace_back(std::make_unique<std::atomic<bool>>(true)); 
-        }
-    }
+    // Simulate some work if needed for testing throughput, etc.
+    // std::this_thread::sleep_for(std::chrono::milliseconds(10)); // Example delay
 }
-
-Engine::~Engine() {
-    PME_LOG_INFO(log_, "Engine shutting down. Joining threads.");
-
-    // Signal discovery instances to stop their loops if they haven't already from global shutdown
-    discovery_should_stop_.store(true, std::memory_order_relaxed);
-
-    // Global shutdown flag might also be set, FileQueue::wakeAll helps unblock threads from queue waits
-    queue_.wakeAll(); 
-
-    for (auto& thread : discoveryThreads_) {
-        if (thread.joinable()) {
-            thread.join();
-        }
-    }
-    PME_LOG_INFO(log_, "Discovery threads joined.");
-
-    for (auto& thread : workerThreads_) {
-        if (thread.joinable()) {
-            thread.join();
-        }
-    }
-    PME_LOG_INFO(log_, "Worker threads joined.");
-    PME_LOG_INFO(log_, "Engine shutdown complete.");
-}
-
-void Engine::run() {
-    PME_LOG_INFO(log_, "Engine starting...");
-
-    // Need to store Discovery instances because threads will take references to them.
-    // They must live as long as the threads.
-    std::vector<Discovery> discovery_instances;
-    discovery_instances.reserve(directories_to_watch_.size());
-
-    // Start Discovery Threads (one per directory)
-    for (size_t i = 0; i < directories_to_watch_.size(); ++i) {
-        const auto& dir_path = directories_to_watch_[i];
-        if (dir_path.empty()) {
-            PME_LOG_WARN(log_, "Empty directory path provided, skipping.");
-            if (i < discoverySuccessFlags_.size() && discoverySuccessFlags_[i]) { 
-                discoverySuccessFlags_[i]->store(false); 
-            }
-            continue;
-        }
-        // Simple check if directory exists before starting watcher (optional, Watcher might also log errors)
-        // if (!std::filesystem::is_directory(dir_path)) {
-        //     PME_LOG_ERROR(log_, "Provided path is not a directory or not accessible, skipping: {}", dir_path);
-        //     continue;
-        // }
-        discovery_instances.emplace_back(dir_path, queue_, log_); // Pass logger to Discovery
-        PME_LOG_INFO(log_, "Creating discovery thread for directory: " << dir_path);
-        if (i < discoverySuccessFlags_.size() && discoverySuccessFlags_[i]) { // Check unique_ptr not null
-            discoveryThreads_.emplace_back(&Engine::discoveryInstanceLoop, this, 
-                                         std::ref(discovery_instances.back()), 
-                                         std::ref(*discoverySuccessFlags_[i])); // Pass reference to the atomic_bool itself
-        } else {
-             PME_LOG_ERROR(log_, "Error: discoverySuccessFlags_ element missing or null for dir: " << dir_path);
-        }
-    }
-
-    // Start Worker Threads
-    workerThreads_.reserve(num_worker_threads_);
-    for (unsigned i = 0; i < num_worker_threads_; ++i) {
-        PME_LOG_INFO(log_, "Creating worker thread #" << (i + 1));
-        workerThreads_.emplace_back(&Engine::workerMain, this, discoverySuccessFlags_[i].get());
-    }
-
-    PME_LOG_INFO(log_, "Engine running with " << discoveryThreads_.size() << " discovery thread(s) and " << workerThreads_.size() << " worker thread(s).");
-
-    // Keep main thread alive, or Engine::run() could return while threads are running.
-    // Shutdown will be triggered by signal handlers setting shutdown::g_shutdownRequested
-    // The destructor will handle joining threads when the Engine object is destroyed.
-    // If main() exits and g_engine is destroyed, destructor runs.
-    // If run() is expected to be blocking until shutdown, a loop is needed here:
-    while (!shutdown::requested()) {
-        // Periodically check discoverySuccessFlags_
-        bool all_discovery_ok = true;
-        for(size_t i = 0; i < discoverySuccessFlags_.size(); ++i) {
-            if (discoverySuccessFlags_[i] && !discoverySuccessFlags_[i]->load()) { // Check unique_ptr not null before load
-                PME_LOG_ERROR(log_, "Discovery for directory '" << directories_to_watch_[i] << "' reported failure.");
-                all_discovery_ok = false;
-                // Option: If a critical discovery fails, trigger global shutdown.
-                // if (is_critical_directory(directories_to_watch_[i])) {
-                //    shutdown::g_shutdownRequested.store(true);
-                //    PME_LOG_CRITICAL(log_, "Critical discovery for '{}' failed. Initiating shutdown.", directories_to_watch_[i]);
-                // }
-            }
-        }
-        // For now, we just log. If all_discovery_ok is false, we might decide to stop the engine.
-        // Or, individual discovery threads that fail will simply exit and log.
-
-        std::this_thread::sleep_for(std::chrono::milliseconds(500)); // Increased sleep
-    }
-
-    PME_LOG_INFO(log_, "Shutdown signal received, Engine run loop ending.");
-    // Thread joining is handled by the destructor when g_engine goes out of scope in main().
-}
-
-void Engine::discoveryInstanceLoop(Discovery& discovery_instance, std::atomic<bool>& success_flag) {
-    PME_LOG_INFO(log_, "Discovery loop started for directory: " << discovery_instance.getDirectory());
-    bool success = discovery_instance.run(discovery_should_stop_); 
-    if (!success) {
-        PME_LOG_ERROR(log_, "Discovery instance for directory '" << discovery_instance.getDirectory() << "' failed.");
-        success_flag.store(false); // Operates on the referenced atomic_bool
-    }
-    PME_LOG_INFO(log_, "Discovery loop finished for directory: " << discovery_instance.getDirectory() << " (Success: " << success << ")");
-}
-
-void Engine::workerMain(std::atomic<bool>* discovery_success_flag_for_this_thread_if_applicable) {
-    // This log line can be part of Engine::start or here.
-    // PME_LOG_INFO(log_, "Worker thread (ID: " << std::this_thread::get_id() << ") started.");
-
-    PacketProcessor packet_processor; // Each worker thread gets its own instance
-
-    std::string file_path;
-    while (!shutdown::requested()) {
-        bool popped_item = queue_.pop(file_path); // Blocking pop
-
-        if (shutdown::requested() && !popped_item) { // Check if shutdown was reason for pop failing
-            PME_LOG_INFO(log_, "Worker (Thread ID: " << std::this_thread::get_id() << ") breaking main loop due to shutdown signal and empty queue after pop attempt.");
-            break;
-        }
-        if (shutdown::requested() && popped_item) {
-             PME_LOG_INFO(log_, "Worker (Thread ID: " << std::this_thread::get_id() << ") popped an item but shutdown was requested. Will process then check shutdown again.");
-        }
-
-
-        if (popped_item) {
-            bool process_this_file = false;
-            {
-                std::lock_guard<std::mutex> guard(processed_files_mutex_);
-                if (processed_files_.find(file_path) == processed_files_.end()) {
-                    processed_files_.insert(file_path);
-                    process_this_file = true;
-                } else {
-                    PME_LOG_INFO(log_, "File '" << file_path << "' already processed or currently being processed by another worker. Skipping. Thread ID: " << std::this_thread::get_id());
-                }
-            }
-
-            if (process_this_file) {
-                PME_LOG_DEBUG(log_, "Worker (Thread ID: " << std::this_thread::get_id() << ") processing file: " << file_path);
-                packet_processor.processFile(file_path); // Use PacketProcessor instance
-            }
-        } else if (!shutdown::requested()) { // Popped_item is false, but not due to shutdown
-             PME_LOG_TRACE(log_, "Worker pop returned false but not shutting down, yielding. Thread ID: " << std::this_thread::get_id());
-             std::this_thread::yield();
-        }
-    }
-
-    PME_LOG_INFO(log_, "Worker (Thread ID: " << std::this_thread::get_id() << ") entering shutdown drain loop.");
-    while (queue_.pop(file_path)) { 
-        bool process_this_file = false;
-        {
-            std::lock_guard<std::mutex> guard(processed_files_mutex_);
-            if (processed_files_.find(file_path) == processed_files_.end()) {
-                processed_files_.insert(file_path);
-                process_this_file = true;
-            } else {
-                 PME_LOG_INFO(log_, "File '" << file_path << "' (drain) already processed. Skipping. Thread ID: " << std::this_thread::get_id());
-            }
-        }
-        if (process_this_file) {
-            PME_LOG_DEBUG(log_, "Worker (Thread ID: " << std::this_thread::get_id() << ", shutdown drain) processing remaining file: " << file_path);
-            packet_processor.processFile(file_path); // Use PacketProcessor instance
-        }
-    }
-    PME_LOG_INFO(log_, "Worker loop finished. Thread ID: " << std::this_thread::get_id());
-}
-
+*/
