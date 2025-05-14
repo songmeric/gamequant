@@ -17,10 +17,9 @@ Engine::Engine(const std::vector<std::string>& dirs_to_watch, unsigned num_worke
     
     size_t num_discovery_threads = directories_to_watch_.size();
     if (num_discovery_threads > 0) {
-        // Resize will default-construct std::atomic<bool> elements (to false).
-        // This is a fundamental operation for vector with non-copy/non-move types.
-        discoverySuccessFlags_.resize(num_discovery_threads); 
-        // Then explicitly set their initial desired state.
+        // Resize will default-construct AtomicBoolWrapper elements.
+        discoverySuccessFlags_.resize(num_discovery_threads);
+        // Then explicitly set their initial desired state to true.
         for (size_t i = 0; i < num_discovery_threads; ++i) {
             discoverySuccessFlags_[i].store(true, std::memory_order_relaxed); 
         }
@@ -125,12 +124,12 @@ void Engine::run() {
     // Thread joining is handled by the destructor when g_engine goes out of scope in main().
 }
 
-void Engine::discoveryInstanceLoop(Discovery& discovery_instance, std::atomic<bool>& success_flag) {
+void Engine::discoveryInstanceLoop(Discovery& discovery_instance, AtomicBoolWrapper& success_flag) {
     PME_LOG_INFO(log_, "Discovery loop started for directory: " << discovery_instance.getDirectory());
     bool success = discovery_instance.run(discovery_should_stop_); 
     if (!success) {
         PME_LOG_ERROR(log_, "Discovery instance for directory '" << discovery_instance.getDirectory() << "' failed.");
-        success_flag.store(false); // Propagate failure
+        success_flag.store(false); // Uses AtomicBoolWrapper::store()
     }
     PME_LOG_INFO(log_, "Discovery loop finished for directory: " << discovery_instance.getDirectory() << " (Success: " << success << ")");
 }
