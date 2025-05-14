@@ -1,3 +1,92 @@
+#pragma once
+
+#include <string>
+#include <thread>
+#include <vector>
+#include <atomic> // For shutdown flag for discovery instances
+#include <mutex> // For processed_files_mutex_
+#include <unordered_set> // Changed from <set> to <unordered_set>
+#include "Discovery.h"
+#include "FileQueue.h"
+#include "ShutdownUtils.h"
+#include "Log.h"
+// #include "Config.h" // Removed
+
+// Wrapper for std::atomic<bool> to aid vector initialization if direct std::vector<std::atomic<bool>> is problematic
+struct AtomicBoolWrapper {
+    std::atomic<bool> flag;
+
+    // Default constructor initializes flag to false (default for std::atomic<bool>)
+    AtomicBoolWrapper() : flag(false) {}
+    // Constructor from bool for initialization like emplace_back(true) or direct init
+    explicit AtomicBoolWrapper(bool initial_value) : flag(initial_value) {}
+
+    // Delete copy and move constructors/assignment operators explicitly
+    // to ensure it behaves like std::atomic<bool> in terms of copy/move restrictions.
+    AtomicBoolWrapper(const AtomicBoolWrapper&) = delete;
+    AtomicBoolWrapper& operator=(const AtomicBoolWrapper&) = delete;
+    AtomicBoolWrapper(AtomicBoolWrapper&&) = delete; 
+    AtomicBoolWrapper& operator=(AtomicBoolWrapper&&) = delete;
+
+    // Provide store and load methods for convenience, similar to std::atomic<bool>
+    void store(bool value, std::memory_order order = std::memory_order_seq_cst) {
+        flag.store(value, order);
+    }
+    bool load(std::memory_order order = std::memory_order_seq_cst) const {
+        return flag.load(order);
+    }
+    // Allow assignment from bool
+    AtomicBoolWrapper& operator=(bool value) {
+        flag.store(value);
+        return *this;
+    }
+};
+
+// Remove old EngineCfg
+// struct EngineCfg
+// {
+//     unsigned watchers = 1;
+//     unsigned workers = 2;
+// };
+
+class Engine
+{
+public:
+    // Constructor now takes directories and worker count directly
+    Engine(const std::vector<std::string>& dirs_to_watch, unsigned num_workers, unsigned queue_capacity);
+    ~Engine(); // Will need to handle thread joining
+
+    void run();
+
+private:
+    // No longer a single watcherLoop, each discovery runs its own.
+    // void watcherLoop(); 
+    void discoveryInstanceLoop(Discovery& discovery_instance, AtomicBoolWrapper& success_flag);
+    void workerLoop();
+
+    // Store copies of configuration or relevant parts
+    std::vector<std::string> directories_to_watch_;
+    unsigned num_worker_threads_;
+    unsigned queue_capacity_; // Added member for queue capacity
+    
+    FileQueue queue_; // Will be initialized with queue_capacity_
+
+    std::vector<std::thread> discoveryThreads_;
+    std::vector<AtomicBoolWrapper> discoverySuccessFlags_;
+    std::vector<std::thread> workerThreads_;
+    px::Log* log_;
+
+    // To signal individual discovery instances to stop, beyond the global shutdown::requested()
+    // This helps in cleanly stopping the Discovery::run() loops.
+    std::atomic<bool> discovery_should_stop_{false};
+
+    // Changed to std::unordered_set for better average time complexity
+    std::unordered_set<std::string> processed_files_;
+    std::mutex processed_files_mutex_;
+};
+
+
+
 #include "Engine.h"
 #include "ShutdownUtils.h"
 #include "PacketProcessor.h"
