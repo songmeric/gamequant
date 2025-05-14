@@ -1,0 +1,764 @@
+main.cpp
+
+#include "Log.h"
+#include "Engine.h"
+#include "ShutdownUtils.h"
+#include <iostream>
+#include <vector>
+#include <string>
+#include <charconv> // For std::from_chars
+#include <cstring> // For strlen
+
+// Helper to parse unsigned int from string
+bool parse_uint(const char* str, unsigned& out_val) {
+    if (!str) return false;
+    auto [ptr, ec] = std::from_chars(str, str + strlen(str), out_val);
+    return ec == std::errc() && ptr == (str + strlen(str));
+}
+    
+int main(int argc, char** argv)
+{
+    sp::logging::start(sp::logging::stdout_config());
+    sp::logging::set_override(sp::logging::level::DEBUG);
+    px::Log* main_log = PME_GET_LOGGER("Main");
+
+    if (argc < 2) {
+        PME_LOG_ERROR(main_log, "Usage: {} <directory1> [directory2...] [queue_capacity] [num_workers]", argv[0]);
+        PME_LOG_ERROR(main_log, "Please provide at least one directory to watch.");
+        sp::logging::stop();
+        return 1;
+    }
+
+    std::vector<std::string> directories_to_watch;
+    unsigned num_worker_threads = 2; // Default workers
+    unsigned queue_capacity = 1024; // Default queue capacity
+    int first_potential_numeric_arg_idx = argc -1;
+
+    // Try to parse num_workers (last argument)
+    if (argc > 2) { // Need at least progname, dir, workers_or_another_dir
+        unsigned parsed_val;
+        if (parse_uint(argv[argc - 1], parsed_val)) {
+            num_worker_threads = parsed_val;
+            first_potential_numeric_arg_idx = argc - 2;
+            // Try to parse queue_capacity (second to last argument)
+            if (argc > 3) { // Need at least progname, dir, capacity, workers
+                 if (parse_uint(argv[argc - 2], parsed_val)) {
+                    queue_capacity = parsed_val;
+                    first_potential_numeric_arg_idx = argc - 3;
+                 }
+            }
+        }
+    }
+
+    // Collect directory paths (arguments from index 1 up to before the parsed numerics)
+    for (int i = 1; i <= first_potential_numeric_arg_idx; ++i) {
+        if (argv[i] && strlen(argv[i]) > 0) {
+             directories_to_watch.push_back(argv[i]);
+        } else {
+            PME_LOG_WARN(main_log, "Empty directory argument at index {}, skipping.", i);
+        }
+    }
+
+    if (directories_to_watch.empty()) {
+        PME_LOG_ERROR(main_log, "No valid directories specified to watch.");
+        PME_LOG_ERROR(main_log, "Usage: {} <directory1> [directory2...] [queue_capacity] [num_workers]", argv[0]);
+        sp::logging::stop();
+        return 1;
+    }
+    if (num_worker_threads == 0) {
+        PME_LOG_WARN(main_log, "Number of worker threads is 0. Files will be queued but not processed.");
+    }
+    if (queue_capacity == 0) {
+        PME_LOG_WARN(main_log, "Queue capacity is 0. No files can be queued effectively.");
+        // Consider making this an error depending on desired robustness.
+    }
+
+    PME_LOG_INFO(main_log, "Configuration - Workers: {}, Queue Capacity: {}", num_worker_threads, queue_capacity);
+    PME_LOG_INFO(main_log, "Watching {} director(y/ies):", directories_to_watch.size());
+    for(const auto& dir : directories_to_watch) {
+        PME_LOG_INFO(main_log, " - {}", dir);
+    }
+
+    shutdown::install();
+
+    Engine g_engine(directories_to_watch, num_worker_threads, queue_capacity);
+    g_engine.run();
+
+    PME_LOG_INFO(main_log, "Application shutting down.");
+    sp::logging::stop();
+    return 0;
+}
+
+Engine.h
+
+#pragma once
+
+#include <string>
+#include <thread>
+#include <vector>
+#include <atomic> // For shutdown flag for discovery instances
+#include <mutex> // For processed_files_mutex_
+#include <unordered_set> // Changed from <set> to <unordered_set>
+#include "Discovery.h"
+#include "FileQueue.h"
+#include "ShutdownUtils.h"
+#include "Log.h"
+// #include "Config.h" // Removed
+
+// Remove old EngineCfg
+// struct EngineCfg
+// {
+//     unsigned watchers = 1;
+//     unsigned workers = 2;
+// };
+
+class Engine
+{
+public:
+    // Constructor now takes directories and worker count directly
+    Engine(const std::vector<std::string>& dirs_to_watch, unsigned num_workers, unsigned queue_capacity);
+    ~Engine(); // Will need to handle thread joining
+
+    void run();
+
+private:
+    // No longer a single watcherLoop, each discovery runs its own.
+    // void watcherLoop(); 
+    void discoveryInstanceLoop(Discovery& discovery_instance, std::atomic<bool>& success_flag);
+    void workerLoop();
+
+    // Store copies of configuration or relevant parts
+    std::vector<std::string> directories_to_watch_;
+    unsigned num_worker_threads_;
+    unsigned queue_capacity_; // Added member for queue capacity
+    
+    FileQueue queue_; // Will be initialized with queue_capacity_
+
+    std::vector<std::thread> discoveryThreads_;
+    std::vector<std::atomic<bool>> discoverySuccessFlags_; // For error propagation
+    std::vector<std::thread> workerThreads_;
+    px::Log* log_;
+
+    // To signal individual discovery instances to stop, beyond the global shutdown::requested()
+    // This helps in cleanly stopping the Discovery::run() loops.
+    std::atomic<bool> discovery_should_stop_{false};
+
+    // Changed to std::unordered_set for better average time complexity
+    std::unordered_set<std::string> processed_files_;
+    std::mutex processed_files_mutex_;
+};
+
+Engine.cpp
+
+#include "Engine.h"
+#include "ShutdownUtils.h"
+#include "PacketProcessor.h"
+#include <filesystem>
+#include <chrono>
+#include <vector>
+
+Engine::Engine(const std::vector<std::string>& dirs_to_watch, unsigned num_workers, unsigned queue_capacity)
+    : directories_to_watch_(dirs_to_watch),
+      num_worker_threads_(num_workers),
+      queue_capacity_(queue_capacity),
+      queue_(queue_capacity_),
+      log_(PME_GET_LOGGER("Engine"))
+{
+    PME_LOG_INFO(log_, "Engine initialized. Dirs: {}, Workers: {}, Queue Cap: {}.", 
+                 directories_to_watch_.size(), num_worker_threads_, queue_capacity_);
+    discoverySuccessFlags_.resize(directories_to_watch_.size());
+    for(size_t i = 0; i < discoverySuccessFlags_.size(); ++i) {
+        discoverySuccessFlags_[i].store(true);
+    }
+}
+
+Engine::~Engine() {
+    PME_LOG_INFO(log_, "Engine shutting down. Joining threads.");
+
+    // Signal discovery instances to stop their loops if they haven't already from global shutdown
+    discovery_should_stop_.store(true, std::memory_order_relaxed);
+
+    // Global shutdown flag might also be set, FileQueue::wakeAll helps unblock threads from queue waits
+    queue_.wakeAll(); 
+
+    for (auto& thread : discoveryThreads_) {
+        if (thread.joinable()) {
+            thread.join();
+        }
+    }
+    PME_LOG_INFO(log_, "Discovery threads joined.");
+
+    for (auto& thread : workerThreads_) {
+        if (thread.joinable()) {
+            thread.join();
+        }
+    }
+    PME_LOG_INFO(log_, "Worker threads joined.");
+    PME_LOG_INFO(log_, "Engine shutdown complete.");
+}
+
+void Engine::run() {
+    PME_LOG_INFO(log_, "Engine starting...");
+
+    // Need to store Discovery instances because threads will take references to them.
+    // They must live as long as the threads.
+    std::vector<Discovery> discovery_instances;
+    discovery_instances.reserve(directories_to_watch_.size());
+
+    // Start Discovery Threads (one per directory)
+    for (size_t i = 0; i < directories_to_watch_.size(); ++i) {
+        const auto& dir_path = directories_to_watch_[i];
+        if (dir_path.empty()) {
+            PME_LOG_WARN(log_, "Empty directory path provided, skipping.");
+            discoverySuccessFlags_[i].store(false);
+            continue;
+        }
+        // Simple check if directory exists before starting watcher (optional, Watcher might also log errors)
+        // if (!std::filesystem::is_directory(dir_path)) {
+        //     PME_LOG_ERROR(log_, "Provided path is not a directory or not accessible, skipping: {}", dir_path);
+        //     continue;
+        // }
+        discovery_instances.emplace_back(dir_path, queue_, log_); // Pass logger to Discovery
+        PME_LOG_INFO(log_, "Creating discovery thread for directory: {}", dir_path);
+        discoveryThreads_.emplace_back(&Engine::discoveryInstanceLoop, this, 
+                                     std::ref(discovery_instances.back()), 
+                                     std::ref(discoverySuccessFlags_[i]));
+    }
+
+    // Start Worker Threads
+    workerThreads_.reserve(num_worker_threads_);
+    for (unsigned i = 0; i < num_worker_threads_; ++i) {
+        PME_LOG_INFO(log_, "Creating worker thread #{}", i + 1);
+        workerThreads_.emplace_back(&Engine::workerLoop, this);
+    }
+
+    PME_LOG_INFO(log_, "Engine running with {} discovery thread(s) and {} worker thread(s).", discoveryThreads_.size(), workerThreads_.size());
+
+    // Keep main thread alive, or Engine::run() could return while threads are running.
+    // Shutdown will be triggered by signal handlers setting shutdown::g_shutdownRequested
+    // The destructor will handle joining threads when the Engine object is destroyed.
+    // If main() exits and g_engine is destroyed, destructor runs.
+    // If run() is expected to be blocking until shutdown, a loop is needed here:
+    while (!shutdown::requested()) {
+        // Periodically check discoverySuccessFlags_
+        bool all_discovery_ok = true;
+        for(size_t i = 0; i < discoverySuccessFlags_.size(); ++i) {
+            if (!discoverySuccessFlags_[i].load()) {
+                PME_LOG_ERROR(log_, "Discovery for directory '{}' reported failure.", directories_to_watch_[i]);
+                all_discovery_ok = false;
+                // Option: If a critical discovery fails, trigger global shutdown.
+                // if (is_critical_directory(directories_to_watch_[i])) {
+                //    shutdown::g_shutdownRequested.store(true);
+                //    PME_LOG_CRITICAL(log_, "Critical discovery for '{}' failed. Initiating shutdown.", directories_to_watch_[i]);
+                // }
+            }
+        }
+        // For now, we just log. If all_discovery_ok is false, we might decide to stop the engine.
+        // Or, individual discovery threads that fail will simply exit and log.
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(500)); // Increased sleep
+    }
+
+    PME_LOG_INFO(log_, "Shutdown signal received, Engine run loop ending.");
+    // Thread joining is handled by the destructor when g_engine goes out of scope in main().
+}
+
+void Engine::discoveryInstanceLoop(Discovery& discovery_instance, std::atomic<bool>& success_flag) {
+    PME_LOG_INFO(log_, "Discovery loop started for directory: {}", discovery_instance.getDirectory());
+    bool success = discovery_instance.run(discovery_should_stop_); 
+    if (!success) {
+        PME_LOG_ERROR(log_, "Discovery instance for directory '{}' failed.", discovery_instance.getDirectory());
+        success_flag.store(false); // Propagate failure
+    }
+    PME_LOG_INFO(log_, "Discovery loop finished for directory: {} (Success: {})", discovery_instance.getDirectory(), success);
+}
+
+void Engine::workerLoop() {
+    PME_LOG_INFO(log_, "Worker loop started. Thread ID: {}", std::this_thread::get_id());
+    std::string file_path;
+    bool popped_item;
+
+    while (true) {
+        popped_item = false; // Reset before attempting pop
+        if (shutdown::requested()) { // Check shutdown before trying to pop
+            // Try to pop one last time in case items were added right before shutdown signal
+            // but don't block if queue is empty during shutdown.
+            // FileQueue::pop handles shutdown signal and won't block indefinitely.
+             if (queue_.pop(file_path)) {
+                 popped_item = true;
+             } else {
+                 PME_LOG_INFO(log_, "Worker shutting down (primary loop), queue empty or shutdown pop returned false.");
+                 break; // Exit primary loop to go to drain loop
+             }
+        } else {
+            if (queue_.pop(file_path)) { // Blocking pop
+                popped_item = true;
+            }
+            // If pop returns false here, it means shutdown was signaled during the wait in pop()
+            // and the queue was empty at that point. The outer loop condition will catch this.
+        }
+
+        if (popped_item) {
+            bool process_this_file = false;
+            {
+                std::lock_guard<std::mutex> guard(processed_files_mutex_);
+                if (processed_files_.find(file_path) == processed_files_.end()) {
+                    // Not found, so mark as being processed and proceed
+                    processed_files_.insert(file_path);
+                    process_this_file = true;
+                } else {
+                    PME_LOG_INFO(log_, "File '{}' already processed or currently being processed by another worker. Skipping.", file_path);
+                }
+            }
+
+            if (process_this_file) {
+                PME_LOG_DEBUG(log_, "Worker (Thread ID: {}) processing file: {}", std::this_thread::get_id(), file_path);
+                processPcap(file_path);
+                // If processing can fail and you want to allow retries, you wouldn't add to processed_files_
+                // until success, or have a more complex state (e.g. retry_count).
+                // For now, assume successful processing means it's "done".
+            }
+        }
+        // If not popped_item and shutdown is requested, the while(!shutdown::requested()) at top will break.
+        if (!popped_item && !shutdown::requested()) {
+             // This case should ideally not happen frequently if pop is truly blocking
+             // or if it returns false only on shutdown & empty queue. Adding for safety.
+             PME_LOG_TRACE(log_, "Worker pop returned false but not shutting down, yielding.");
+             std::this_thread::yield(); // prevent potential busy loop if pop behaves unexpectedly
+        }
+    }
+
+    // Drain the queue after shutdown signal if items exist
+    PME_LOG_INFO(log_, "Worker (Thread ID: {}) entering shutdown drain loop.", std::this_thread::get_id());
+    while (queue_.pop(file_path)) { // pop will return false if empty & shutdown
+        bool process_this_file = false;
+        {
+            std::lock_guard<std::mutex> guard(processed_files_mutex_);
+            if (processed_files_.find(file_path) == processed_files_.end()) {
+                processed_files_.insert(file_path);
+                process_this_file = true;
+            }
+        }
+        if (process_this_file) {
+            PME_LOG_DEBUG(log_, "Worker (Thread ID: {}, shutdown drain) processing remaining file: {}", std::this_thread::get_id(), file_path);
+            processPcap(file_path);
+        }
+    }
+    PME_LOG_INFO(log_, "Worker loop finished. Thread ID: {}", std::this_thread::get_id());
+}
+
+Watcher.h
+
+#pragma once
+#include <functional>
+#include <string>
+#include <sys/inotify.h>
+
+class Watcher 
+{
+public:
+    using CB = std::function<void(std::string_view, uint32_t)>;
+
+    Watcher(std::string dir, CB cb);
+    ~Watcher();
+
+    int fd() const noexcept { return fd_; }
+    void handle();
+    const std::string& dir() const noexcept { return dir_;}
+
+private:
+    int fd_{-1}, wd_{-1};
+    std::string dir_;
+    CB cb_;
+};
+
+Watcher.cpp
+
+#include "Watcher.h"
+#include "Log.h"
+#include <array>
+#include <filesystem>
+#include <stdexcept>
+#include <unistd.h>
+#include <sys/inotify.h>
+#include <cerrno>
+#include <cstring>
+#include <vector>
+
+Watcher::Watcher(std::string dir, CB cb)
+    : dir_(std::move(dir)), cb_(std::move(cb))
+{
+    if(!std::filesystem::is_directory(dir_))
+        throw std::runtime_error("not a directory: " + dir_);
+    fd_ = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
+    if(fd_==-1) throw std::runtime_error("inotify_init1");
+    uint32_t watch_mask = IN_CREATE | IN_MOVED_TO | IN_CLOSE_WRITE;
+    wd_ = inotify_add_watch(fd_, dir_.c_str(), watch_mask);
+    if(wd_==-1) throw std::runtime_error("add_watch");
+}
+
+Watcher::~Watcher()
+{
+    if(fd_ != -1) {
+        if (wd_ != -1) {
+            inotify_rm_watch(fd_, wd_);
+        }
+        close(fd_);
+    }
+}
+
+void Watcher::handle()
+{
+    if (fd_ == -1) return;
+
+    char buffer[4096] __attribute__ ((aligned(__alignof__(struct inotify_event))));
+    ssize_t bytes_read;
+
+    while (true) {
+        bytes_read = read(fd_, buffer, sizeof(buffer));
+
+        if (bytes_read == -1) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                break;
+            } else if (errno == EINTR) {
+                continue;
+            } else {
+                return;
+            }
+        }
+
+        if (bytes_read == 0) {
+            break;
+        }
+
+        for (char* p = buffer; p < buffer + bytes_read; ) {
+            struct inotify_event* event = reinterpret_cast<struct inotify_event*>(p);
+            
+            if (event->mask & (IN_CREATE | IN_MOVED_TO | IN_CLOSE_WRITE)) {
+                if (event->len > 0) {
+                    cb_(event->name, event->mask);
+                } else {
+                }
+            }
+            p += sizeof(struct inotify_event) + event->len;
+        }
+    }
+}
+
+FileQueue.h
+
+#pragma once
+#include <MPMCQueue.h>
+#include <condition_variable>
+#include <mutex>
+#include <string>
+#include "ShutdownUtils.h"
+#include "Log.h" // For logging in the revised push
+
+class FileQueue
+{
+public:
+    explicit FileQueue(std::size_t cap = 1024):
+    q_(cap), capacity_(cap), log_(PME_GET_LOGGER("FileQueue")) {
+        if (capacity_ == 0) {
+            PME_LOG_ERROR(log_, "FileQueue capacity cannot be zero.");
+            throw std::invalid_argument("FileQueue capacity cannot be zero.");
+        }
+    }
+
+    void push(std::string path) // Revised push
+    {
+        std::unique_lock<std::mutex> lk(mtx_);
+        // Wait until shutdown or (potentially) space available
+        not_full_.wait(lk, [&] {
+            return shutdown::requested() || q_.size() < capacity_; 
+        });
+
+        if (shutdown::requested()) {
+            return;
+        }
+
+        while (!shutdown::requested()) {
+            // Pass by rvalue reference to allow potential move in try_push
+            if (q_.try_push(std::move(path))) { 
+                lk.unlock(); 
+                not_empty_.notify_one();
+                return;
+            }
+            // try_push failed. Path was not moved if try_push takes P&&
+            // If try_push takes by value or const&, path is still valid.
+            // Assuming try_push that takes P&& will not steal from path if it fails.
+            PME_LOG_TRACE(log_, "try_push failed after wake for path '{}'; re-waiting not_full_.", path);
+            not_full_.wait(lk, [&] {
+                return shutdown::requested() || q_.size() < capacity_;
+            });
+        }
+    }
+
+    bool pop(std::string &out) // Revised pop using try_pop loop
+    {
+        std::unique_lock<std::mutex> lk(mtx_);
+        // Wait until shutdown or (potentially) item available
+        not_empty_.wait(lk, [&] {
+            return shutdown::requested() || !q_.empty(); 
+        });
+
+
+        while (!shutdown::requested()) {
+            if (q_.try_pop(out)) { 
+                lk.unlock(); 
+                not_full_.notify_one();
+                return true;
+            }
+            
+            PME_LOG_TRACE(log_, "try_pop failed after wake; re-waiting not_empty_.");
+            not_empty_.wait(lk, [&] {
+                return shutdown::requested() || !q_.empty();
+            });
+        }
+        
+        return false; // Shutdown and queue is empty after loop or final try_pop.
+    }
+
+    void wakeAll() // Acquire lock before notify_all based on discussion
+    {
+        std::unique_lock<std::mutex> lk(mtx_); // Acquire lock
+        PME_LOG_TRACE(log_, "wakeAll called, notifying all waiters.");
+        not_full_.notify_all();
+        not_empty_.notify_all();
+        // Lock is released by lk destructor
+    }
+
+private:
+    rigtorp::MPMCQueue<std::string> q_;
+    const std::size_t capacity_;
+    std::mutex mtx_;
+    std::condition_variable not_full_, not_empty_;    
+    px::Log* log_; // Initialized in constructor
+};
+
+
+Discovery.h
+
+#pragma once
+
+#include "Watcher.h"
+#include "FileQueue.h"
+#include "ShutdownUtils.h" // Corrected path
+#include "Log.h"
+#include <sys/epoll.h>
+#include <vector>
+#include <string>
+#include <atomic> // For the stop flag
+
+// Forward declare px::Log
+namespace px { class Log; }
+
+class Discovery
+{
+public:
+    // Constructor now takes a logger
+    Discovery(std::string dir, FileQueue& q, px::Log* engine_logger);
+    // run() now returns bool for success/failure
+    bool run(const std::atomic<bool>& engine_stop_flag);
+
+    const std::string& getDirectory() const { return watcher_.dir(); } // Helper to get dir for logging
+
+private:
+    void onEvent(std::string_view filename, uint32_t event_mask);
+    Watcher watcher_;
+    FileQueue& queue_;
+    px::Log* log_; // Logger, can be specific to this discovery instance or passed from engine
+    std::string discovery_dir_path_; // Store the full path for constructing file paths
+};
+
+
+Discovery.cpp
+
+#include "Discovery.h"
+#include "ShutdownUtils.h" // Corrected path
+#include <unistd.h> // For close()
+#include <sys/epoll.h> // For epoll functions
+#include <filesystem> // For path manipulation
+#include <chrono>   // For std::chrono
+#include <thread>   // For std::this_thread::sleep_for
+#include <cerrno>   // For errno
+#include <cstring>  // For strerror
+
+// Discovery Constructor (check watcher fd)
+Discovery::Discovery(std::string dir, FileQueue& q, px::Log* engine_logger)
+    : watcher_(dir, [this](std::string_view name, uint32_t mask) { onEvent(name, mask); }),
+      queue_(q),
+      log_(engine_logger), // Use the passed logger, or create a specific one if desired
+      discovery_dir_path_(std::move(dir)) // Store the directory path
+{
+    PME_LOG_INFO(log_, "Discovery instance for directory: {}", discovery_dir_path_);
+    if (watcher_.fd() < 0) {
+        // Watcher constructor failed to initialize inotify.
+        // This instance of Discovery is now in a bad state.
+        // The run() method will check fd() and refuse to start.
+        PME_LOG_ERROR(log_, "Watcher initialization failed for directory: {}. Discovery will not run.", discovery_dir_path_);
+    }
+}
+
+// Helper function to get file attributes
+struct FileAttributes {
+    std::filesystem::file_time_type last_write_time;
+    std::uintmax_t file_size;
+    bool exists = false;
+};
+
+FileAttributes get_file_attributes(const std::filesystem::path& p, px::Log* logger) {
+    FileAttributes attrs;
+    try {
+        if (std::filesystem::exists(p) && std::filesystem::is_regular_file(p)) {
+            attrs.last_write_time = std::filesystem::last_write_time(p);
+            attrs.file_size = std::filesystem::file_size(p);
+            attrs.exists = true;
+        }
+    } catch (const std::filesystem::filesystem_error& e) {
+        PME_LOG_WARN(logger, "Error getting attributes for file {}: {}", p.string(), e.what());
+        attrs.exists = false; // Treat as non-existent or problematic
+    }
+    return attrs;
+}
+
+// Discovery run method - now returns bool
+bool Discovery::run(const std::atomic<bool>& engine_stop_flag) {
+    if (watcher_.fd() < 0) {
+        PME_LOG_ERROR(log_, "Watcher FD is invalid for dir '{}'. Discovery run loop cannot start.", discovery_dir_path_);
+        return false; // Indicate failure to Engine
+    }
+
+    const std::chrono::milliseconds initial_scan_stability_delay(1500); // Configurable: e.g., 1.5 seconds
+
+    PME_LOG_INFO(log_, "Performing initial scan of directory: {} (stability delay: {}ms)", discovery_dir_path_, initial_scan_stability_delay.count());
+    try {
+        if (std::filesystem::exists(discovery_dir_path_) && std::filesystem::is_directory(discovery_dir_path_)) {
+            std::vector<std::filesystem::path> initial_pcap_files;
+            for (const auto& entry : std::filesystem::directory_iterator(discovery_dir_path_)) {
+                if (shutdown::requested() || engine_stop_flag.load(std::memory_order_relaxed)) {
+                    PME_LOG_INFO(log_, "Shutdown signaled during initial scan directory listing of {}, aborting scan.", discovery_dir_path_);
+                    return true; // Normal shutdown, not an error for discovery itself
+                }
+                if (entry.is_regular_file() && entry.path().extension() == ".pcap") {
+                    initial_pcap_files.push_back(entry.path());
+                }
+            }
+
+            for (const auto& pcap_path : initial_pcap_files) {
+                if (shutdown::requested() || engine_stop_flag.load(std::memory_order_relaxed)) {
+                    PME_LOG_INFO(log_, "Shutdown signaled during initial scan stability check of {}, aborting scan.", discovery_dir_path_);
+                    return true; // Normal shutdown, not an error for discovery itself
+                }
+
+                FileAttributes attrs1 = get_file_attributes(pcap_path, log_);
+                if (!attrs1.exists) continue; 
+
+                PME_LOG_TRACE(log_, "Initial scan: First check for {}: size={}, time={}", 
+                              pcap_path.string(), attrs1.file_size, attrs1.last_write_time.time_since_epoch().count());
+
+                std::this_thread::sleep_for(initial_scan_stability_delay);
+
+                FileAttributes attrs2 = get_file_attributes(pcap_path, log_);
+                if (!attrs2.exists) { // File might have been deleted during sleep
+                     PME_LOG_INFO(log_, "Initial scan: File {} deleted during stability check.", pcap_path.string());
+                     continue;
+                }
+                PME_LOG_TRACE(log_, "Initial scan: Second check for {}: size={}, time={}", 
+                              pcap_path.string(), attrs2.file_size, attrs2.last_write_time.time_since_epoch().count());
+
+                if (attrs1.file_size == attrs2.file_size && attrs1.last_write_time == attrs2.last_write_time) {
+                    PME_LOG_INFO(log_, "Found stable pre-existing PCAP file during scan: {}. Enqueueing.", pcap_path.string());
+                    queue_.push(pcap_path.string()); 
+                } else {
+                    PME_LOG_INFO(log_, "Pre-existing PCAP file {} appears unstable or recently modified. Skipping enqueue. Will rely on inotify events.", pcap_path.string());
+                }
+            }
+        } else {
+            PME_LOG_ERROR(log_, "Directory '{}' does not exist or is not a directory during initial scan.", discovery_dir_path_);
+            // This could be considered a failure for this discovery instance.
+            return false; 
+        }
+    } catch (const std::filesystem::filesystem_error& e) {
+        PME_LOG_ERROR(log_, "Filesystem error during initial scan of {}: {}. Aborting discovery for this directory.", discovery_dir_path_, e.what());
+        return false; // Indicate failure
+    }
+    PME_LOG_INFO(log_, "Initial scan of directory {} complete.", discovery_dir_path_);
+
+    // Setup epoll after the initial scan
+    int epoll_fd = epoll_create1(EPOLL_CLOEXEC);
+    if (epoll_fd == -1) {
+        PME_LOG_ERROR(log_, "epoll_create1 failed for dir '{}': {}", discovery_dir_path_, strerror(errno));
+        return false; 
+    }
+
+    struct epoll_event ev;
+    ev.events = EPOLLIN; 
+    ev.data.fd = watcher_.fd();
+    if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, watcher_.fd(), &ev) == -1) {
+        PME_LOG_ERROR(log_, "epoll_ctl ADD failed for dir '{}': {}", discovery_dir_path_, strerror(errno));
+        close(epoll_fd);
+        return false; 
+    }
+
+    PME_LOG_INFO(log_, "Discovery run loop (event monitoring) starting for directory: {}", discovery_dir_path_);
+    constexpr int MAX_EVENTS = 10;
+    struct epoll_event events[MAX_EVENTS];
+    bool success = true; 
+
+    while (!shutdown::requested() && !engine_stop_flag.load(std::memory_order_relaxed)) {
+        int nfds = epoll_wait(epoll_fd, events, MAX_EVENTS, 250); 
+
+        if (nfds == -1) {
+            if (errno == EINTR) { 
+                continue;
+            }
+            PME_LOG_ERROR(log_, "epoll_wait failed for dir '{}': {}", discovery_dir_path_, strerror(errno));
+            success = false; 
+            break; 
+        }
+
+        for (int n = 0; n < nfds; ++n) {
+            if (events[n].data.fd == watcher_.fd()) {
+                watcher_.handle(); 
+            }
+        }
+    }
+
+    if (success) {
+      PME_LOG_INFO(log_, "Discovery run loop for dir '{}' finished (Event monitoring ended. Success: {}).", discovery_dir_path_, success);
+    } else {
+      PME_LOG_ERROR(log_, "Discovery run loop for dir '{}' finished due to an error (Success: {}).", discovery_dir_path_, success);
+    }
+    
+    close(epoll_fd);
+    return success;
+}
+
+// Updated onEvent callback
+void Discovery::onEvent(std::string_view filename_sv, uint32_t event_mask) {
+    std::filesystem::path fs_filename = filename_sv;
+    std::filesystem::path full_path = std::filesystem::path(discovery_dir_path_) / fs_filename;
+    std::string full_path_str = full_path.string();
+
+    // Filter by .pcap extension. This is a common requirement.
+    if (fs_filename.extension() != ".pcap") {
+        PME_LOG_TRACE(log_, "Ignoring non-pcap file event mask {} for '{}'", event_mask, full_path_str);
+        return;
+    }
+
+    if (event_mask & IN_CLOSE_WRITE) {
+        PME_LOG_INFO(log_, "PCAP file closed after write (IN_CLOSE_WRITE): '{}'. Enqueueing.", full_path_str);
+        queue_.push(std::move(full_path_str));
+    } else if (event_mask & IN_MOVED_TO) {
+        PME_LOG_INFO(log_, "PCAP file moved into directory (IN_MOVED_TO): '{}'. Enqueueing.", full_path_str);
+        queue_.push(std::move(full_path_str));
+    } else if (event_mask & IN_CREATE) {
+        PME_LOG_INFO(log_, "PCAP file created (IN_CREATE): '{}'. Waiting for IN_CLOSE_WRITE or IN_MOVED_TO.", full_path_str);
+        // Do not enqueue on IN_CREATE alone for this use case.
+    } else {
+        PME_LOG_TRACE(log_, "Other subscribed inotify event ({}) for PCAP file '{}'", event_mask, full_path_str);
+    }
+}
+
