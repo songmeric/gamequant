@@ -1,0 +1,441 @@
+#include "PacketProcessor.h"
+#include "Log.h"
+#include <PcapFileDevice.h>
+#include <Packet.h>
+#include <EthLayer.h>
+#include <IPv4Layer.h>
+#include <TcpLayer.h>
+#include <UdpLayer.h>
+#include <PayloadLayer.h>
+#include <iostream> // For placeholder logging/output
+#include <functional> // For std::bind with TcpReassembly
+#include <NetworkUtils.h> // For pcpp::netToHost16, etc.
+#include <thread>   // Added for std::this_thread::sleep_for
+#include <chrono>   // Added for std::chrono::milliseconds
+
+// User's custom protocol headers - ensure these are in the include path
+// For example, if they are in the same directory or a subdirectory:
+// #include "protocols/RazeFormatter.h" 
+// #include "protocols/xraze.h"
+// For now, assuming they are directly accessible:
+#include "RazeFormatter.h" 
+#include "xraze.h"
+
+// Define the static logger retrieval for PacketProcessor
+px::Log* PacketProcessor::getLogger() {
+    static px::Log* logger = PME_GET_LOGGER("PacketProcessor");
+    return logger;
+}
+
+PacketProcessor::PacketProcessor()
+    : log_(getLogger()), 
+      tcp_reassembly_(
+          onTcpMessageReadyCallback, 
+          this,  // userCookie
+          onTcpConnectionStartCallback,
+          onTcpConnectionEndCallback
+      ) {
+    PME_LOG_INFO(log_, "PacketProcessor instance created.");
+    partial_flow_buffers_.clear();
+}
+
+PacketProcessor::~PacketProcessor() {
+    PME_LOG_INFO(log_, "PacketProcessor instance destroyed.");
+    partial_flow_buffers_.clear(); 
+}
+
+// New callback for connection start
+void PacketProcessor::onTcpConnectionStartCallback(const pcpp::ConnectionData& connectionData, void* userCookie) {
+    PacketProcessor* self = static_cast<PacketProcessor*>(userCookie);
+    if (!self) return;
+    uint32_t flow_id = connectionData.flowKey;
+    PME_LOG_INFO(self->log_, "TCP Connection Started for flow key: " << flow_id);
+    // It's good practice to ensure no stale buffer exists when a new connection starts
+    self->partial_flow_buffers_.erase(flow_id);
+}
+
+// New callback for connection end
+void PacketProcessor::onTcpConnectionEndCallback(const pcpp::ConnectionData& connectionData, pcpp::TcpReassemblyConnectionEndReason reason, void* userCookie) {
+    PacketProcessor* self = static_cast<PacketProcessor*>(userCookie);
+    if (!self) return;
+    uint32_t flow_id = connectionData.flowKey;
+    std::string reason_str = (reason == pcpp::TcpReassemblyConnectionClosedByFIN_RST) ? "FIN/RST" : "Manually";
+    PME_LOG_INFO(self->log_, "TCP Connection Ended for flow key: " << flow_id << ". Reason: " << reason_str);
+    self->partial_flow_buffers_.erase(flow_id); // Remove any pending buffer for this flow
+}
+
+// Modified callback for when TCP message data is ready
+void PacketProcessor::onTcpMessageReadyCallback(int8_t side, const pcpp::TcpStreamData& tcpData, void* userCookie) {
+    PacketProcessor* self = static_cast<PacketProcessor*>(userCookie);
+    if (!self) {
+        PME_LOG_ERROR(PME_GET_LOGGER("PacketProcessor"), "TCP MessageReady callback: userCookie is null.");
+        return;
+    }
+
+    const pcpp::ConnectionData& connectionData = tcpData.getConnectionData();
+    uint32_t flow_id = connectionData.flowKey;
+
+    std::vector<uint8_t> current_processing_buffer;
+
+    // 1. Prepend existing buffered data for this flow (if any)
+    auto it = self->partial_flow_buffers_.find(flow_id);
+    if (it != self->partial_flow_buffers_.end()) {
+        current_processing_buffer = std::move(it->second);
+        self->partial_flow_buffers_.erase(it);
+        PME_LOG_DEBUG(self->log_, "Flow key: " << flow_id << " - Prepended " << current_processing_buffer.size() << " previously buffered bytes. Side: " << (int)side);
+    }
+
+    // 2. Append newly received data
+    const uint8_t* new_data_ptr = tcpData.getData();
+    size_t new_data_len = tcpData.getDataLength();
+    if (new_data_ptr && new_data_len > 0) {
+        current_processing_buffer.insert(current_processing_buffer.end(), new_data_ptr, new_data_ptr + new_data_len);
+    }
+
+    if (current_processing_buffer.empty()) {
+        PME_LOG_DEBUG(self->log_, "Flow key: " << flow_id << " - No data to process in this callback. Side: " << (int)side);
+        return;
+    }
+
+    const uint8_t* data_ptr = current_processing_buffer.data();
+    size_t total_data_len = current_processing_buffer.size();
+    size_t offset = 0;
+
+    PME_LOG_INFO(self->log_, "TCP Message Data Ready for flow key: " << flow_id 
+                            << ". Side: " << (int)side << ". Processing buffer size: " << total_data_len << " bytes.");
+
+    while (offset < total_data_len) {
+        const uint8_t* current_msg_ptr = data_ptr + offset;
+        size_t remaining_len = total_data_len - offset;
+
+        if (remaining_len < sizeof(RazeFormatter::Header)) {
+            PME_LOG_DEBUG(self->log_, "Flow key: " << flow_id << " - Remaining data (" << remaining_len 
+                                 << " bytes) too small for RazeFormatter::Header. Buffering.");
+            if (remaining_len > 0) { 
+                self->partial_flow_buffers_[flow_id].assign(current_msg_ptr, current_msg_ptr + remaining_len);
+            }
+            break; 
+        }
+
+        const auto* hdr = reinterpret_cast<const RazeFormatter::Header*>(current_msg_ptr);
+        uint16_t message_len = pcpp::netToHost16(hdr->packet_length); 
+
+        if (message_len == 0) {
+            PME_LOG_ERROR(self->log_, "Flow key: " << flow_id << " - RazeProtocol message_len is 0. Invalid message. Discarding current processing buffer for this flow and stopping.");
+            self->partial_flow_buffers_.erase(flow_id); 
+            break; 
+        }
+        
+        if (message_len > remaining_len) {
+            PME_LOG_DEBUG(self->log_, "Flow key: " << flow_id << " - RazeProtocol message_len (" << message_len
+                                 << ") > remaining data (" << remaining_len
+                                 << "). Partial message detected. Buffering remaining " << remaining_len << " bytes.");
+            if (remaining_len > 0) { 
+                 self->partial_flow_buffers_[flow_id].assign(current_msg_ptr, current_msg_ptr + remaining_len);
+            }
+            break; 
+        }
+
+        PME_LOG_DEBUG(self->log_, "Flow key: " << flow_id << " - RazeProtocol Message: Type=" << static_cast<int>(hdr->packet_type) 
+                               << ", Declared Length (host order)=" << message_len);
+
+        switch (hdr->packet_type) {
+            case RazeFormatter::PacketType::unsequenced_header: {
+                handleUnsequencedData(reinterpret_cast<RazeFormatter::UnsequencedHeader const *>(hdr));
+                break;
+            }
+            default:
+                PME_LOG_WARN(self->log_, "Flow key: " << flow_id << " - Unknown RazeProtocol packet_type: " << static_cast<int>(hdr->packet_type) 
+                                      << ". Skipping " << message_len << " bytes.");
+                break;
+        }
+        offset += message_len; 
+    }
+}
+
+void PacketProcessor::handleUnsequencedData(RazeFormatter::UnsequencedHeader const* hdr)
+{
+    switch (hdr->message_type) 
+    {
+        case RazeFormatter::MessageType::new_order:
+        {
+            handleNewOrder(reinterpret_cast<RazeFormatter::NewOrder const *>(hdr));
+            break;
+        }
+        default:
+            PME_LOG_WARN(log_, "Ignoring any packet that isn't new_order");
+            break;
+    }
+}
+
+void PacketProcessor::handleNewOrder(RazeFormatter::NewOrder const* hdr)
+{
+    PME_LOG_INFO(log_, "NewOrder received: " << hdr->data.order_token);
+}
+
+void PacketProcessor::processUdpPacket(pcpp::Packet& packet) {
+    pcpp::UdpLayer* udpLayer = packet.getLayerOfType<pcpp::UdpLayer>();
+    if (!udpLayer) {
+        PME_LOG_TRACE(log_, "Packet does not have a UDP layer.");
+        return;
+    }
+
+    pcpp::IPv4Layer* ipv4Layer = packet.getLayerOfType<pcpp::IPv4Layer>();
+    if (!ipv4Layer) {
+        PME_LOG_DEBUG(log_, "UDP packet is not IPv4. SPCAST processing currently expects IPv4. SrcPort: " 
+                            << udpLayer->getSrcPort() << " DstPort: " << udpLayer->getDstPort());
+        return; // SPCAST logic here relies on IPv4 for flow key
+    }
+
+    std::string flow_info_log = "UDP Flow - SrcIP: " + ipv4Layer->getSrcIPAddress().toString() +
+                                " DstIP: " + ipv4Layer->getDstIPAddress().toString() +
+                                " SrcPort: " + std::to_string(udpLayer->getSrcPort()) +
+                                " DstPort: " + std::to_string(udpLayer->getDstPort());
+
+    PME_LOG_DEBUG(log_, "Processing " << flow_info_log);
+    uint8_t* payload = udpLayer->getLayerPayload();
+    size_t payloadSize = udpLayer->getLayerPayloadSize();
+
+    if (payloadSize == 0) {
+        PME_LOG_DEBUG(log_, flow_info_log << " - UDP packet has no payload.");
+        return;
+    }
+
+    // The first byte of every SPCAST packet_header_t is the version.
+    uint8_t detectedVersion = *payload;
+
+    switch (detectedVersion) {
+        case 3:
+            handleSPCastV3(packet, ipv4Layer, udpLayer, payload, payloadSize);
+            break;
+        case 4:
+            handleSPCastV4(packet, ipv4Layer, udpLayer, payload, payloadSize);
+            break;
+        default:
+            PME_LOG_TRACE(log_, flow_info_log << " - UDP payload does not appear to be SPCAST. First byte/version field=" << (int)detectedVersion);
+            break;
+    }
+}
+
+void PacketProcessor::handleSPCastV3(pcpp::Packet& packet, pcpp::IPv4Layer* ipv4Layer, pcpp::UdpLayer* udpLayer, uint8_t* payload, size_t payloadSize) {
+    // Basic size check for packet header
+    if (payloadSize < sizeof(spcast::SpcastVersion3Traits::PacketHeader)) {
+        PME_LOG_WARN(log_, "SPCASTv3: Datagram too small for packet_header_t (" << payloadSize << " bytes). SrcPort=" << udpLayer->getSrcPort());
+        return;
+    }
+
+    const auto* pktHdr = reinterpret_cast<const spcast::SpcastVersion3Traits::PacketHeader*>(payload);
+
+    // Quick sanity on version
+    if (pktHdr->version != 3) {
+        PME_LOG_DEBUG(log_, "SPCASTv3: Unexpected version byte " << (int)pktHdr->version << ", skipping packet.");
+        return;
+    }
+
+    const uint64_t recv_timestamp_ns = pktHdr->recv_timestamp_ns;
+    const uint64_t send_timestamp_ns = pktHdr->send_timestamp_ns;
+
+    // Pointer math to start of first message
+    const uint8_t* cursor = payload + sizeof(spcast::SpcastVersion3Traits::PacketHeader);
+    const uint8_t* end    = payload + payloadSize;
+
+    while (cursor + sizeof(spcast::SpcastVersion3Traits::MessageHeader) <= end) {
+        const auto* msgHdr = reinterpret_cast<const spcast::SpcastVersion3Traits::MessageHeader*>(cursor);
+
+        uint16_t msg_len_net = msgHdr->length;
+        uint16_t msg_len     = pcpp::netToHost16(msg_len_net); // total length including header
+
+        if (msg_len == 0) {
+            PME_LOG_WARN(log_, "SPCASTv3: Encountered message with length 0. Skipping remaining bytes.");
+            break;
+        }
+
+        if (cursor + msg_len > end) {
+            PME_LOG_WARN(log_, "SPCASTv3: Truncated message (declared " << msg_len << " bytes, only " << (end - cursor) << " remain).");
+            break;
+        }
+
+        // Extract symbol string (may be empty)
+        std::string symbol;
+        if (msgHdr->symbol_size > 0 && msgHdr->symbol_offset + msgHdr->symbol_size <= msg_len) {
+            symbol.assign(reinterpret_cast<const char*>(cursor) + msgHdr->symbol_offset, msgHdr->symbol_size);
+        }
+
+        uint64_t seq = msgHdr->seq_num; // host order already (pcap captured on same endianness)
+
+        // Sequence tracking per symbol
+        uint64_t& expected = spcast_v3_last_seq_[symbol]; // default 0 if new key
+        if (expected != 0) {
+            if (seq == expected) {
+                // OK
+            } else if (seq > expected) {
+                PME_LOG_WARN(log_, "SPCASTv3 GAP - Symbol=" << symbol << " expected " << expected << " got " << seq << ");
+            } else { // seq < expected
+                PME_LOG_WARN(log_, "SPCASTv3 OOO/DUP - Symbol=" << symbol << " expected >= " << expected << " got " << seq << ");
+            }
+        }
+        expected = seq + 1;
+
+        PME_LOG_INFO(log_, "SPCASTv3 MSG - Sym=" << symbol
+                        << " Type=" << static_cast<int>(msgHdr->message_type)
+                        << " Seq=" << seq
+                        << " ExchTS=" << msgHdr->exch_timestamp_ns
+                        << " RecvTS=" << recv_timestamp_ns
+                        << " SendTS=" << send_timestamp_ns);
+
+        // Advance
+        cursor += msg_len;
+    }
+}
+
+void PacketProcessor::handleSPCastV4(pcpp::Packet& packet, pcpp::IPv4Layer* ipv4Layer, pcpp::UdpLayer* udpLayer, uint8_t* payload, size_t payloadSize) {
+    PME_LOG_DEBUG(log_, "SPCAST Version 4 detected. Flow: " 
+                        << ipv4Layer->getSrcIPAddress().toString() << ":" << udpLayer->getSrcPort() << "->"
+                        << ipv4Layer->getDstIPAddress().toString() << ":" << udpLayer->getDstPort()
+                        << ". Payload size: " << payloadSize 
+                        << ". (Full handling not yet implemented).");
+}   
+
+// This is a simplified version for when TcpReassembly provides the full connection data
+// If you need to manually track TCP segments before they are reassembled or for other purposes,
+// you might need a more detailed processTcpPacket method.
+void PacketProcessor::processTcpPacket(pcpp::Packet& parsedPacket, const pcpp::ConnectionData& connData) {
+    // This method might be used if we need to do something with TCP packets
+    // *before* or *in addition to* reassembly, or if not using the reassembly feature
+    // for a specific purpose. For now, TcpReassembly handles most of the TCP logic.
+    PME_LOG_TRACE(log_, "Raw TCP Packet processed for flow: " << connData.toString() << " (will be fed to reassembly)");
+}
+
+void PacketProcessor::processFile(const std::string& filePath) {
+    PME_LOG_INFO(log_, "Starting to process PCAP file: " << filePath);
+
+    pcpp::IFileReaderDevice* reader = pcpp::IFileReaderDevice::getReader(filePath);
+
+    if (reader == nullptr || !reader->open()) {
+        PME_LOG_ERROR(log_, "Cannot open PCAP file: " << filePath);
+        if (reader) delete reader;
+        return;
+    }
+
+    PME_LOG_INFO(log_, "Successfully opened PCAP file: " << filePath);
+
+    tcp_reassembly_.closeAllConnections(); // This will trigger onTcpConnectionEndCallback for any open connections
+    partial_flow_buffers_.clear(); // Also explicitly clear, though onTcpConnectionEndCallback should handle active ones.
+
+    pcpp::RawPacket rawPacket;
+    int packetCount = 0;
+    int tcpCount = 0;
+    int udpCount = 0;
+    int otherCount = 0;
+
+    while (reader->getNextPacket(rawPacket)) {
+        if (shutdown::requested()) {
+            PME_LOG_INFO(log_, "Shutdown requested during processing of file: " << filePath << ". Aborting file processing.");
+            break; 
+        }
+
+        packetCount++;
+        pcpp::Packet parsedPacket(&rawPacket);
+
+        if (parsedPacket.isPacketOfType(pcpp::TCP)) {
+            pcpp::TcpLayer* tcpLayer = parsedPacket.getLayerOfType<pcpp::TcpLayer>();
+            pcpp::IPv4Layer* ipv4Layer = parsedPacket.getLayerOfType<pcpp::IPv4Layer>();
+            if (tcpLayer && ipv4Layer) {
+                tcp_reassembly_.reassemblePacket(parsedPacket);
+                tcpCount++;
+            } else {
+                otherCount++;
+            }
+        } else if (parsedPacket.isPacketOfType(pcpp::UDP)) {
+            processUdpPacket(parsedPacket);
+            udpCount++;
+        } else {
+            otherCount++;
+        }
+        
+        // Hybrid approach for yielding:
+        // Yield on most iterations, periodically do a very short sleep for a stronger yield.
+        if (packetCount % 200 == 0) { // Adjust frequency as needed
+            std::this_thread::sleep_for(std::chrono::microseconds(50)); // Adjust duration (e.g., 10-100µs)
+        } else {
+            std::this_thread::yield();
+        }
+
+    }
+
+    // Ensure reassembly structures are cleaned up even if loop broke early due to shutdown
+    tcp_reassembly_.closeAllConnections(); // Ensure all connections are closed and final data processed / callbacks triggered
+    partial_flow_buffers_.clear(); // Final clear for safety
+
+    PME_LOG_INFO(log_, "Finished processing PCAP file: " << filePath);
+    PME_LOG_INFO(log_, "Summary - Total Packets: " << packetCount 
+                      << ", TCP: " << tcpCount 
+                      << ", UDP: " << udpCount 
+                      << ", Other: " << otherCount);
+
+    reader->close();
+    delete reader;
+}
+
+
+
+class PacketProcessor {
+public:
+    PacketProcessor();
+    ~PacketProcessor();
+
+    void processFile(const std::string& filePath);
+
+private:
+    // TCP Reassembly callbacks
+    static void onTcpMessageReadyCallback(int8_t side, const pcpp::TcpStreamData& tcpData, void* userCookie);
+    static void onTcpConnectionStartCallback(const pcpp::ConnectionData& connectionData, void* userCookie);
+    static void onTcpConnectionEndCallback(const pcpp::ConnectionData& connectionData, pcpp::TcpReassembly::ConnectionEndReason reason, void* userCookie);
+
+    // UDP processing
+    void processUdpPacket(pcpp::Packet& packet);
+    void handleSPCastV3(pcpp::Packet& packet,
+                        pcpp::IPv4Layer* ipv4Layer,
+                        pcpp::UdpLayer* udpLayer,
+                        uint8_t* payload,
+                        size_t payloadSize);
+    void handleSPCastV4(pcpp::Packet& packet,
+                        pcpp::IPv4Layer* ipv4Layer,
+                        pcpp::UdpLayer* udpLayer,
+                        uint8_t* payload,
+                        size_t payloadSize);
+
+    // TCP processing
+    void processTcpPacket(pcpp::Packet& packet, const pcpp::ConnectionData& connData);
+
+    // RazeProtocol processing
+    void handleUnsequencedData(RazeFormatter::UnsequencedHeader const* hdr);
+    void handleNewOrder(RazeFormatter::NewOrder const* hdr);
+
+
+    px::Log* log_;
+    pcpp::TcpReassembly tcp_reassembly_;
+    std::map<uint32_t, std::vector<uint8_t>> partial_flow_buffers_; // Buffer for partial TCP messages per flow SID
+
+    // Track last seen sequence per symbol for SPCast v3
+    std::unordered_map<std::string, uint64_t> spcast_v3_last_seq_;
+
+    // Custom UDP Reassembly related members
+    // Example:
+    // struct UdpMessageFragment {
+    //     uint16_t messageId; // Or some identifier for the message
+    //     uint16_t fragmentOffset;
+    //     bool isLastFragment;
+    //     std::vector<uint8_t> payload;
+    // };
+    // std::map<uint32_t, std::vector<UdpMessageFragment>> udp_message_buffer_; // Key: sourceIP_sourcePort_destIP_destPort hash or similar
+    // void checkForCompleteUdpMessages(uint32_t flowKey);
+
+
+    // Helper to get logger
+    static px::Log* getLogger();
+};
+
+// Replace the old free function with a call to a static method or instance for compatibility,
+// or update Engine to use the class. For now, let's assume Engine will be updated.
+// void processPcap(const std::string& file); // Remove this or adapt Engine
