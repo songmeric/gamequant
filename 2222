@@ -1,0 +1,150 @@
+#include <iostream>
+#include <fstream>
+#include <string>
+#include <string_view>
+#include <unordered_map>
+#include <regex>
+#include <chrono>
+#include <iomanip>
+#include <sstream>
+
+// You need C++20 for std::chrono::from_stream
+using sys_clock = std::chrono::system_clock;
+
+// Holds both known and unknown fields
+struct LatencyStats {
+    std::string event_type;
+    int         md_seq_num       = 0;
+    std::string md_feed_name;
+    int         exch_seq_num     = 0;
+    int         exch_src_id      = 0;
+    uint64_t    md_sec_ric       = 0;
+    int         oms_queue_size   = 0;
+    sys_clock::time_point before_md_recv;
+
+    // Catch‐all for additional fields
+    std::unordered_map<std::string, std::string> extras;
+    
+    friend std::ostream& operator<<(std::ostream& os, LatencyStats const& s) {
+        os << "event_type=" << s.event_type
+           << " md_seq_num=" << s.md_seq_num
+           << " md_feed_name=" << s.md_feed_name
+           << " exch_seq_num=" << s.exch_seq_num
+           << " exch_src_id=" << s.exch_src_id
+           << " md_sec_ric=" << s.md_sec_ric
+           << " oms_queue_size=" << s.oms_queue_size
+           << " before_md_recv=[";
+        auto tt = sys_clock::to_time_t(s.before_md_recv);
+        auto subsec = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                          s.before_md_recv.time_since_epoch() % std::chrono::seconds(1)
+                      ).count();
+        os << std::put_time(std::gmtime(&tt), "%Y-%m-%d %H:%M:%S")
+           << "." << std::setw(9) << std::setfill('0') << subsec
+           << "]";
+        if (!s.extras.empty()) {
+            os << " extras={";
+            for (auto const& [k,v] : s.extras) {
+                os << k << "=" << v << ",";
+            }
+            os << "}";
+        }
+        return os;
+    }
+};
+
+// Parse ISO‐style timestamp with nanoseconds
+sys_clock::time_point parseTimestamp(std::string_view ts) {
+    std::istringstream in(std::string(ts));
+    std::tm tm{};
+    long         nanosec = 0;
+    in >> std::get_time(&tm, "%Y-%m-%d %H:%M:%S");
+    // then read “.123456789”
+    if (in.peek() == '.') {
+        in.ignore();
+        in >> nanosec;
+    }
+    auto tp = sys_clock::from_time_t(std::mktime(&tm));
+    return tp + std::chrono::nanoseconds(nanosec);
+}
+
+// Key=Value parser
+std::pair<std::string_view,std::string_view>
+    parseKV(std::string_view text, size_t& pos)
+{
+    // skip whitespace
+    while (pos < text.size() && isspace(text[pos])) pos++;
+    auto start = pos;
+    // read key
+    while (pos < text.size() && text[pos] != '=') pos++;
+    auto key = text.substr(start, pos - start);
+    pos++; // skip '='
+    // skip whitespace
+    while (pos < text.size() && isspace(text[pos])) pos++;
+    // read value (up to comma or end)
+    start = pos;
+    bool in_quotes = (text[pos]=='\'');
+    if (in_quotes) pos++;
+    while (pos < text.size() && 
+          (in_quotes ? text[pos] != '\'' : text[pos] != ',' && text[pos] != '}'))
+    {
+        pos++;
+    }
+    auto value = text.substr(start, pos - start);
+    if (in_quotes && pos<text.size() && text[pos]=='\'') pos++;
+    // skip comma
+    if (pos<text.size() && text[pos]==',') pos++;
+    return {key, value};
+}
+
+std::unordered_map<int, LatencyStats>
+parseLatencyStatsFile(const std::string& filename) {
+    static const std::regex line_re{
+        R"(.*clordid\s*=\s*(\d+)\s*,\s*latency_stats\s*=\s*\{(.*)\}.*)"};
+    std::unordered_map<int,LatencyStats> out;
+    std::ifstream in{filename};
+    std::string   line;
+    while (std::getline(in, line)) {
+        std::smatch m;
+        if (!std::regex_match(line, m, line_re)) continue;
+        int               cid  = std::stoi(m[1].str());
+        std::string_view  body = m[2].str();
+        
+        LatencyStats stats;
+        size_t pos = 0;
+        while (pos < body.size()) {
+            auto [k,v] = parseKV(body, pos);
+            if (k == "event_type") {
+                stats.event_type = std::string(v);
+            } else if (k == "md_seq_num") {
+                stats.md_seq_num = std::stoi(std::string(v));
+            } else if (k == "md_feed_name") {
+                // strip quotes if present
+                stats.md_feed_name = v.front()=='\'' && v.back()=='\'' 
+                                    ? std::string(v.substr(1, v.size()-2))
+                                    : std::string(v);
+            } else if (k == "exch_seq_num") {
+                stats.exch_seq_num = std::stoi(std::string(v));
+            } else if (k == "exch_src_id") {
+                stats.exch_src_id  = std::stoi(std::string(v));
+            } else if (k == "md_sec_ric") {
+                stats.md_sec_ric   = std::stoull(std::string(v));
+            } else if (k == "oms_queue_size") {
+                stats.oms_queue_size = std::stoi(std::string(v));
+            } else if (k == "before_md_recv") {
+                stats.before_md_recv = parseTimestamp(v);
+            } else {
+                stats.extras.emplace(std::string(k), std::string(v));
+            }
+        }
+        out.emplace(cid, std::move(stats));
+    }
+    return out;
+}
+
+int main(){
+    auto stats_map = parseLatencyStatsFile("dropcopyfile.log");
+    std::cout << "Parsed " << stats_map.size() << " entries\n\n";
+    for (auto const& [cid, st] : stats_map) {
+        std::cout << "ClOrdID=" << cid << " → " << st << "\n";
+    }
+}
