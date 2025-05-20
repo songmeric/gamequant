@@ -1,0 +1,59 @@
+// --- add this helper at file‐scope ---
+std::string_view trim_sv(std::string_view sv) {
+    size_t b = 0, e = sv.size();
+    while (b < e && std::isspace((unsigned char)sv[b])) ++b;
+    while (e > b && std::isspace((unsigned char)sv[e-1])) --e;
+    return sv.substr(b, e-b);
+}
+
+// --- inside your parsing loop, replace your unpack + stripQuotes line with this ---
+
+while (pos < body.size()) {
+    auto [raw_k, raw_v] = parseKV(body, pos);
+
+    // 1) trim both ends of key and value
+    auto key_sv   = trim_sv(raw_k);
+    auto value_sv = trim_sv(raw_v);
+
+    // 2) strip the single quotes if present
+    auto value_nq = stripQuotes(value_sv);
+
+    // 3) use std::string(key_sv) for comparison/parsing:
+    std::string key{key_sv};
+    std::string_view val{value_nq};
+
+    try {
+        if (key == "event_type") {
+            stats.event_type = std::string(val);
+        }
+        else if (key == "md_seq_num") {
+            stats.md_seq_num = std::stoi(std::string(val));
+        }
+        else if (key == "md_feed_name") {
+            stats.md_feed_name = std::string(val);
+        }
+        else if (key == "exch_seq_num") {
+            stats.exch_seq_num = std::stoi(std::string(val));
+        }
+        else if (key == "exch_src_id") {
+            stats.exch_src_id = std::stoi(std::string(val));
+        }
+        else if (key == "md_sec_ric") {
+            stats.md_sec_ric = std::stoull(std::string(val));
+        }
+        else if (key == "oms_queue_size") {
+            stats.oms_queue_size = std::stoi(std::string(val));
+        }
+        else if (key == "before_md_recv") {
+            stats.before_md_recv = parseTimestamp(val);
+        }
+        else {
+            // truly unknown or new field
+            stats.extras.emplace(std::move(key), std::string(val));
+        }
+    }
+    catch (...) {
+        // fallback on any parse error
+        stats.extras.emplace(std::move(key), std::string(val));
+    }
+}
