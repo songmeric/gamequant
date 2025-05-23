@@ -1,0 +1,69 @@
+#include <unordered_map>
+#include <vector>
+#include <string>
+#include <fstream>
+#include <chrono>
+#include <algorithm>
+#include <iomanip>
+#include <cstdint>
+
+bool writeTimestampDeltaCSV(
+    const std::unordered_map<uint64_t, std::vector<ParsedPacketInfo>>& packetMap,
+    const std::string& outputDir) {
+    
+    // Construct the output file path
+    std::string filename = outputDir;
+    if (!filename.empty() && filename.back() != '/' && filename.back() != '\\') {
+        filename += "/";
+    }
+    filename += "timestamp_deltas.csv";
+    
+    // Open the file for writing
+    std::ofstream csvFile(filename);
+    if (!csvFile.is_open()) {
+        return false;
+    }
+    
+    // Write CSV header
+    csvFile << "entry_id,timestamp1_seconds,timestamp2_seconds,delta_nanoseconds\n";
+    
+    // Process each entry in the map
+    for (const auto& [key, packetVector] : packetMap) {
+        // Skip if the vector doesn't contain exactly 2 packets
+        if (packetVector.size() != 2) {
+            continue;
+        }
+        
+        // Get timestamps from both packets
+        auto timestamp1 = packetVector[0].getTimeStamp();
+        auto timestamp2 = packetVector[1].getTimeStamp();
+        
+        // Convert both timestamps to nanoseconds since epoch
+        auto nanos1 = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            timestamp1.time_since_epoch()
+        ).count();
+        auto nanos2 = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            timestamp2.time_since_epoch()
+        ).count();
+        
+        // Calculate the delta in nanoseconds (absolute value)
+        int64_t deltaNanos = std::abs(nanos2 - nanos1);
+        
+        // Convert to seconds with full precision
+        double timestamp1InSeconds = nanos1 / 1000000000.0;
+        double timestamp2InSeconds = nanos2 / 1000000000.0;
+        
+        // Write to CSV with appropriate precision
+        csvFile << std::fixed << std::setprecision(9);  // 9 decimal places for nanosecond precision
+        csvFile << key << "," << timestamp1InSeconds << "," << timestamp2InSeconds << "," << deltaNanos << "\n";
+    }
+    
+    // Check if writing was successful
+    if (csvFile.fail()) {
+        csvFile.close();
+        return false;
+    }
+    
+    csvFile.close();
+    return true;
+}
