@@ -1,0 +1,179 @@
+#include <cstdint>
+#include <string>
+#include <sstream>
+#include <iomanip>
+#include <ctime>
+#include <stdexcept>
+
+// Parse UTC timestamp string to uint64_t nanoseconds since epoch
+// Format: YYYY-MM-DD HH:MM:SS.nnnnnnnnn (nanoseconds precision)
+uint64_t parseTimestampToNanos(const std::string& timestamp) {
+    // Parse components
+    int year, month, day, hour, minute, second;
+    char dash1, dash2, space, colon1, colon2, dot;
+    std::string nano_str;
+    
+    std::istringstream iss(timestamp);
+    iss >> year >> dash1 >> month >> dash2 >> day >> space 
+        >> hour >> colon1 >> minute >> colon2 >> second >> dot;
+    
+    // Read the nanosecond part
+    if (iss && dot == '.') {
+        iss >> nano_str;
+    }
+    
+    // Validate format
+    if (iss.fail() || dash1 != '-' || dash2 != '-' || space != ' ' || 
+        colon1 != ':' || colon2 != ':' || dot != '.') {
+        throw std::invalid_argument("Invalid timestamp format");
+    }
+    
+    // Parse nanoseconds (pad with zeros if less than 9 digits)
+    uint64_t nanos_frac = 0;
+    if (!nano_str.empty()) {
+        if (nano_str.length() > 9) {
+            nano_str = nano_str.substr(0, 9);
+        } else {
+            nano_str.append(9 - nano_str.length(), '0');
+        }
+        nanos_frac = std::stoull(nano_str);
+    }
+    
+    // Convert to UTC time
+    std::tm tm = {};
+    tm.tm_year = year - 1900;  // years since 1900
+    tm.tm_mon = month - 1;      // 0-11
+    tm.tm_mday = day;
+    tm.tm_hour = hour;
+    tm.tm_min = minute;
+    tm.tm_sec = second;
+    tm.tm_isdst = 0;  // UTC has no DST
+    
+    // Convert to seconds since epoch (UTC)
+#ifdef _WIN32
+    // Windows doesn't have timegm, use _mkgmtime
+    std::time_t time_seconds = _mkgmtime(&tm);
+#else
+    // POSIX systems have timegm
+    std::time_t time_seconds = timegm(&tm);
+#endif
+    
+    if (time_seconds == -1) {
+        throw std::invalid_argument("Failed to convert timestamp");
+    }
+    
+    // Convert to nanoseconds
+    uint64_t total_nanos = static_cast<uint64_t>(time_seconds) * 1'000'000'000ULL;
+    total_nanos += nanos_frac;
+    
+    return total_nanos;
+}
+
+// Portable UTC conversion alternative (if timegm not available)
+uint64_t parseTimestampToNanosPortable(const std::string& timestamp) {
+    // Parse components
+    int year, month, day, hour, minute, second;
+    char dash1, dash2, space, colon1, colon2, dot;
+    std::string nano_str;
+    
+    std::istringstream iss(timestamp);
+    iss >> year >> dash1 >> month >> dash2 >> day >> space 
+        >> hour >> colon1 >> minute >> colon2 >> second >> dot;
+    
+    if (iss && dot == '.') {
+        iss >> nano_str;
+    }
+    
+    if (iss.fail() || dash1 != '-' || dash2 != '-' || space != ' ' || 
+        colon1 != ':' || colon2 != ':' || dot != '.') {
+        throw std::invalid_argument("Invalid timestamp format");
+    }
+    
+    // Parse nanoseconds
+    uint64_t nanos_frac = 0;
+    if (!nano_str.empty()) {
+        if (nano_str.length() > 9) {
+            nano_str = nano_str.substr(0, 9);
+        } else {
+            nano_str.append(9 - nano_str.length(), '0');
+        }
+        nanos_frac = std::stoull(nano_str);
+    }
+    
+    // Manual UTC calculation (days since epoch)
+    // This is a simplified version - for production use, consider a proper date library
+    
+    // Days from 1970-01-01 to year-01-01
+    int days = 0;
+    for (int y = 1970; y < year; ++y) {
+        days += (y % 4 == 0 && (y % 100 != 0 || y % 400 == 0)) ? 366 : 365;
+    }
+    
+    // Days from year-01-01 to year-month-01
+    const int days_in_month[] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+    for (int m = 1; m < month; ++m) {
+        days += days_in_month[m - 1];
+        if (m == 2 && year % 4 == 0 && (year % 100 != 0 || year % 400 == 0)) {
+            days += 1;  // leap year February
+        }
+    }
+    
+    // Add day of month
+    days += day - 1;
+    
+    // Convert to seconds
+    uint64_t seconds = static_cast<uint64_t>(days) * 86400ULL;
+    seconds += static_cast<uint64_t>(hour) * 3600ULL;
+    seconds += static_cast<uint64_t>(minute) * 60ULL;
+    seconds += static_cast<uint64_t>(second);
+    
+    // Convert to nanoseconds
+    uint64_t total_nanos = seconds * 1'000'000'000ULL;
+    total_nanos += nanos_frac;
+    
+    return total_nanos;
+}
+
+// Example usage
+#include <iostream>
+#include <iomanip>
+
+int main() {
+    try {
+        // Test cases
+        std::string timestamps[] = {
+            "2025-01-01 16:04:02.111133000",
+            "2025-01-01 16:04:02.123456789",
+            "2025-01-01 16:04:02.000000001",
+            "1970-01-01 00:00:00.000000000",  // Unix epoch
+            "2038-01-19 03:14:07.999999999"   // Near 32-bit limit
+        };
+        
+        for (const auto& ts : timestamps) {
+            uint64_t nanos = parseTimestampToNanos(ts);
+            std::cout << "Timestamp: " << ts << "\n";
+            std::cout << "Nanoseconds: " << nanos << "\n";
+            
+            // Verify by converting back
+            uint64_t seconds = nanos / 1'000'000'000ULL;
+            uint64_t nanos_part = nanos % 1'000'000'000ULL;
+            std::time_t time_sec = static_cast<std::time_t>(seconds);
+            std::tm* tm_utc = std::gmtime(&time_sec);
+            
+            std::cout << "Verified: "
+                      << std::setfill('0') 
+                      << std::setw(4) << (tm_utc->tm_year + 1900) << "-"
+                      << std::setw(2) << (tm_utc->tm_mon + 1) << "-"
+                      << std::setw(2) << tm_utc->tm_mday << " "
+                      << std::setw(2) << tm_utc->tm_hour << ":"
+                      << std::setw(2) << tm_utc->tm_min << ":"
+                      << std::setw(2) << tm_utc->tm_sec << "."
+                      << std::setw(9) << nanos_part << "\n\n";
+        }
+        
+    } catch (const std::exception& e) {
+        std::cerr << "Error: " << e.what() << "\n";
+    }
+    
+    return 0;
+}
