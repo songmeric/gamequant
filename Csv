@@ -1,0 +1,70 @@
+#include <unordered_map>
+#include <vector>
+#include <string>
+#include <fstream>
+#include <chrono>
+#include <algorithm>
+#include <iomanip>
+#include <cstdint>
+
+bool writeTimestampDeltaCSV(
+    const std::unordered_map<uint64_t, std::vector<ParsedPacketInfo>>& packetMap,
+    const std::string& outputDir) {
+    
+    // Construct the output file path
+    std::string filename = outputDir;
+    if (!filename.empty() && filename.back() != '/' && filename.back() != '\\') {
+        filename += "/";
+    }
+    filename += "timestamp_deltas.csv";
+    
+    // Open the file for writing
+    std::ofstream csvFile(filename);
+    if (!csvFile.is_open()) {
+        return false;
+    }
+    
+    // Write CSV header
+    csvFile << "entry_id,timestamp_seconds,delta_microseconds\n";
+    
+    // Process each entry in the map
+    for (const auto& [key, packetVector] : packetMap) {
+        // Skip if the vector doesn't contain exactly 2 packets
+        if (packetVector.size() != 2) {
+            continue;
+        }
+        
+        // Get timestamps from both packets
+        auto timestamp1 = packetVector[0].getTimeStamp();
+        auto timestamp2 = packetVector[1].getTimeStamp();
+        
+        // Find the smaller timestamp for x-axis
+        auto minTimestamp = std::min(timestamp1, timestamp2);
+        auto maxTimestamp = std::max(timestamp1, timestamp2);
+        
+        // Calculate the delta
+        auto delta = std::chrono::duration_cast<std::chrono::microseconds>(
+            maxTimestamp - minTimestamp
+        ).count();
+        
+        // Convert minimum timestamp to seconds since epoch (with decimal precision)
+        auto epochTime = minTimestamp.time_since_epoch();
+        auto seconds = std::chrono::duration_cast<std::chrono::seconds>(epochTime).count();
+        auto microseconds = std::chrono::duration_cast<std::chrono::microseconds>(epochTime).count() % 1000000;
+        
+        double timestampInSeconds = seconds + (microseconds / 1000000.0);
+        
+        // Write to CSV with appropriate precision
+        csvFile << std::fixed << std::setprecision(6);
+        csvFile << key << "," << timestampInSeconds << "," << delta << "\n";
+    }
+    
+    // Check if writing was successful
+    if (csvFile.fail()) {
+        csvFile.close();
+        return false;
+    }
+    
+    csvFile.close();
+    return true;
+}
