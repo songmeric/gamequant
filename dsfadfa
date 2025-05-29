@@ -1,4 +1,5 @@
 //FILENAME: main.cpp
+
 #include "Log.h"
 #include "Engine.h"
 #include "ShutdownUtils.h"
@@ -7,19 +8,18 @@
 #include <string>
 #include <charconv> // For std::from_chars
 #include <cstring> // For strlen
-
 // Helper to parse unsigned int from string
 bool parse_uint(const char* str, unsigned& out_val) {
     if (!str) return false;
     auto [ptr, ec] = std::from_chars(str, str + strlen(str), out_val);
-    return ec == std::errc{} && ptr == (str + strlen(str));
+    return ec == std::errc() && ptr == (str + strlen(str));
 }
 
 int main(int argc, char** argv)
 {
     sp::logging::start(sp::logging::stdout_config());
     sp::logging::set_override(sp::logging::level::DEBUG);
-    px::log* main_log = PME_GET_LOGGER("Main");
+    px::Log* main_log = PME_GET_LOGGER("Main");
 
     if (argc < 2) {
         PME_LOG_ERROR(main_log, "Usage: " << argv[0] << " <directory1> [directory2...] [queue_capacity] [num_workers]");
@@ -93,15 +93,15 @@ int main(int argc, char** argv)
 #include <filesystem>
 #include <chrono>
 #include <vector>
-#include <queue> // For discoverySuccessFlags_
+#include <deque> // For discoverySuccessFlags_
 #include <thread> // For std::this_thread::get_id()
 #include <memory> // For std::make_unique
-#include <sapp/app/wait.hpp>
+#include <spapp/app/wait.hpp>
 #include <iostream>
 #include "DropcopyHandler.h"
 #include "OutputFileWriter.h"
 
-Engine::Engine(const std::string& dropcopy_directory, const std::vector<std::string>& dirs_to_watch, unsigned num_workers, unsigned queue_capacity)
+Engine::Engine(const std::string dropcopy_directory, const std::vector<std::string>& dirs_to_watch, unsigned num_workers, unsigned queue_capacity)
     : dc_(dropcopy_directory),
       directories_to_watch_(dirs_to_watch),
       num_worker_threads_(num_workers),
@@ -119,7 +119,6 @@ void Engine::stop() {
     {
         PME_LOG_INFO(log_, "Successfully written output csv");
     }
-
     queue_.wakeAll();
 
     for (auto& thread : discoveryThreads_) {
@@ -174,7 +173,7 @@ void Engine::run() {
     stop();
 }
 
-void Engine::discoveryInstanceLoop(std::string dir, FileQueue& q, px::log* engine_logger) {
+void Engine::discoveryInstanceLoop(std::string dir, FileQueue& q, px::Log* engine_logger) {
     Discovery discovery_instance(dir,q,engine_logger);
 
     PME_LOG_INFO(log_, "Discovery loop started for directory: " << discovery_instance.getDirectory());
@@ -264,7 +263,7 @@ void Engine::workerMain() {
 class Engine
 {
 public:
-    Engine(const std::string& dropcopy_directory, const std::vector<std::string>& dirs_to_watch, unsigned num_workers, unsigned queue_capacity);
+    Engine(const std::string dropcopy_directory, const std::vector<std::string>& dirs_to_watch, unsigned num_workers, unsigned queue_capacity);
     ~Engine() = default;
 
     void run();
@@ -272,7 +271,7 @@ public:
     void stop();
 
 private:
-    void discoveryInstanceLoop(std::string dir, FileQueue& q, px::log* engine_logger);
+    void discoveryInstanceLoop(std::string dir, FileQueue& q, px::Log* engine_logger);
     void workerMain();
 
     std::unordered_map<uint64_t, std::vector<ParsedPacketInfo>> outputMap_;
@@ -286,7 +285,7 @@ private:
 
     std::vector<std::thread> discoveryThreads_;
     std::vector<std::thread> workerThreads_;
-    px::log* log_;
+    px::Log* log_;
 
     std::unordered_set<std::string> processed_files_;
     std::mutex processed_files_mutex_;
@@ -304,7 +303,7 @@ private:
 #include <cstring> // For strerror
 
 // Discovery Constructor (check watcher fd)
-Discovery::Discovery(std::string dir, FileQueue& q, px::log* engine_logger)
+Discovery::Discovery(std::string dir, FileQueue& q, px::Log* engine_logger)
     : watcher_(dir, [this](std::string_view name, uint32_t mask) { onEvent(name, mask); }),
       queue_(q),
       log_(engine_logger), // Use the passed logger, or create a specific one if desired
@@ -325,7 +324,7 @@ struct FileAttributes {
     bool exists = false;
 };
 
-FileAttributes get_file_attributes(const std::filesystem::path& p, px::log* logger) {
+FileAttributes get_file_attributes(const std::filesystem::path& p, px::Log* logger) {
     FileAttributes attrs;
     try {
         if (std::filesystem::exists(p) && std::filesystem::is_regular_file(p)) {
@@ -357,7 +356,6 @@ void Discovery::run() {
                     PME_LOG_INFO(log_, "Shutdown signaled during initial scan directory listing of " << discovery_dir_path_ << ", aborting scan.");
                     return; // Normal shutdown, not an error for discovery itself
                 }
-
                 if (entry.is_regular_file() && entry.path().extension() == ".pcap") {
                     initial_pcap_files.push_back(entry.path());
                 }
@@ -492,7 +490,7 @@ void Discovery::onEvent(std::string_view filename_sv, uint32_t event_mask) {
 class Discovery
 {
 public:
-    Discovery(std::string dir, FileQueue& q, px::log* engine_logger);
+    Discovery(std::string dir, FileQueue& q, px::Log* engine_logger);
     // run() now returns bool for success/failure
     void run();
 
@@ -502,21 +500,21 @@ private:
     void onEvent(std::string_view filename, uint32_t event_mask);
     Watcher watcher_;
     FileQueue& queue_;
-    px::log* log_; // Logger, can be specific to this discovery instance or passed from engine
+    px::log* Log_; // Logger, can be specific to this discovery instance or passed from engine
     std::string discovery_dir_path_; // Store the full path for constructing file paths
 };
 
 //FILENAME: DropcopyHandler.cpp
 #include "DropcopyHandler.h"
 
-DropcopyHandler::DropcopyHandler(const std::string& dropcopy_directory)
+DropcopyHandler::DropcopyHandler(const std::string dropcopy_directory)
     :dir_(std::move(dropcopy_directory)), log_(PME_GET_LOGGER("DropcopyHandler"))
 {
     map_ = parseDropcopy(dir_);
 
     PME_LOG_INFO(log_, "Parsed " << map_.size() << " entries");
     for (auto const& [cid, st] : map_) {
-        PME_LOG_INFO(log_, "CID+ID=" << cid << " → " << st << "\n");
+        PME_LOG_INFO(log_, "ClOrdID=" << cid << " → " << st << "\n");
     }
 }
 
@@ -534,8 +532,7 @@ DropcopyHandler::DropcopyHandler(const std::string& dropcopy_directory)
 #include <regex>
 #include <chrono>
 #include <iomanip>
-#include <iostream>
-#include <fstream>
+#include <sstream>
 #include "Log.h"
 
 // Holds both known and unknown fields
@@ -594,7 +591,7 @@ struct LatencyStats {
 class DropcopyHandler
 {
 public:
-    DropcopyHandler(const std::string& dropcopy_directory);
+    DropcopyHandler(const std::string dropcopy_directory);
 
     ~DropcopyHandler() = default;
 
@@ -674,15 +671,15 @@ public:
         while (pos < text.size() && isspace(text[pos])) pos++;
         // read value (up to comma or end)
         start = pos;
-        bool in_quotes = (text[pos]=='"');
+        bool in_quotes = (text[pos]=='\'');
         if (in_quotes) pos++;
         while (pos < text.size() &&
-               (in_quotes ? text[pos] != '"' : text[pos] != ',' && text[pos] != ')'))
+               (in_quotes ? text[pos] != '\'' : text[pos] != ',' && text[pos] != '}'))
         {
             pos++;
         }
         auto value = text.substr(start, pos - start);
-        if (in_quotes && pos<text.size() && text[pos]=='"') pos++;
+        if (in_quotes && pos<text.size() && text[pos]=='\'') pos++;
         // skip comma
         if (pos<text.size() && text[pos]==',') pos++;
         return {key, value};
@@ -697,16 +694,15 @@ public:
 
     std::unordered_map<uint64_t, LatencyStats>
     parseDropcopy(const std::string& filename) {
-        static const std::regex
-            r(".*lordid=\\s*(\\d+)\\s*,\\s*latency_stats=\\s*(.*)\\s*");
-
+        static const std::regex line_re{
+            R"(.*clordid\s*=\s*(\d+)\s*,\s*latency_stats\s*=\s*\{(.*)\}.*)"};
         std::unordered_map<uint64_t, LatencyStats> out;
-        std::ifstream in(filename);
+        std::ifstream in{filename};
         std::string line;
         while (std::getline(in, line)) {
             std::smatch m;
             if (!std::regex_match(line, m, line_re)) continue;
-            uint64_t cid = std::stoll(m[1].str());
+            uint64_t cid = std::stoi(m[1].str());
             std::string body_str = m[2].str();
             std::string_view body = body_str;
 
@@ -720,20 +716,20 @@ public:
                 if (k == "event_type") {
                     stats.event_type = std::string(v);
                 } else if (k == "md_seq_num") {
-                    stats.md_seq_num = std::stoll(std::string(v));
+                    stats.md_seq_num = std::stoi(std::string(v));
                 } else if (k == "md_feed_name") {
                     // strip quotes if present
-                    stats.md_feed_name = v.front()=='\\''&& v.back()=='\\''
+                    stats.md_feed_name = v.front()=='\'' && v.back()=='\''
                         ? std::string(v.substr(1, v.size()-2))
                         : std::string(v);
                 } else if (k == "exch_seq_num") {
-                    stats.exch_seq_num = std::stoll(std::string(v));
+                    stats.exch_seq_num = std::stoi(std::string(v));
                 } else if (k == "exch_src_id") {
-                    stats.exch_src_id = std::stoll(std::string(v));
+                    stats.exch_src_id = std::stoi(std::string(v));
                 } else if (k == "md_sec_ric") {
                     stats.md_sec_ric = std::stoull(std::string(v));
                 } else if (k == "oms_queue_size") {
-                    stats.oms_queue_size = std::stoll(std::string(v));
+                    stats.oms_queue_size = std::stoi(std::string(v));
                 } else if (k == "before_md_recv") {
                     stats.before_md_recv = parseTimestamp(v);
                 } else if (k == "after_md_recv") {
@@ -761,7 +757,7 @@ public:
                 } else if (k == "md_exchange_time") {
                     stats.md_exchange_time = parseTimestamp(v);
                 } else if (k == "md_event_id") {
-                    stats.md_event_id = std::stoll(std::string(v));
+                    stats.md_event_id = std::stoi(std::string(v));
                 }
             }
             out.emplace(cid, std::move(stats));
@@ -777,12 +773,11 @@ public:
 private:
     std::unordered_map<uint64_t, LatencyStats> map_;
     std::string dir_;
-    px::log* log_;
+    px::Log* log_;
 };
 
 //FILENAME: FileQueue.h
 #pragma once
-
 #include <MPMCQueue.h>
 #include <condition_variable>
 #include <mutex>
@@ -853,15 +848,17 @@ public:
                     PME_LOG_WARN(log_, "try_pop succeeded but returned null unique_ptr. Treating as empty.");
                 }
             }
-        }
+        
 
-        PME_LOG_TRACE(log_, "try_pop (unique_ptr) failed after wake; re-waiting not_empty_.");
-        not_empty_.wait(lk, [&] {
-            return shutdown::requested() || !q_.empty();
-        });
+            PME_LOG_TRACE(log_, "try_pop (unique_ptr) failed after wake; re-waiting not_empty_.");
+            not_empty_.wait(lk, [&] {
+                return shutdown::requested() || !q_.empty();
+            });
 
-        if (shutdown::requested() && q_.empty()) {
-            return false;
+            if (shutdown::requested() && q_.empty()) {
+                return false;
+            }
+        
         }
 
         if (q_.try_pop(uptr_popped)) {
@@ -889,7 +886,7 @@ private:
     const int capacity_;
     std::mutex mtx_;
     std::condition_variable not_full_, not_empty_;
-    px::log* log_;
+    px::Log* log_;
 };
 
 //FILENAME: Watcher.cpp
@@ -1017,12 +1014,12 @@ private:
 #include "ShutdownUtils.h"
 #include <PcapLiveDevice.h>
 
-px::log* PacketProcessor::getLogger() {
-    static px::log* logger = PME_GET_LOGGER("PacketProcessor");
+px::Log* PacketProcessor::getLogger() {
+    static px::Log* logger = PME_GET_LOGGER("PacketProcessor");
     return logger;
 }
 
-PacketProcessor::PacketProcessor(const std::unordered_map<uint64_t, LatencyStats>& mapper)
+PacketProcessor::PacketProcessor(const std::unordered_map<uint64_t, LatencyStats>& mapRef)
     : log_(getLogger()),
       tcp_reassembly_(
           onTcpMessageReadyCallback,
@@ -1030,7 +1027,7 @@ PacketProcessor::PacketProcessor(const std::unordered_map<uint64_t, LatencyStats
           onTcpConnectionStartCallback,
           onTcpConnectionEndCallback
       ),
-      dropcopy_map_ref_(mapper)
+      dropcopy_map_ref_(mapRef)
 {
     PME_LOG_INFO(log_, "PacketProcessor instance created.");
     partial_flow_buffers_.clear();
@@ -1069,7 +1066,7 @@ void PacketProcessor::onTcpMessageReadyCallback(int8_t side, const pcpp::TcpStre
         return;
     }
     
-    ParsedPacketInfo packetInfo(tcpData.getTimeStamp()->getPrecise());
+    ParsedPacketInfo packetInfo(tcpData.getTimeStampPrecise());
     
     const pcpp::ConnectionData& connectionData = tcpData.getConnectionData();
     uint32_t flow_id = connectionData.flowKey;
@@ -1127,7 +1124,7 @@ void PacketProcessor::onTcpMessageReadyCallback(int8_t side, const pcpp::TcpStre
         
         if (message_len > remaining_len) {
             PME_LOG_DEBUG(self->log_, "Flow key: " << flow_id << " - RazeProtocol message_len (" << message_len
-                                      << " bytes) larger than remaining data (" << remaining_len
+                                      << ") > remaining data (" << remaining_len
                                       << "). Partial message detected. Buffering remaining " << remaining_len << " bytes.");
             if (remaining_len > 0) {
                 self->partial_flow_buffers_[flow_id].assign(current_msg_ptr, current_msg_ptr + remaining_len);
@@ -1140,7 +1137,7 @@ void PacketProcessor::onTcpMessageReadyCallback(int8_t side, const pcpp::TcpStre
         
         switch (hdr->packet_type) {
             case RazeFormatter::PacketType::unsequenced_data: {
-                self->handleUnsequencedData(reinterpret_cast<const RazeFormatter::UnsequencedHeader const *>(hdr), packetInfo);
+                self->handleUnsequencedData(reinterpret_cast<RazeFormatter::UnsequencedHeader const *>(hdr), packetInfo);
                 break;
             }
             default:
@@ -1158,7 +1155,7 @@ void PacketProcessor::handleUnsequencedData(RazeFormatter::UnsequencedHeader con
     {
         case RazeFormatter::MessageType::new_order:
         {
-            handleNewOrder(reinterpret_cast<const RazeFormatter::NewOrder const *>(hdr), packetInfo);
+            handleNewOrder(reinterpret_cast<RazeFormatter::NewOrder const *>(hdr), packetInfo);
             break;
         }
         default:
@@ -1174,7 +1171,7 @@ void PacketProcessor::handleNewOrder(RazeFormatter::NewOrder const* hdr, ParsedP
     if (it != dropcopy_map_ref_.end())
     {
         auto stat = it->second;
-        PME_LOG_INFO(getLogger(), "TCP Packet lookup: md_seq_num = " << stat.md_seq_num << " md_recv_time = " << stat.md_recv_time << " md_send_time = " << stat.md_send_time << "TCP TIMESTAMP: " << packetInfo.getTimestamp());
+        PME_LOG_INFO(getLogger(), "TCP Packet lookup: md_seq_num = " << stat.md_seq_num << " md_recv_time = " << stat.md_recv_time << " md_send_time = " << stat.md_send_time << "TCP TIMESTAMP: " << packetInfo.getTimeStamp());
         uint64_t hash = generateHash(stat.md_seq_num, stat.md_recv_time, stat.md_send_time);
         
         PME_LOG_INFO(getLogger(), "TCP HASH: " << hash);
@@ -1221,10 +1218,10 @@ void PacketProcessor::processUdpPacket(pcpp::Packet& packet) {
     
     switch (detectedVersion) {
         case 3:
-            handleSpcastV3(packet, ipv4Layer, udpLayer, payload, payloadSize);
+            handleSPCastV3(packet, ipv4Layer, udpLayer, payload, payloadSize);
             break;
         case 4:
-            handleSpcastV4(packet, ipv4Layer, udpLayer, payload, payloadSize);
+            handleSPCastV4(packet, ipv4Layer, udpLayer, payload, payloadSize);
             break;
         default:
             PME_LOG_TRACE(log_, flow_info_log << " - UDP payload does not appear to be SPCAST. First byte/version field=" << (int)detectedVersion);
@@ -1232,9 +1229,9 @@ void PacketProcessor::processUdpPacket(pcpp::Packet& packet) {
     }
 }
 
-void PacketProcessor::handleSpcastV3(pcpp::Packet& packet, pcpp::IPv4Layer* ipv4Layer, pcpp::UdpLayer* udpLayer, uint8_t* payload, size_t payloadSize) {
+void PacketProcessor::handleSPCastV3(pcpp::Packet& packet, pcpp::IPv4Layer* ipv4Layer, pcpp::UdpLayer* udpLayer, uint8_t* payload, size_t payloadSize) {
     // Basic size check for packet header
-    if (payloadSize < sizeof(spcast::SpcastVersionTraits::PacketHeader)) {
+    if (payloadSize < sizeof(spcast::SpcastVersion3Traits::PacketHeader)) {
         PME_LOG_WARN(log_, "SPCASTV3: Datagram too small for packet_header_t (" << payloadSize << " bytes). SrcPort=" << udpLayer->getSrcPort());
         return;
     }
@@ -1247,16 +1244,16 @@ void PacketProcessor::handleSpcastV3(pcpp::Packet& packet, pcpp::IPv4Layer* ipv4
     
     ParsedPacketInfo packetInfo(timestamp);
     
-    const auto* pktHdr = reinterpret_cast<const spcast::SpcastVersionTraits::PacketHeader*>(payload);
+    const auto* pktHdr = reinterpret_cast<const spcast::SpcastVersion3Traits::PacketHeader*>(payload);
     
-    const uint8_t recv_timestamp_ns = pktHdr->recv_timestamp_ns;
-    const uint8_t send_timestamp_ns = pktHdr->send_timestamp_ns;
+    const uint64_t recv_timestamp_ns = pktHdr->recv_timestamp_ns;
+    const uint64_t send_timestamp_ns = pktHdr->send_timestamp_ns;
     
     // Pointer math to start of first message
-    const uint8_t* cursor = payload + sizeof(spcast::SpcastVersionTraits::PacketHeader);
+    const uint8_t* cursor = payload + sizeof(spcast::SpcastVersion3Traits::PacketHeader);
     const uint8_t* end    = payload + payloadSize;
-    while (cursor + sizeof(spcast::SpcastVersionTraits::MessageHeader) <= end) {
-        const auto* msgHdr = reinterpret_cast<const spcast::SpcastVersionTraits::MessageHeader*>(cursor);
+    while (cursor + sizeof(spcast::SpcastVersion3Traits::MessageHeader) <= end) {
+        const auto* msgHdr = reinterpret_cast<const spcast::SpcastVersion3Traits::MessageHeader*>(cursor);
         
         uint16_t msg_len = msgHdr->length; // total length including header
         
@@ -1278,16 +1275,21 @@ void PacketProcessor::handleSpcastV3(pcpp::Packet& packet, pcpp::IPv4Layer* ipv4
         
         uint64_t seq = msgHdr->seq_num;
         
-        if (seq != last_udpseq_) {
+        if (seq != last_udpseq_) 
+        {
             uint64_t hash = generateHash(seq, recv_timestamp_ns, send_timestamp_ns);
             PME_LOG_INFO(log_, "UDP HASH: " << hash);
             
             auto iter = joinMap_.find(hash);
-            if (iter != joinMap_.end()) {
+            if (iter != joinMap_.end()) 
+            {
                 PME_LOG_INFO(log_, "LLISTFOUND");
             }
             joinMap_[hash].push_back(packetInfo);
-        } else {
+            last_udpseq_ = seq;
+        } 
+        else 
+        {
             PME_LOG_WARN(log_, "Skipping duplicate spcast message");
         }
         ++spcast_v3_message_total_;
@@ -1295,9 +1297,9 @@ void PacketProcessor::handleSpcastV3(pcpp::Packet& packet, pcpp::IPv4Layer* ipv4
     }
 }
 
-void PacketProcessor::handleSpcastV4(pcpp::Packet& packet, pcpp::IPv4Layer* ipv4Layer, pcpp::UdpLayer* udpLayer, uint8_t* payload, size_t payloadSize) {
+void PacketProcessor::handleSPCastV4(pcpp::Packet& packet, pcpp::IPv4Layer* ipv4Layer, pcpp::UdpLayer* udpLayer, uint8_t* payload, size_t payloadSize) {
     PME_LOG_DEBUG(log_, "SPCAST Version 4 detected. File: "
-                        << ipv4Layer->getSrcIPAddress().toString() << ":" << udpLayer->getSrcPort() << " → "
+                        << ipv4Layer->getSrcIPAddress().toString() << ":" << udpLayer->getSrcPort() << " -> "
                         << ipv4Layer->getDstIPAddress().toString() << ":" << udpLayer->getDstPort()
                         << ". Payload Size: " << payloadSize
                         << ". (full handling not yet implemented).");
@@ -1393,7 +1395,7 @@ std::unordered_map<uint64_t, std::vector<ParsedPacketInfo>> PacketProcessor::pro
 #include "TcpReassembly.h"
 #include "Log.h"
 #include <razeapi/messages/raze.hpp>
-#include <razeapi/messages/raze.hpp>
+#include <razeapi/messages/xraze.hpp>
 #include <razeapi/proto/order_extra.h>
 #include <razeapi/proto/raze.h>
 #include <razeapi/utils/fixed_decimal.hpp>
@@ -1404,13 +1406,13 @@ std::unordered_map<uint64_t, std::vector<ParsedPacketInfo>> PacketProcessor::pro
 
 namespace spcast
 {
-    namespace SpcastVersionTraits
+    namespace SpcastVersion3Traits
     {
         using PacketHeader = md_api::proto::spcast_v3::packet_header_t;
         using MessageHeader = md_api::proto::spcast_v3::message_header_t;
         using MessageType = md_api::proto::spcast_v3::message_type_enum;
-        static constexpr MessageType StatusMessageType = MessageType::Status;
-        using VenueENum = md_api::proto::spcast_v3::venue_enum;
+        static constexpr MessageType StatusMessageType = MessageType::StatusChange;
+        using VenueEnum = md_api::proto::spcast_v3::venue_enum;
         using StatusMsg = md_api::proto::spcast_v3::status_change_t;
         using QuoteMsg = md_api::proto::spcast_v3::quote_t;
         using TradeMsg = md_api::proto::spcast_v3::trade_t;
@@ -1429,13 +1431,13 @@ namespace spcast
         using CloseMsg = md_api::proto::spcast_v3::close_t;
     };
     
-    namespace SpcastVersionTraits
+    namespace SpcastVersion4Traits
     {
         using PacketHeader = md_api::proto::spcast_v4::packet_header_t;
         using MessageHeader = md_api::proto::spcast_v4::message_header_t;
         using MessageType = md_api::proto::spcast_v4::message_type_enum;
         static constexpr MessageType StatusMessageType = MessageType::Status;
-        using VenueENum = md_api::proto::spcast_v4::venue_enum;
+        using VenueEnum = md_api::proto::spcast_v4::venue_enum;
         using StatusMsg = md_api::proto::spcast_v4::status_t;
         using QuoteMsg = md_api::proto::spcast_v4::quote_t;
         using TradeMsg = md_api::proto::spcast_v4::trade_t;
@@ -1460,7 +1462,7 @@ namespace RazeFormatter
     using UnsequencedHeader = ::raze::unsequenced_header;
     
     using NewOrder = ::raze::new_order;
-    using NewFppaOrder = ::raze::new_fpga_order;
+    using NewFpgaOrder = ::raze::new_fpga_order;
     using AmendOrder = ::raze::amend_order;
     using CancelOrder = ::raze::cancel_order;
     using UpdatePriceOrder = ::raze::update_price;
@@ -1491,7 +1493,7 @@ namespace RazeFormatter
     
     using PriceType = ::raze::price_type;
     using SharesType = ::raze::shares_type;
-    using ClOrderIdType = ::raze::clordid_type;
+    using ClOrdIdType = ::raze::clordid_type;
     
     static constexpr const std::int64_t InvalidPrice = razeapi::util::fixed_decimal::invalid_price;
     
@@ -1503,7 +1505,8 @@ namespace RazeFormatter
 struct ParsedPacketInfo
 {
     std::chrono::time_point<std::chrono::high_resolution_clock> ts_;
-    ParsedPacketInfo(std::chrono::time_point<std::chrono::high_resolution_clock> timestamp):ts_(timestamp)
+    ParsedPacketInfo(std::chrono::time_point<std::chrono::high_resolution_clock> timestamp):ts_(timestamp){}
+    std::chrono::time_point<std::chrono::high_resolution_clock> getTimeStamp() const 
     {
         return ts_;
     }
@@ -1511,7 +1514,7 @@ struct ParsedPacketInfo
 
 class PacketProcessor {
 public:
-    PacketProcessor(const std::unordered_map<uint64_t, LatencyStats>& mapper);
+    PacketProcessor(const std::unordered_map<uint64_t, LatencyStats>& mapRef);
     ~PacketProcessor();
     
     std::unordered_map<uint64_t, std::vector<ParsedPacketInfo>> processFile(const std::string& filePath);
@@ -1524,12 +1527,12 @@ private:
     
     // UDP processing
     void processUdpPacket(pcpp::Packet& packet);
-    void handleSpcastV3(pcpp::Packet& packet,
+    void handleSPCastV3(pcpp::Packet& packet,
                         pcpp::IPv4Layer* ipv4Layer,
                         pcpp::UdpLayer* udpLayer,
                         uint8_t* payload,
                         size_t payloadSize);
-    void handleSpcastV4(pcpp::Packet& packet,
+    void handleSPCastV4(pcpp::Packet& packet,
                         pcpp::IPv4Layer* ipv4Layer,
                         pcpp::UdpLayer* udpLayer,
                         uint8_t* payload,
@@ -1545,10 +1548,10 @@ private:
         return static_cast<uint64_t>(seed);
     }
     
-    static std::chrono::time_point<std::chrono::high_resolution_clock> timespecToTimePoint(const timespec& ts)
+    static std::chrono::time_point<std::chrono::high_resolution_clock> timespecToTimePoint(const timespec& in)
     {
         auto duration = std::chrono::duration_cast<std::chrono::high_resolution_clock::duration>(
-            std::chrono::seconds(ts.tv_sec) + std::chrono::nanoseconds(ts.tv_nsec));
+            std::chrono::seconds(in.tv_sec) + std::chrono::nanoseconds(in.tv_nsec));
         return std::chrono::time_point<std::chrono::high_resolution_clock>(duration);
     }
     
@@ -1557,7 +1560,7 @@ private:
     void handleNewOrder(RazeFormatter::NewOrder const* hdr, ParsedPacketInfo& packetInfo);
     
     uint64_t spcast_v3_message_total_ {0};
-    px::log* log_;
+    px::Log* log_;
     pcpp::TcpReassembly tcp_reassembly_;
     std::map<uint32_t, std::vector<uint8_t>> partial_flow_buffers_; // Buffer for partial TCP messages per flow SID
     
@@ -1579,7 +1582,7 @@ private:
     // void checkForCompleteUdpMessages(uint32_t flowKey);
     
     // Helper to get logger
-    static px::log* getLogger();
+    static px::Log* getLogger();
 };
 
 //FILENAME: OutputFileWriter.h
@@ -1624,10 +1627,11 @@ namespace OutputFileWriter
             }
             
             // Get timestamps from both packets
-            auto timestamp1 = packetVector[0].getTimestamp();
-            auto timestamp2 = packetVector[1].getTimestamp();
+            auto timestamp1 = packetVector[0].getTimeStamp();
+            auto timestamp2 = packetVector[1].getTimeStamp();
             
-            if (timestamp1 > timestamp2) {
+            if (timestamp1 > timestamp2) 
+            {
                 std::swap(timestamp1, timestamp2);
             }
             
