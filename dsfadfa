@@ -1,0 +1,1656 @@
+//FILENAME: main.cpp
+#include "Log.h"
+#include "Engine.h"
+#include "ShutdownUtils.h"
+#include <iostream>
+#include <vector>
+#include <string>
+#include <charconv> // For std::from_chars
+#include <cstring> // For strlen
+
+// Helper to parse unsigned int from string
+bool parse_uint(const char* str, unsigned& out_val) {
+    if (!str) return false;
+    auto [ptr, ec] = std::from_chars(str, str + strlen(str), out_val);
+    return ec == std::errc{} && ptr == (str + strlen(str));
+}
+
+int main(int argc, char** argv)
+{
+    sp::logging::start(sp::logging::stdout_config());
+    sp::logging::set_override(sp::logging::level::DEBUG);
+    px::log* main_log = PME_GET_LOGGER("Main");
+
+    if (argc < 2) {
+        PME_LOG_ERROR(main_log, "Usage: " << argv[0] << " <directory1> [directory2...] [queue_capacity] [num_workers]");
+        PME_LOG_ERROR(main_log, "Please provide at least one directory to watch.");
+        sp::logging::stop();
+        return 1;
+    }
+
+    std::vector<std::string> directories_to_watch;
+    std::string dropcopy_dir = "/lxhome/songjoon/pme/dropcopy/dropcopyfile";
+    unsigned num_worker_threads = 1; // Default workers
+    unsigned queue_capacity = 1024; // Default queue capacity
+    int first_potential_numeric_arg_idx = argc -1;
+
+    // Try to parse num_workers (last argument)
+    if (argc > 2) { // Need at least progname, dir, workers_or_another_dir
+        unsigned parsed_val;
+        if (parse_uint(argv[argc - 1], parsed_val)) {
+            num_worker_threads = parsed_val;
+            first_potential_numeric_arg_idx = argc - 2;
+            // Try to parse queue_capacity (second to last argument)
+            if (argc > 3) { // Need at least progname, dir, capacity, workers
+                if (parse_uint(argv[argc - 2], parsed_val)) {
+                    queue_capacity = parsed_val;
+                    first_potential_numeric_arg_idx = argc - 3;
+                }
+            }
+        }
+    }
+
+    // Collect directory paths (arguments from index 1 up to before the parsed numerics)
+    for (int i = 1; i <= first_potential_numeric_arg_idx; ++i) {
+        if (argv[i] && strlen(argv[i]) > 0) {
+            directories_to_watch.push_back(argv[i]);
+        } else {
+            PME_LOG_WARN(main_log, "Empty directory argument at index " << i << ", skipping.");
+        }
+    }
+
+    if (directories_to_watch.empty()) {
+        PME_LOG_ERROR(main_log, "No valid directories specified to watch.");
+        PME_LOG_ERROR(main_log, "Usage: " << argv[0] << " <directory1> [directory2...] [queue_capacity] [num_workers]");
+        sp::logging::stop();
+        return 1;
+    }
+
+    if (num_worker_threads == 0) {
+        PME_LOG_WARN(main_log, "Number of worker threads is 0. Files will be queued but not processed.");
+    }
+
+    if (queue_capacity == 0) {
+        PME_LOG_WARN(main_log, "Queue capacity is 0. No files can be queued effectively.");
+        // Consider making this an error depending on your required robustness.
+    }
+
+    PME_LOG_INFO(main_log, "Configuration - Workers: " << num_worker_threads << ", Queue Capacity: " << queue_capacity);
+    PME_LOG_INFO(main_log, "Watching " << directories_to_watch.size() << " directory(s)::");
+    for(const auto& dir : directories_to_watch) {
+        PME_LOG_INFO(main_log, " - " << dir);
+    }
+
+    Engine g_engine(dropcopy_dir, directories_to_watch, num_worker_threads, queue_capacity);
+    g_engine.run();
+    sp::logging::stop();
+    return 0;
+}
+
+//FILENAME: Engine.cpp
+#include "Engine.h"
+#include "ShutdownUtils.h"
+#include <filesystem>
+#include <chrono>
+#include <vector>
+#include <queue> // For discoverySuccessFlags_
+#include <thread> // For std::this_thread::get_id()
+#include <memory> // For std::make_unique
+#include <sapp/app/wait.hpp>
+#include <iostream>
+#include "DropcopyHandler.h"
+#include "OutputFileWriter.h"
+
+Engine::Engine(const std::string& dropcopy_directory, const std::vector<std::string>& dirs_to_watch, unsigned num_workers, unsigned queue_capacity)
+    : dc_(dropcopy_directory),
+      directories_to_watch_(dirs_to_watch),
+      num_worker_threads_(num_workers),
+      queue_capacity_(queue_capacity),
+      queue_(queue_capacity_),
+      log_(PME_GET_LOGGER("Engine"))
+{
+    PME_LOG_INFO(log_, "Engine initialized. Dirs: " << directories_to_watch_.size() << ", Workers: " << num_worker_threads_ << ", Queue Cap: " << queue_capacity_ << ".");
+}
+
+void Engine::stop() {
+    PME_LOG_INFO(log_, "Engine shutting down. Joining threads.");
+    shutdown::g_shutdownRequested = true; //true, std::memory_order_release);
+    if(OutputFileWriter::write(outputMap_, "/lxhome/songjoon/pme/output"))
+    {
+        PME_LOG_INFO(log_, "Successfully written output csv");
+    }
+
+    queue_.wakeAll();
+
+    for (auto& thread : discoveryThreads_) {
+        if (thread.joinable()) {
+            thread.join();
+            PME_LOG_INFO(log_, "Discovery threads joined.");
+        }
+        else
+        {
+            PME_LOG_INFO(log_, "Not joinable Discovery thread, skipping.");
+        }
+    }
+
+    for (auto& thread : workerThreads_) {
+        if (thread.joinable()) {
+            thread.join();
+            PME_LOG_INFO(log_, "Worker threads joined.");
+        }
+        else
+        {
+            PME_LOG_INFO(log_, "Not joinable Worker thread, skipping.");
+        }
+    }
+
+    PME_LOG_INFO(log_, "Engine shutdown complete.");
+}
+
+void Engine::run() {
+    PME_LOG_INFO(log_, "Engine starting...");
+
+    for (size_t i = 0; i < directories_to_watch_.size(); ++i) {
+        const auto& dir_path = directories_to_watch_[i];
+        if (dir_path.empty()) {
+            PME_LOG_WARN(log_, "Empty directory path provided, skipping.");
+            continue;
+        }
+        PME_LOG_INFO(log_, "Creating discovery thread for directory: " << dir_path);
+        discoveryThreads_.emplace_back(&Engine::discoveryInstanceLoop, this, dir_path, std::ref(queue_), std::ref(log_));
+    }
+
+    // Start Worker Threads
+    workerThreads_.reserve(num_worker_threads_);
+    for (unsigned i = 0; i < num_worker_threads_; ++i) {
+        PME_LOG_INFO(log_, "Creating worker thread #" << (i + 1));
+        workerThreads_.emplace_back(&Engine::workerMain, this);
+    }
+
+    PME_LOG_INFO(log_, "Engine running with " << discoveryThreads_.size() << " discovery thread(s) and " << workerThreads_.size() << " worker thread(s).");
+    int sig = sp::app::wait();
+
+    PME_LOG_FATAL(log_, "Shutdown signal: " << sig << " received, Engine run loop ending.");
+    stop();
+}
+
+void Engine::discoveryInstanceLoop(std::string dir, FileQueue& q, px::log* engine_logger) {
+    Discovery discovery_instance(dir,q,engine_logger);
+
+    PME_LOG_INFO(log_, "Discovery loop started for directory: " << discovery_instance.getDirectory());
+    discovery_instance.run();
+    PME_LOG_INFO(log_, "Discovery loop finished for directory: " << discovery_instance.getDirectory());
+}
+
+void Engine::workerMain() {
+    PME_LOG_INFO(log_, "Worker thread (ID: " << std::this_thread::get_id() << ") started.");
+
+    PacketProcessor packet_processor(dc_.getMapRef()); // Each worker thread gets its own instance
+
+    std::string file_path;
+    while (!shutdown::requested()) {
+        bool popped_item = queue_.pop(file_path); // Blocking pop
+
+        if (shutdown::requested() && !popped_item) { // Check if shutdown was reason for pop failing
+            PME_LOG_INFO(log_, "Worker (Thread ID: " << std::this_thread::get_id() << ") breaking main loop due to shutdown signal and empty queue after pop attempt.");
+            break;
+        }
+
+        if (shutdown::requested() && popped_item) {
+            PME_LOG_INFO(log_, "Worker (Thread ID: " << std::this_thread::get_id() << ") popped an item but shutdown was requested. Will process then check shutdown again.");
+        }
+
+        if (popped_item) {
+            bool process_this_file = false;
+            {
+                std::lock_guard<std::mutex> guard(processed_files_mutex_);
+                if (processed_files_.find(file_path) == processed_files_.end()) {
+                    processed_files_.insert(file_path);
+                    process_this_file = true;
+                } else {
+                    PME_LOG_INFO(log_, "File '" << file_path << "' already processed or currently being processed by another worker. Skipping. Thread ID: " << std::this_thread::get_id());
+                }
+            }
+
+            if (process_this_file) {
+                PME_LOG_DEBUG(log_, "Worker (Thread ID: " << std::this_thread::get_id() << ") processing file: " << file_path);
+                std::unordered_map<uint64_t, std::vector<ParsedPacketInfo>> tMap = packet_processor.processFile(file_path); // Use PacketProcessor instance
+                outputMap_.insert(tMap.begin(), tMap.end());
+            }
+        } else if (!shutdown::requested()) { // Popped_item is false, but not due to shutdown
+            PME_LOG_TRACE(log_, "Worker pop returned false but not shutting down, yielding. Thread ID: " << std::this_thread::get_id());
+            std::this_thread::yield();
+        }
+    }
+
+    PME_LOG_INFO(log_, "Worker (Thread ID: " << std::this_thread::get_id() << ") entering shutdown drain loop.");
+    while (queue_.pop(file_path)) {
+        bool process_this_file = false;
+        {
+            std::lock_guard<std::mutex> guard(processed_files_mutex_);
+            if (processed_files_.find(file_path) == processed_files_.end()) {
+                processed_files_.insert(file_path);
+                process_this_file = true;
+            } else {
+                PME_LOG_INFO(log_, "File '" << file_path << "' (drain) already processed. Skipping. Thread ID: " << std::this_thread::get_id());
+            }
+        }
+        if (process_this_file) {
+            PME_LOG_DEBUG(log_, "Worker (Thread ID: " << std::this_thread::get_id() << ", shutdown drain) processing remaining file: " << file_path);
+            std::unordered_map<uint64_t, std::vector<ParsedPacketInfo>> tMap = packet_processor.processFile(file_path); // Use PacketProcessor instance
+            outputMap_.insert(tMap.begin(), tMap.end());
+        }
+    }
+    PME_LOG_INFO(log_, "Worker loop finished. Thread ID: " << std::this_thread::get_id());
+}
+
+//FILENAME: Engine.h
+#pragma once
+
+#include <string>
+#include <thread>
+#include <vector>
+#include <atomic>
+#include <mutex>
+#include <unordered_set>
+#include <memory>
+#include "Discovery.h"
+#include "FileQueue.h"
+#include "ShutdownUtils.h"
+#include "Log.h"
+#include "DropcopyHandler.h"
+#include "PacketProcessor.h"
+
+class Engine
+{
+public:
+    Engine(const std::string& dropcopy_directory, const std::vector<std::string>& dirs_to_watch, unsigned num_workers, unsigned queue_capacity);
+    ~Engine() = default;
+
+    void run();
+
+    void stop();
+
+private:
+    void discoveryInstanceLoop(std::string dir, FileQueue& q, px::log* engine_logger);
+    void workerMain();
+
+    std::unordered_map<uint64_t, std::vector<ParsedPacketInfo>> outputMap_;
+    DropcopyHandler dc_;
+    std::vector<std::string> directories_to_watch_;
+
+    unsigned num_worker_threads_;
+    unsigned queue_capacity_;
+
+    FileQueue queue_;
+
+    std::vector<std::thread> discoveryThreads_;
+    std::vector<std::thread> workerThreads_;
+    px::log* log_;
+
+    std::unordered_set<std::string> processed_files_;
+    std::mutex processed_files_mutex_;
+};
+
+//FILENAME: Discovery.cpp
+#include "Discovery.h"
+#include "ShutdownUtils.h" // Corrected path
+#include <unistd.h> // For close()
+#include <sys/epoll.h> // For epoll functions
+#include <filesystem> // For path manipulation
+#include <chrono> // for std::chrono
+#include <thread> // for std::this_thread::sleep_for
+#include <cerrno> // for errno
+#include <cstring> // For strerror
+
+// Discovery Constructor (check watcher fd)
+Discovery::Discovery(std::string dir, FileQueue& q, px::log* engine_logger)
+    : watcher_(dir, [this](std::string_view name, uint32_t mask) { onEvent(name, mask); }),
+      queue_(q),
+      log_(engine_logger), // Use the passed logger, or create a specific one if desired
+      discovery_dir_path_(std::move(dir)) // Store the directory path
+{
+    PME_LOG_INFO(log_, "Discovery instance for directory: " << discovery_dir_path_);
+    if (watcher_.fd() < 0) {
+        // Watcher constructor failed to initialize inotify.
+        // This instance of Discovery is now in a bad state.
+        // The run() method will check fd() and refuse to start.
+        PME_LOG_ERROR(log_, "Watcher initialization failed for directory: " << discovery_dir_path_ << ". Discovery will not run.");
+    }
+}
+
+struct FileAttributes {
+    std::filesystem::file_time_type last_write_time;
+    std::uintmax_t file_size;
+    bool exists = false;
+};
+
+FileAttributes get_file_attributes(const std::filesystem::path& p, px::log* logger) {
+    FileAttributes attrs;
+    try {
+        if (std::filesystem::exists(p) && std::filesystem::is_regular_file(p)) {
+            attrs.last_write_time = std::filesystem::last_write_time(p);
+            attrs.file_size = std::filesystem::file_size(p);
+            attrs.exists = true;
+        }
+    } catch (const std::filesystem::filesystem_error& e) {
+        PME_LOG_WARN(logger, "Error getting attributes for file " << p.string() << ": " << e.what());
+        attrs.exists = false; // Treat as non-existent or problematic
+    }
+    return attrs;
+}
+
+void Discovery::run() {
+    if (watcher_.fd() < 0) {
+        PME_LOG_ERROR(log_, "Watcher FD is invalid for dir '" << discovery_dir_path_ << "'. Discovery run loop cannot start.");
+        return; // Indicate failure to Engine
+    }
+
+    const std::chrono::milliseconds initial_scan_stability_delay(1500); // Configurable: e.g., 1.5 seconds
+
+    PME_LOG_INFO(log_, "Performing initial scan of directory: " << discovery_dir_path_ << " (stability delay: " << initial_scan_stability_delay.count() << "ms)");
+    try {
+        if (std::filesystem::exists(discovery_dir_path_) && std::filesystem::is_directory(discovery_dir_path_)) {
+            std::vector<std::filesystem::path> initial_pcap_files;
+            for (const auto& entry : std::filesystem::directory_iterator(discovery_dir_path_)) {
+                if (shutdown::requested()) {
+                    PME_LOG_INFO(log_, "Shutdown signaled during initial scan directory listing of " << discovery_dir_path_ << ", aborting scan.");
+                    return; // Normal shutdown, not an error for discovery itself
+                }
+
+                if (entry.is_regular_file() && entry.path().extension() == ".pcap") {
+                    initial_pcap_files.push_back(entry.path());
+                }
+            }
+
+            for (const auto& pcap_path : initial_pcap_files) {
+                if (shutdown::requested()) {
+                    PME_LOG_INFO(log_, "Shutdown signaled during initial scan stability check of " << discovery_dir_path_ << ", aborting scan.");
+                    return; // Normal shutdown, not an error for discovery itself
+                }
+
+                FileAttributes attrs1 = get_file_attributes(pcap_path, log_);
+                if (!attrs1.exists) continue;
+
+                PME_LOG_TRACE(log_, "Initial scan: First check for " << pcap_path.string() << ": size=" << attrs1.file_size << ", time=" << attrs1.last_write_time.time_since_epoch().count());
+
+                std::this_thread::sleep_for(initial_scan_stability_delay);
+
+                FileAttributes attrs2 = get_file_attributes(pcap_path, log_);
+                if (!attrs2.exists) { // File might have been deleted during sleep
+                    PME_LOG_INFO(log_, "Initial scan: File " << pcap_path.string() << " deleted during stability check.");
+                    continue;
+                }
+
+                PME_LOG_TRACE(log_, "Initial scan: Second check for " << pcap_path.string() << ": size=" << attrs2.file_size << ", time=" << attrs2.last_write_time.time_since_epoch().count());
+
+                if (attrs1.file_size == attrs2.file_size && attrs1.last_write_time == attrs2.last_write_time) {
+                    PME_LOG_INFO(log_, "Found stable pre-existing PCAP file during scan: " << pcap_path.string() << ". Enqueuing.");
+                    queue_.push(pcap_path.string());
+                } else {
+                    PME_LOG_INFO(log_, "Pre-existing PCAP file " << pcap_path.string() << " appears unstable or recently modified. Skipping enqueue. Will rely on inotify events.");
+                }
+            }
+        } else {
+            PME_LOG_ERROR(log_, "Directory '" << discovery_dir_path_ << "' does not exist or is not a directory during initial scan.");
+            // This could be considered a failure for this discovery instance.
+            return;
+        }
+    } catch (const std::filesystem::filesystem_error& e) {
+        PME_LOG_ERROR(log_, "Filesystem error during initial scan of " << discovery_dir_path_ << ": " << e.what() << ". Aborting discovery for this directory.");
+        return; // Indicate failure
+    }
+    PME_LOG_INFO(log_, "Initial scan of directory " << discovery_dir_path_ << " complete.");
+
+    // Setup epoll after the initial scan
+    int epoll_fd = epoll_create1(EPOLL_CLOEXEC);
+    if (epoll_fd == -1) {
+        PME_LOG_ERROR(log_, "epoll_create1 failed for dir '" << discovery_dir_path_ << "': " << strerror(errno));
+        return;
+    }
+
+    struct epoll_event ev;
+    ev.events = EPOLLIN;
+    ev.data.fd = watcher_.fd();
+    if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, watcher_.fd(), &ev) == -1) {
+        PME_LOG_ERROR(log_, "epoll_ctl ADD failed for dir '" << discovery_dir_path_ << "': " << strerror(errno));
+        close(epoll_fd);
+        return;
+    }
+
+    PME_LOG_INFO(log_, "Discovery run loop (event monitoring) starting for directory: " << discovery_dir_path_);
+    constexpr int MAX_EVENTS = 10;
+    struct epoll_event events[MAX_EVENTS];
+    bool success = true;
+
+    while (!shutdown::requested()) {
+        int nfds = epoll_wait(epoll_fd, events, MAX_EVENTS, 250);
+
+        if (nfds == -1) {
+            if (errno == EINTR) {
+                continue;
+            }
+            PME_LOG_ERROR(log_, "epoll_wait failed for dir '" << discovery_dir_path_ << "': " << strerror(errno));
+            success = false;
+            break;
+        }
+
+        for (int n = 0; n < nfds; ++n) {
+            if (events[n].data.fd == watcher_.fd()) {
+                watcher_.handle();
+            }
+        }
+    }
+
+    if (success) {
+        PME_LOG_INFO(log_, "Discovery run loop for dir '" << discovery_dir_path_ << "' finished (event monitoring ended. Success: " << success << ").");
+    } else {
+        PME_LOG_ERROR(log_, "Discovery run loop for dir '" << discovery_dir_path_ << "' finished due to an error (Success: " << success << ").");
+    }
+
+    close(epoll_fd);
+}
+
+// Updated onEvent callback
+void Discovery::onEvent(std::string_view filename_sv, uint32_t event_mask) {
+    std::filesystem::path fs_filename = filename_sv;
+    std::filesystem::path full_path = std::filesystem::path(discovery_dir_path_) / fs_filename;
+    std::string full_path_str = full_path.string();
+
+    // Filter by .pcap extension. This is a common requirement.
+    if (fs_filename.extension() != ".pcap") {
+        PME_LOG_TRACE(log_, "Ignoring non-pcap file event mask " << event_mask << " for '" << full_path_str << "'");
+        return;
+    }
+
+    if (event_mask & IN_CLOSE_WRITE) {
+        PME_LOG_INFO(log_, "PCAP file closed after write (IN_CLOSE_WRITE): '" << full_path_str << "'. Enqueuing.");
+        queue_.push(std::move(full_path_str));
+    } else if (event_mask & IN_MOVED_TO) {
+        PME_LOG_INFO(log_, "PCAP file moved into directory (IN_MOVED_TO): '" << full_path_str << "'. Enqueuing.");
+        queue_.push(std::move(full_path_str));
+    } else if (event_mask & IN_CREATE) {
+        PME_LOG_INFO(log_, "PCAP file created (IN_CREATE): '" << full_path_str << "'. Waiting for IN_CLOSE_WRITE or IN_MOVED_TO.");
+        // Do not enqueue on IN_CREATE alone for this use case.
+    } else {
+        PME_LOG_TRACE(log_, "Other subscribed inotify event (" << event_mask << ") for PCAP file '" << full_path_str << "'");
+    }
+}
+
+//FILENAME: Discovery.h
+#pragma once
+
+#include "Watcher.h"
+#include "FileQueue.h"
+#include "ShutdownUtils.h" // Corrected path
+#include "Log.h"
+#include <sys/epoll.h>
+#include <vector>
+#include <string>
+#include <atomic>
+
+class Discovery
+{
+public:
+    Discovery(std::string dir, FileQueue& q, px::log* engine_logger);
+    // run() now returns bool for success/failure
+    void run();
+
+    const std::string& getDirectory() const { return watcher_.dir(); } // Helper to get dir for logging
+
+private:
+    void onEvent(std::string_view filename, uint32_t event_mask);
+    Watcher watcher_;
+    FileQueue& queue_;
+    px::log* log_; // Logger, can be specific to this discovery instance or passed from engine
+    std::string discovery_dir_path_; // Store the full path for constructing file paths
+};
+
+//FILENAME: DropcopyHandler.cpp
+#include "DropcopyHandler.h"
+
+DropcopyHandler::DropcopyHandler(const std::string& dropcopy_directory)
+    :dir_(std::move(dropcopy_directory)), log_(PME_GET_LOGGER("DropcopyHandler"))
+{
+    map_ = parseDropcopy(dir_);
+
+    PME_LOG_INFO(log_, "Parsed " << map_.size() << " entries");
+    for (auto const& [cid, st] : map_) {
+        PME_LOG_INFO(log_, "CID+ID=" << cid << " → " << st << "\n");
+    }
+}
+
+//FILENAME: DropcopyHandler.h
+#pragma once
+
+#include <cstdint>
+#include <charconv>
+#include <ctime>
+#include <iostream>
+#include <fstream>
+#include <string>
+#include <string_view>
+#include <unordered_map>
+#include <regex>
+#include <chrono>
+#include <iomanip>
+#include <iostream>
+#include <fstream>
+#include "Log.h"
+
+// Holds both known and unknown fields
+struct LatencyStats {
+    std::string event_type;
+    uint64_t    md_seq_num        = 0;
+    std::string md_feed_name;
+    int         exch_seq_num      = 0;
+    int         exch_src_id       = 0;
+    uint64_t    md_sec_ric        = 0;
+    int         oms_queue_size    = 0;
+    uint64_t before_md_recv;
+    uint64_t after_md_recv;
+    uint64_t before_md_decode;
+    uint64_t after_md_decode;
+    uint64_t before_strategy;
+    uint64_t before_slice_new;
+    uint64_t before_soflomo_check;
+    uint64_t before_oms_send;
+    uint64_t before_driver_send;
+    uint64_t after_driver_send;
+    uint64_t md_recv_time;
+    uint64_t md_send_time;
+    uint64_t md_exchange_time;
+    int md_event_id           = 0;
+    uint64_t hw_recv_time;
+
+    friend std::ostream& operator<<(std::ostream& os, LatencyStats const& s) {
+        os << "event_type=" << s.event_type
+           << " md_seq_num=" << s.md_seq_num
+           << " md_feed_name=" << s.md_feed_name
+           << " exch_seq_num=" << s.exch_seq_num
+           << " exch_src_id=" << s.exch_src_id
+           << " md_sec_ric=" << s.md_sec_ric
+           << " oms_queue_size=" << s.oms_queue_size
+           << " before_md_recv=" << s.before_md_recv
+           << " after_md_recv=" << s.after_md_recv
+           << " before_md_decode=" << s.before_md_decode
+           << " after_md_decode=" << s.after_md_decode
+           << " before_strategy=" << s.before_strategy
+           << " before_slice_new=" << s.before_slice_new
+           << " before_soflomo_check=" << s.before_soflomo_check
+           << " before_oms_send=" << s.before_oms_send
+           << " before_driver_send=" << s.before_driver_send
+           << " after_driver_send=" << s.after_driver_send
+           << " md_recv_time=" << s.md_recv_time
+           << " md_send_time=" << s.md_send_time
+           << " md_exchange_time=" << s.md_exchange_time
+           << " md_event_id=" << s.md_event_id
+           << " hw_recv_time=" << s.hw_recv_time;
+
+        return os;
+    }
+};
+
+class DropcopyHandler
+{
+public:
+    DropcopyHandler(const std::string& dropcopy_directory);
+
+    ~DropcopyHandler() = default;
+
+    // Parse UTC timestamp string_view to uint64_t nanoseconds since epoch
+    // format: YYYY-MM-DD HH:MM:SS.nnnnnnnnn
+    uint64_t parseTimestamp(std::string_view timestamp) {
+        // Expected format: "YYYY-MM-DD HH:MM:SS.nnnnnnnnn"
+        // Positions:       01234567890123456789012345567
+        
+        int year, month, day, hour, minute, second;
+
+        auto res = std::from_chars(timestamp.data(), timestamp.data() + 4, year);
+        res = std::from_chars(timestamp.data() + 5, timestamp.data() + 7, month);
+        res = std::from_chars(timestamp.data() + 8, timestamp.data() + 10, day);
+        res = std::from_chars(timestamp.data() + 11, timestamp.data() + 13, hour);
+        res = std::from_chars(timestamp.data() + 14, timestamp.data() + 16, minute);
+        res = std::from_chars(timestamp.data() + 17, timestamp.data() + 19, second);
+
+        // Parse nanoseconds
+        uint64_t nanos_frac = 0;
+        if (timestamp.length() > 20 && timestamp[19] == '.') {
+            // Get nanosecond substring
+            auto nano_start = timestamp.data() + 20;
+            auto nano_len = std::min<size_t>(9, timestamp.length() - 20);
+
+            // Parse what we have
+            uint64_t parsed_value = 0;
+            std::from_chars(nano_start, nano_start + nano_len, parsed_value);
+
+            // Scale to nanoseconds (multiply by 10^(9-nano_len))
+            uint64_t scale = 1;
+            for (size_t i = nano_len; i < 9; ++i) {
+                scale *= 10;
+            }
+            nanos_frac = parsed_value * scale;
+        }
+
+        // Convert to UTC time
+        std::tm tm = {};
+        tm.tm_year = year - 1900;
+        tm.tm_mon = month - 1;
+        tm.tm_mday = day;
+        tm.tm_hour = hour;
+        tm.tm_min = minute;
+        tm.tm_sec = second;
+        tm.tm_isdst = 0;
+
+        // timegm for UTC (available on Linux)
+        std::time_t time_seconds = timegm(&tm);
+
+        // Check for errors
+        if (time_seconds == -1) {
+            return 0; // or handle error as needed
+        }
+
+        // Check for negative time (before 1970)
+        if (time_seconds < 0) {
+            return 0; // or handle pre-1970 dates as needed
+        }
+
+        // Now safe to cast
+        return static_cast<uint64_t>(time_seconds) * 1'000'000'000ULL + nanos_frac;
+    }
+
+    // Key-Value parser
+    std::pair<std::string_view,std::string_view>
+        parseKV(std::string_view text, size_t& pos)
+    {
+        // skip whitespace
+        while (pos < text.size() && isspace(text[pos])) pos++;
+        auto start = pos;
+        // read key
+        while (pos < text.size() && text[pos] != '=') pos++;
+        auto key = text.substr(start, pos - start);
+        pos++; // skip '='
+        // skip whitespace
+        while (pos < text.size() && isspace(text[pos])) pos++;
+        // read value (up to comma or end)
+        start = pos;
+        bool in_quotes = (text[pos]=='"');
+        if (in_quotes) pos++;
+        while (pos < text.size() &&
+               (in_quotes ? text[pos] != '"' : text[pos] != ',' && text[pos] != ')'))
+        {
+            pos++;
+        }
+        auto value = text.substr(start, pos - start);
+        if (in_quotes && pos<text.size() && text[pos]=='"') pos++;
+        // skip comma
+        if (pos<text.size() && text[pos]==',') pos++;
+        return {key, value};
+    }
+
+    std::string_view trim_sv(std::string_view sv) {
+        size_t b = 0, e = sv.size();
+        while (b < e && std::isspace((unsigned char)sv[b])) ++b;
+        while (e > b && std::isspace((unsigned char)sv[e-1])) --e;
+        return sv.substr(b, e-b);
+    }
+
+    std::unordered_map<uint64_t, LatencyStats>
+    parseDropcopy(const std::string& filename) {
+        static const std::regex
+            r(".*lordid=\\s*(\\d+)\\s*,\\s*latency_stats=\\s*(.*)\\s*");
+
+        std::unordered_map<uint64_t, LatencyStats> out;
+        std::ifstream in(filename);
+        std::string line;
+        while (std::getline(in, line)) {
+            std::smatch m;
+            if (!std::regex_match(line, m, line_re)) continue;
+            uint64_t cid = std::stoll(m[1].str());
+            std::string body_str = m[2].str();
+            std::string_view body = body_str;
+
+            LatencyStats stats;
+            size_t pos = 0;
+            while (pos < body.size()) {
+                auto [k_raw, v_raw] = parseKV(body, pos);
+                auto k = trim_sv(k_raw);
+                auto v = trim_sv(v_raw);
+
+                if (k == "event_type") {
+                    stats.event_type = std::string(v);
+                } else if (k == "md_seq_num") {
+                    stats.md_seq_num = std::stoll(std::string(v));
+                } else if (k == "md_feed_name") {
+                    // strip quotes if present
+                    stats.md_feed_name = v.front()=='\\''&& v.back()=='\\''
+                        ? std::string(v.substr(1, v.size()-2))
+                        : std::string(v);
+                } else if (k == "exch_seq_num") {
+                    stats.exch_seq_num = std::stoll(std::string(v));
+                } else if (k == "exch_src_id") {
+                    stats.exch_src_id = std::stoll(std::string(v));
+                } else if (k == "md_sec_ric") {
+                    stats.md_sec_ric = std::stoull(std::string(v));
+                } else if (k == "oms_queue_size") {
+                    stats.oms_queue_size = std::stoll(std::string(v));
+                } else if (k == "before_md_recv") {
+                    stats.before_md_recv = parseTimestamp(v);
+                } else if (k == "after_md_recv") {
+                    stats.after_md_recv = parseTimestamp(v);
+                } else if (k == "before_md_decode") {
+                    stats.before_md_decode = parseTimestamp(v);
+                } else if (k == "after_md_decode") {
+                    stats.after_md_decode = parseTimestamp(v);
+                } else if (k == "before_strategy") {
+                    stats.before_strategy = parseTimestamp(v);
+                } else if (k == "before_slice_new") {
+                    stats.before_slice_new = parseTimestamp(v);
+                } else if (k == "before_soflomo_check") {
+                    stats.before_soflomo_check = parseTimestamp(v);
+                } else if (k == "before_oms_send") {
+                    stats.before_oms_send = parseTimestamp(v);
+                } else if (k == "before_driver_send") {
+                    stats.before_driver_send = parseTimestamp(v);
+                } else if (k == "after_driver_send") {
+                    stats.after_driver_send = parseTimestamp(v);
+                } else if (k == "md_recv_time") {
+                    stats.md_recv_time = parseTimestamp(v);
+                } else if (k == "md_send_time") {
+                    stats.md_send_time = parseTimestamp(v);
+                } else if (k == "md_exchange_time") {
+                    stats.md_exchange_time = parseTimestamp(v);
+                } else if (k == "md_event_id") {
+                    stats.md_event_id = std::stoll(std::string(v));
+                }
+            }
+            out.emplace(cid, std::move(stats));
+        }
+        return out;
+    }
+
+    const std::unordered_map<uint64_t, LatencyStats>& getMapRef() const
+    {
+        return map_;
+    }
+
+private:
+    std::unordered_map<uint64_t, LatencyStats> map_;
+    std::string dir_;
+    px::log* log_;
+};
+
+//FILENAME: FileQueue.h
+#pragma once
+
+#include <MPMCQueue.h>
+#include <condition_variable>
+#include <mutex>
+#include <string>
+#include <memory>
+#include "ShutdownUtils.h"
+#include "Log.h" // For logging in the revised push
+
+class FileQueue
+{
+public:
+    explicit FileQueue(int cap = 1024):
+        q_(cap), capacity_(cap), log_(PME_GET_LOGGER("FileQueue")) {
+        if (capacity_ <= 0) {
+            PME_LOG_ERROR(log_, "FileQueue capacity less than or equal to zero.");
+            throw std::invalid_argument("FileQueue capacity less than or equal to zero.");
+        }
+    }
+
+    void push(std::string path_str)
+    {
+        auto uptr_to_push = std::make_unique<std::string>(std::move(path_str));
+
+        std::unique_lock<std::mutex> lk(mtx_);
+        not_full_.wait(lk, [&] {
+            return shutdown::requested() || q_.size() < capacity_;
+        });
+
+        if (shutdown::requested()) {
+            return;
+        }
+
+        while (!shutdown::requested()) {
+            if (q_.try_push(std::move(uptr_to_push))) {
+                lk.unlock();
+                not_empty_.notify_one();
+                return;
+            }
+            // If try_push failed, uptr_to_push is NOT moved from yet. It's still valid.
+            PME_LOG_TRACE(log_, "try_push (unique_ptr) failed after wake; re-waiting not_full_.");
+            not_full_.wait(lk, [&] {
+                return shutdown::requested() || q_.size() < capacity_;
+            });
+        }
+        // If loop terminates due to shutdown, uptr_to_push will be destroyed, freeing memory.
+    }
+
+    bool pop(std::string& out_str)
+    {
+        std::unique_lock<std::mutex> lk(mtx_);
+        not_empty_.wait(lk, [&] {
+            return shutdown::requested() || !q_.empty();
+        });
+
+        if (shutdown::requested() && q_.empty()) {
+            return false;
+        }
+
+        std::unique_ptr<std::string> uptr_popped;
+        while (!shutdown::requested()) {
+            if (q_.try_pop(uptr_popped)) {
+                if (uptr_popped) { // Ensure pointer is not null after pop
+                    out_str = std::move(*uptr_popped); // Move the string content
+                    lk.unlock();
+                    not_full_.notify_one();
+                    return true;
+                } else {
+                    PME_LOG_WARN(log_, "try_pop succeeded but returned null unique_ptr. Treating as empty.");
+                }
+            }
+        }
+
+        PME_LOG_TRACE(log_, "try_pop (unique_ptr) failed after wake; re-waiting not_empty_.");
+        not_empty_.wait(lk, [&] {
+            return shutdown::requested() || !q_.empty();
+        });
+
+        if (shutdown::requested() && q_.empty()) {
+            return false;
+        }
+
+        if (q_.try_pop(uptr_popped)) {
+            if (uptr_popped) {
+                out_str = std::move(*uptr_popped);
+                lk.unlock();
+                not_full_.notify_one();
+                return true;
+            }
+        }
+        return false;
+    }
+
+    void wakeAll()
+    {
+        //Acquiring lock before notify_all is potentially faster due to modern compiler optimization
+        std::unique_lock<std::mutex> lk(mtx_);
+        PME_LOG_TRACE(log_, "wakeAll called, notifying all waiters.");
+        not_full_.notify_all();
+        not_empty_.notify_all();
+    }
+
+private:
+    rigtorp::MPMCQueue<std::unique_ptr<std::string>> q_;
+    const int capacity_;
+    std::mutex mtx_;
+    std::condition_variable not_full_, not_empty_;
+    px::log* log_;
+};
+
+//FILENAME: Watcher.cpp
+#include "Watcher.h"
+#include "Log.h"
+#include <array>
+#include <filesystem>
+#include <stdexcept>
+#include <unistd.h>
+#include <sys/inotify.h>
+#include <cerrno>
+#include <cstring>
+#include <vector>
+
+Watcher::Watcher(std::string dir, CB cb)
+    : dir_(std::move(dir)), cb_(std::move(cb))
+{
+    if(!std::filesystem::is_directory(dir_))
+    {
+        PME_LOG_FATAL(PME_GET_LOGGER("Watcher"), "NOT A DIRECTORY");
+        throw std::runtime_error("not a directory: " + dir_);
+    }
+    fd_ = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
+    if(fd_==-1)
+    {
+        PME_LOG_FATAL(PME_GET_LOGGER("Watcher"), "inotify");
+        throw std::runtime_error("inotify_init1");
+    }
+    uint32_t watch_mask = IN_CREATE | IN_MOVED_TO | IN_CLOSE_WRITE;
+    wd_ = inotify_add_watch(fd_, dir_.c_str(), watch_mask);
+    if(wd_==-1)
+    {
+        PME_LOG_FATAL(PME_GET_LOGGER("Watcher"), "add_watch");
+        throw std::runtime_error("add_watch");
+    }
+}
+
+Watcher::~Watcher()
+{
+    if(fd_ != -1) {
+        if (wd_ != -1) {
+            inotify_rm_watch(fd_, wd_);
+        }
+        close(fd_);
+    }
+}
+
+void Watcher::handle()
+{
+    if (fd_ == -1) return;
+
+    char buffer[4096] __attribute__ ((aligned(__alignof__(struct inotify_event))));
+    ssize_t bytes_read;
+
+    while (true) {
+        bytes_read = read(fd_, buffer, sizeof(buffer));
+
+        if (bytes_read == -1) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                break;
+            } else if (errno == EINTR) {
+                continue;
+            } else {
+                return;
+            }
+        }
+
+        if (bytes_read == 0) {
+            break;
+        }
+
+        for (char* p = buffer; p < buffer + bytes_read; ) {
+            struct inotify_event* event = reinterpret_cast<struct inotify_event*>(p);
+
+            if (event->mask & (IN_CREATE | IN_MOVED_TO | IN_CLOSE_WRITE)) {
+                if (event->len > 0) {
+                    cb_(event->name, event->mask);
+                } else {
+                }
+            }
+            p += sizeof(struct inotify_event) + event->len;
+        }
+    }
+}
+
+//FILENAME: Watcher.h
+#pragma once
+#include <functional>
+#include <string>
+#include <sys/inotify.h>
+
+class Watcher
+{
+public:
+    using CB = std::function<void(std::string_view, uint32_t)>;
+    
+    Watcher(std::string dir, CB cb);
+    ~Watcher();
+    
+    int fd() const noexcept { return fd_; }
+    void handle();
+    const std::string& dir() const noexcept { return dir_; }
+    
+private:
+    int fd_{-1}, wd_{-1};
+    std::string dir_;
+    CB cb_;
+};
+
+//FILENAME: PacketProcessor.cpp
+#include "PacketProcessor.h"
+#include "Log.h"
+#include <PcapFileDevice.h>
+#include <Packet.h>
+#include <EthLayer.h>
+#include <IPv4Layer.h>
+#include <TcpLayer.h>
+#include <UdpLayer.h>
+#include <PayloadLayer.h>
+#include <iostream> // For placeholder logging/output
+#include <functional> // For std::bind with TcpReassembly
+#include <SystemUtils.h> // For pcpp::getHostInfo16, etc.
+#include <thread> // Added for std::this_thread::sleep_for
+#include <chrono> // Added for std::chrono::milliseconds
+#include "ShutdownUtils.h"
+#include <PcapLiveDevice.h>
+
+px::log* PacketProcessor::getLogger() {
+    static px::log* logger = PME_GET_LOGGER("PacketProcessor");
+    return logger;
+}
+
+PacketProcessor::PacketProcessor(const std::unordered_map<uint64_t, LatencyStats>& mapper)
+    : log_(getLogger()),
+      tcp_reassembly_(
+          onTcpMessageReadyCallback,
+          this, // userCookie
+          onTcpConnectionStartCallback,
+          onTcpConnectionEndCallback
+      ),
+      dropcopy_map_ref_(mapper)
+{
+    PME_LOG_INFO(log_, "PacketProcessor instance created.");
+    partial_flow_buffers_.clear();
+}
+
+PacketProcessor::~PacketProcessor() {
+    PME_LOG_INFO(log_, "PacketProcessor instance destroyed.");
+    partial_flow_buffers_.clear();
+}
+
+// New callback for connection start
+void PacketProcessor::onTcpConnectionStartCallback(const pcpp::ConnectionData& connectionData, void* userCookie) {
+    PacketProcessor* self = static_cast<PacketProcessor*>(userCookie);
+    if (!self) return;
+    uint32_t flow_id = connectionData.flowKey;
+    PME_LOG_INFO(self->log_, "TCP Connection Started for flow key: " << flow_id);
+    // It's good practice to ensure no stale buffer exists when a new connection starts
+    self->partial_flow_buffers_.erase(flow_id);
+}
+
+// New callback for connection end
+void PacketProcessor::onTcpConnectionEndCallback(const pcpp::ConnectionData& connectionData, pcpp::TcpReassembly::ConnectionEndReason reason, void* userCookie) {
+    PacketProcessor* self = static_cast<PacketProcessor*>(userCookie);
+    if (!self) return;
+    uint32_t flow_id = connectionData.flowKey;
+    std::string reason_str = (reason == pcpp::TcpReassembly::TcpReassemblyConnectionClosedByFIN_RST) ? "FIN/RST" : "Manually";
+    PME_LOG_INFO(self->log_, "TCP Connection Ended for flow key: " << flow_id << ". Reason: " << reason_str);
+    self->partial_flow_buffers_.erase(flow_id); // Remove any pending buffer for this flow
+}
+
+// Modified callback for when TCP message data is ready
+void PacketProcessor::onTcpMessageReadyCallback(int8_t side, const pcpp::TcpStreamData& tcpData, void* userCookie) {
+    PacketProcessor* self = static_cast<PacketProcessor*>(userCookie);
+    if (!self) {
+        PME_LOG_ERROR(PME_GET_LOGGER("PacketProcessor"), "TCP MessageReady callback: userCookie is null.");
+        return;
+    }
+    
+    ParsedPacketInfo packetInfo(tcpData.getTimeStamp()->getPrecise());
+    
+    const pcpp::ConnectionData& connectionData = tcpData.getConnectionData();
+    uint32_t flow_id = connectionData.flowKey;
+    
+    std::vector<uint8_t> current_processing_buffer;
+    
+    // 1. Prepend existing buffered data for this flow (if any)
+    auto it = self->partial_flow_buffers_.find(flow_id);
+    if (it != self->partial_flow_buffers_.end()) {
+        current_processing_buffer = std::move(it->second);
+        self->partial_flow_buffers_.erase(it);
+        PME_LOG_DEBUG(self->log_, "Flow key: " << flow_id << " - Prepended " << current_processing_buffer.size() << " previously buffered bytes. Side: " << (int)side);
+    }
+    
+    // 2. Append newly received data
+    const uint8_t* new_data_ptr = tcpData.getData();
+    size_t new_data_len = tcpData.getDataLength();
+    if (new_data_ptr && new_data_len > 0) {
+        current_processing_buffer.insert(current_processing_buffer.end(), new_data_ptr, new_data_ptr + new_data_len);
+    }
+    
+    if (current_processing_buffer.empty()) {
+        PME_LOG_DEBUG(self->log_, "Flow key: " << flow_id << " - No data to process in this callback. Side: " << (int)side);
+        return;
+    }
+    
+    const uint8_t* data_ptr = current_processing_buffer.data();
+    size_t total_data_len = current_processing_buffer.size();
+    size_t offset = 0;
+    
+    PME_LOG_INFO(self->log_, "TCP Message Data Ready for flow key: " << flow_id
+                             << ". Side: " << (int)side << ". Processing buffer size: " << total_data_len << " bytes.");
+    
+    while (offset < total_data_len) {
+        const uint8_t* current_msg_ptr = data_ptr + offset;
+        size_t remaining_len = total_data_len - offset;
+        
+        if (remaining_len < sizeof(RazeFormatter::Header)) {
+            PME_LOG_DEBUG(self->log_, "Flow key: " << flow_id << " - Remaining data (" << remaining_len
+                                      << " bytes) too small for RazeFormatter::Header. Buffering.");
+            if (remaining_len > 0) {
+                self->partial_flow_buffers_[flow_id].assign(current_msg_ptr, current_msg_ptr + remaining_len);
+            }
+            break;
+        }
+        
+        const auto* hdr = reinterpret_cast<const RazeFormatter::Header*>(current_msg_ptr);
+        uint16_t message_len = hdr->packet_length;
+        
+        if (message_len == 0) {
+            PME_LOG_ERROR(self->log_, "Flow key: " << flow_id << " - RazeProtocol message_len is 0. Invalid message. Discarding current processing buffer for this flow and stopping.");
+            self->partial_flow_buffers_.erase(flow_id);
+            break;
+        }
+        
+        if (message_len > remaining_len) {
+            PME_LOG_DEBUG(self->log_, "Flow key: " << flow_id << " - RazeProtocol message_len (" << message_len
+                                      << " bytes) larger than remaining data (" << remaining_len
+                                      << "). Partial message detected. Buffering remaining " << remaining_len << " bytes.");
+            if (remaining_len > 0) {
+                self->partial_flow_buffers_[flow_id].assign(current_msg_ptr, current_msg_ptr + remaining_len);
+            }
+            break;
+        }
+        
+        PME_LOG_DEBUG(self->log_, "Flow key: " << flow_id << " - RazeProtocol Message: Type=" << static_cast<int>(hdr->packet_type)
+                                  << ", Declared Length (host order)=" << message_len);
+        
+        switch (hdr->packet_type) {
+            case RazeFormatter::PacketType::unsequenced_data: {
+                self->handleUnsequencedData(reinterpret_cast<const RazeFormatter::UnsequencedHeader const *>(hdr), packetInfo);
+                break;
+            }
+            default:
+                PME_LOG_WARN(self->log_, "Flow key: " << flow_id << " - Unknown RazeProtocol packet_type: " << static_cast<int>(hdr->packet_type)
+                                         << ". Skipping " << message_len << " bytes.");
+                break;
+        }
+        offset += message_len;
+    }
+}
+
+void PacketProcessor::handleUnsequencedData(RazeFormatter::UnsequencedHeader const* hdr, ParsedPacketInfo& packetInfo)
+{
+    switch (hdr->message_type)
+    {
+        case RazeFormatter::MessageType::new_order:
+        {
+            handleNewOrder(reinterpret_cast<const RazeFormatter::NewOrder const *>(hdr), packetInfo);
+            break;
+        }
+        default:
+            PME_LOG_WARN(PME_GET_LOGGER("TCP - handleUnsequencedData"), "Ignoring any packet that isn't new_order");
+            break;
+    }
+}
+
+void PacketProcessor::handleNewOrder(RazeFormatter::NewOrder const* hdr, ParsedPacketInfo& packetInfo)
+{
+    PME_LOG_INFO(PME_GET_LOGGER("TCP - handleNewOrder"), "NewOrder received: " << hdr->data.order_token);
+    auto it = dropcopy_map_ref_.find(static_cast<uint64_t>(hdr->data.order_token));
+    if (it != dropcopy_map_ref_.end())
+    {
+        auto stat = it->second;
+        PME_LOG_INFO(getLogger(), "TCP Packet lookup: md_seq_num = " << stat.md_seq_num << " md_recv_time = " << stat.md_recv_time << " md_send_time = " << stat.md_send_time << "TCP TIMESTAMP: " << packetInfo.getTimestamp());
+        uint64_t hash = generateHash(stat.md_seq_num, stat.md_recv_time, stat.md_send_time);
+        
+        PME_LOG_INFO(getLogger(), "TCP HASH: " << hash);
+        
+        auto iter = joinMap_.find(hash);
+        if (iter != joinMap_.end())
+        {
+            PME_LOG_INFO(getLogger(), "MAP MATCH FOUND");
+        }
+        
+        joinMap_[hash].push_back(packetInfo);
+    }
+}
+
+void PacketProcessor::processUdpPacket(pcpp::Packet& packet) {
+    pcpp::UdpLayer* udpLayer = packet.getLayerOfType<pcpp::UdpLayer>();
+    if (!udpLayer) {
+        PME_LOG_TRACE(log_, "Packet does not have a UDP layer.");
+        return;
+    }
+    
+    pcpp::IPv4Layer* ipv4Layer = packet.getLayerOfType<pcpp::IPv4Layer>();
+    if (!ipv4Layer) {
+        PME_LOG_DEBUG(log_, "UDP packet is not IPv4. SPCAST processing currently expects IPv4. SrcPort: "
+                            << udpLayer->getSrcPort() << " DstPort: " << udpLayer->getDstPort());
+        return; // SPCAST logic here relies on IPv4 for flow key
+    }
+    
+    std::string flow_info_log = "UDP Flow - SrcIP: " + ipv4Layer->getSrcIPAddress().toString() +
+                                " DstIP: " + ipv4Layer->getDstIPAddress().toString() +
+                                " SrcPort: " + std::to_string(udpLayer->getSrcPort()) +
+                                " DstPort: " + std::to_string(udpLayer->getDstPort());
+    
+    uint8_t* payload = udpLayer->getLayerPayload();
+    size_t payloadSize = udpLayer->getLayerPayloadSize();
+    
+    if (payloadSize == 0) {
+        PME_LOG_WARN(log_, flow_info_log << " - UDP packet has no payload.");
+        return;
+    }
+    
+    // The first byte of every SPCAST packet_header_t is the version.
+    uint8_t detectedVersion = *payload;
+    
+    switch (detectedVersion) {
+        case 3:
+            handleSpcastV3(packet, ipv4Layer, udpLayer, payload, payloadSize);
+            break;
+        case 4:
+            handleSpcastV4(packet, ipv4Layer, udpLayer, payload, payloadSize);
+            break;
+        default:
+            PME_LOG_TRACE(log_, flow_info_log << " - UDP payload does not appear to be SPCAST. First byte/version field=" << (int)detectedVersion);
+            break;
+    }
+}
+
+void PacketProcessor::handleSpcastV3(pcpp::Packet& packet, pcpp::IPv4Layer* ipv4Layer, pcpp::UdpLayer* udpLayer, uint8_t* payload, size_t payloadSize) {
+    // Basic size check for packet header
+    if (payloadSize < sizeof(spcast::SpcastVersionTraits::PacketHeader)) {
+        PME_LOG_WARN(log_, "SPCASTV3: Datagram too small for packet_header_t (" << payloadSize << " bytes). SrcPort=" << udpLayer->getSrcPort());
+        return;
+    }
+    
+    pcpp::RawPacket* rawPkt = packet.getRawPacket();
+    
+    timespec ts = rawPkt->getPacketTimeStamp();
+    
+    std::chrono::time_point<std::chrono::high_resolution_clock> timestamp = timespecToTimePoint(ts);
+    
+    ParsedPacketInfo packetInfo(timestamp);
+    
+    const auto* pktHdr = reinterpret_cast<const spcast::SpcastVersionTraits::PacketHeader*>(payload);
+    
+    const uint8_t recv_timestamp_ns = pktHdr->recv_timestamp_ns;
+    const uint8_t send_timestamp_ns = pktHdr->send_timestamp_ns;
+    
+    // Pointer math to start of first message
+    const uint8_t* cursor = payload + sizeof(spcast::SpcastVersionTraits::PacketHeader);
+    const uint8_t* end    = payload + payloadSize;
+    while (cursor + sizeof(spcast::SpcastVersionTraits::MessageHeader) <= end) {
+        const auto* msgHdr = reinterpret_cast<const spcast::SpcastVersionTraits::MessageHeader*>(cursor);
+        
+        uint16_t msg_len = msgHdr->length; // total length including header
+        
+        if (msg_len == 0) {
+            PME_LOG_WARN(log_, "SPCASTV3: Encountered message with length 0. Skipping remaining bytes.");
+            break;
+        }
+        
+        if (cursor + msg_len > end) {
+            PME_LOG_WARN(log_, "SPCASTV3: Truncated message (declared " << msg_len << " bytes, only " << (end - cursor) << " remain).");
+            break;
+        }
+        
+        // Extract symbol string (may be empty)
+        std::string symbol;
+        if (msgHdr->symbol_size > 0 && msgHdr->symbol_offset + msgHdr->symbol_size <= msg_len) {
+            symbol.assign(reinterpret_cast<const char*>(cursor) + msgHdr->symbol_offset, msgHdr->symbol_size);
+        }
+        
+        uint64_t seq = msgHdr->seq_num;
+        
+        if (seq != last_udpseq_) {
+            uint64_t hash = generateHash(seq, recv_timestamp_ns, send_timestamp_ns);
+            PME_LOG_INFO(log_, "UDP HASH: " << hash);
+            
+            auto iter = joinMap_.find(hash);
+            if (iter != joinMap_.end()) {
+                PME_LOG_INFO(log_, "LLISTFOUND");
+            }
+            joinMap_[hash].push_back(packetInfo);
+        } else {
+            PME_LOG_WARN(log_, "Skipping duplicate spcast message");
+        }
+        ++spcast_v3_message_total_;
+        cursor += msg_len;
+    }
+}
+
+void PacketProcessor::handleSpcastV4(pcpp::Packet& packet, pcpp::IPv4Layer* ipv4Layer, pcpp::UdpLayer* udpLayer, uint8_t* payload, size_t payloadSize) {
+    PME_LOG_DEBUG(log_, "SPCAST Version 4 detected. File: "
+                        << ipv4Layer->getSrcIPAddress().toString() << ":" << udpLayer->getSrcPort() << " → "
+                        << ipv4Layer->getDstIPAddress().toString() << ":" << udpLayer->getDstPort()
+                        << ". Payload Size: " << payloadSize
+                        << ". (full handling not yet implemented).");
+}
+
+std::unordered_map<uint64_t, std::vector<ParsedPacketInfo>> PacketProcessor::processFile(const std::string& filePath) {
+    
+    joinMap_.clear();
+    PME_LOG_INFO(log_, "Starting to process PCAP file: " << filePath);
+    
+    pcpp::IFileReaderDevice* reader = pcpp::IFileReaderDevice::getReader(filePath);
+    
+    if (reader == nullptr || !reader->open()) {
+        PME_LOG_ERROR(log_, "Cannot open PCAP file: " << filePath);
+        if (reader) delete reader;
+        return joinMap_;
+    }
+    
+    PME_LOG_INFO(log_, "Successfully opened PCAP file: " << filePath);
+    
+    tcp_reassembly_.closeAllConnections(); // This will trigger onTcpConnectionEndCallback for any open connections
+    partial_flow_buffers_.clear(); // Also explicitly clear, though onTcpConnectionEndCallback should handle active ones.
+    
+    pcpp::RawPacket rawPacket;
+    int packetCount = 0;
+    int tcpCount = 0;
+    int udpCount = 0;
+    int otherCount = 0;
+    
+    while (reader->getNextPacket(rawPacket)) {
+        if (shutdown::requested()) {
+            PME_LOG_INFO(log_, "Shutdown requested during processing of file: " << filePath << ". Aborting file processing.");
+            break;
+        }
+        
+        packetCount++;
+        pcpp::Packet parsedPacket(&rawPacket);
+        
+        if (parsedPacket.isPacketOfType(pcpp::TCP)) {
+            pcpp::TcpLayer* tcpLayer = parsedPacket.getLayerOfType<pcpp::TcpLayer>();
+            pcpp::IPv4Layer* ipv4Layer = parsedPacket.getLayerOfType<pcpp::IPv4Layer>();
+            if (tcpLayer && ipv4Layer) {
+                tcp_reassembly_.reassemblePacket(parsedPacket);
+                tcpCount++;
+            } else {
+                otherCount++;
+            }
+        } else if (parsedPacket.isPacketOfType(pcpp::UDP)) {
+            processUdpPacket(parsedPacket);
+            udpCount++;
+        } else {
+            otherCount++;
+        }
+        
+        // Hybrid approach for yielding:
+        // Yield on most iterations, periodically do a very short sleep for a stronger yield.
+        if (packetCount % 200 == 0) { // Adjust frequency as needed
+            std::this_thread::sleep_for(std::chrono::microseconds(50)); // Adjust duration (e.g., 10-100μs)
+        } else {
+            std::this_thread::yield();
+        }
+    }
+    
+    // Ensure reassembly structures are cleaned up even if loop broke early due to shutdown
+    tcp_reassembly_.closeAllConnections(); // Ensure all connections are closed and final data processed / callbacks triggered
+    partial_flow_buffers_.clear(); // Final clear for safety
+    
+    PME_LOG_INFO(log_, "Finished processing PCAP file: " << filePath);
+    PME_LOG_INFO(log_, "Summary - Total Packets: " << packetCount
+                       << ", TCP: " << tcpCount
+                       << ", UDP: " << udpCount
+                       << ", SPCastV3 Message count: " << spcast_v3_message_total_
+                       << ", Other: " << otherCount);
+    
+    reader->close();
+    delete reader;
+    
+    return joinMap_;
+}
+
+//FILENAME: PacketProcessor.h
+#pragma once
+#include <string>
+#include <vector>
+#include <atomic>
+#include <map>
+#include "PcapFileDevice.h"
+#include "Packet.h"
+#include "EthLayer.h"
+#include "IPv4Layer.h"
+#include "TcpLayer.h"
+#include "UdpLayer.h"
+#include "TcpReassembly.h"
+#include "Log.h"
+#include <razeapi/messages/raze.hpp>
+#include <razeapi/messages/raze.hpp>
+#include <razeapi/proto/order_extra.h>
+#include <razeapi/proto/raze.h>
+#include <razeapi/utils/fixed_decimal.hpp>
+#include <md_api/proto/spcast_v3.h>
+#include <md_api/proto/spcast_v4.h>
+#include <boost/functional/hash.hpp>
+#include "DropcopyHandler.h"
+
+namespace spcast
+{
+    namespace SpcastVersionTraits
+    {
+        using PacketHeader = md_api::proto::spcast_v3::packet_header_t;
+        using MessageHeader = md_api::proto::spcast_v3::message_header_t;
+        using MessageType = md_api::proto::spcast_v3::message_type_enum;
+        static constexpr MessageType StatusMessageType = MessageType::Status;
+        using VenueENum = md_api::proto::spcast_v3::venue_enum;
+        using StatusMsg = md_api::proto::spcast_v3::status_change_t;
+        using QuoteMsg = md_api::proto::spcast_v3::quote_t;
+        using TradeMsg = md_api::proto::spcast_v3::trade_t;
+        using AuctionSummaryMsg = md_api::proto::spcast_v3::auction_summary_t;
+        using SideEnum = md_api::proto::spcast_v3::side_enum;
+        using ReutersTradeMsg = md_api::proto::spcast_v3::trade_reuters_t;
+        
+        using ExchSeqNum = md_api::proto::spcast_v3::raw_feed_exch_seq_num_t;
+        
+        using FxGenericQuoteMsg = md_api::proto::spcast_v3::quote_fx_t;
+        using FxCitiQuoteMsg = md_api::proto::spcast_v3::quote_citi_fx_t;
+        using FxDbQuoteMsg = md_api::proto::spcast_v3::quote_db_fx_t;
+        using FxUbsQuoteMsg = md_api::proto::spcast_v3::quote_ubs_fx_t;
+        
+        using OpenMsg = md_api::proto::spcast_v3::open_t;
+        using CloseMsg = md_api::proto::spcast_v3::close_t;
+    };
+    
+    namespace SpcastVersionTraits
+    {
+        using PacketHeader = md_api::proto::spcast_v4::packet_header_t;
+        using MessageHeader = md_api::proto::spcast_v4::message_header_t;
+        using MessageType = md_api::proto::spcast_v4::message_type_enum;
+        static constexpr MessageType StatusMessageType = MessageType::Status;
+        using VenueENum = md_api::proto::spcast_v4::venue_enum;
+        using StatusMsg = md_api::proto::spcast_v4::status_t;
+        using QuoteMsg = md_api::proto::spcast_v4::quote_t;
+        using TradeMsg = md_api::proto::spcast_v4::trade_t;
+        using AuctionSummaryMsg = md_api::proto::spcast_v4::auction_summary_t;
+        using SideEnum = md_api::proto::spcast_v4::side_enum;
+        
+        using ExchSeqNum = md_api::proto::spcast_v4::raw_feed_exch_seq_num_t;
+        
+        using FxGenericQuoteMsg = md_api::proto::spcast_v4::quote_fx_t;
+        using FxCitiQuoteMsg = md_api::proto::spcast_v4::quote_citi_fx_t;
+        using FxDbQuoteMsg = md_api::proto::spcast_v4::quote_db_fx_t;
+        using FxUbsQuoteMsg = md_api::proto::spcast_v4::quote_ubs_fx_t;
+        
+        using OpenMsg = md_api::proto::spcast_v4::open_t;
+        using CloseMsg = md_api::proto::spcast_v4::close_t;
+    };
+}
+
+namespace RazeFormatter
+{
+    using Header = xraze::header;
+    using UnsequencedHeader = ::raze::unsequenced_header;
+    
+    using NewOrder = ::raze::new_order;
+    using NewFppaOrder = ::raze::new_fpga_order;
+    using AmendOrder = ::raze::amend_order;
+    using CancelOrder = ::raze::cancel_order;
+    using UpdatePriceOrder = ::raze::update_price;
+    using LoginRequest = xraze::login_request;
+    using LogoutRequest = xraze::logout_request;
+    using ClientHeartbeat = xraze::client_heartbeat;
+    
+    using FlowStatus = ::raze::flow_status;
+    using FlowInfo = ::raze::flow_info;
+    using ClientStatus = ::raze::client_status;
+    using LoginAccepted = xraze::login_accepted;
+    using LoginRejected = xraze::login_rejected;
+    using NewAccepted = ::raze::new_accepted;
+    using NewRejected = ::raze::new_rejected;
+    using AmendAccepted = ::raze::amend_accepted;
+    using AmendRejected = ::raze::amend_rejected;
+    using CancelAccepted = ::raze::cancel_accepted;
+    using CancelRejected = ::raze::cancel_rejected;
+    using UpdatePriceAccepted = ::raze::update_price_accepted;
+    using UpdatePriceRejected = ::raze::update_price_rejected;
+    using OrderStatus = ::raze::order_status;
+    using Execution = ::raze::execution;
+    
+    using MessageType = ::raze::message_type_e;
+    using PacketType = xraze::packet_type_e;
+    using OrderType = ::raze::order_type_e;
+    using BuySellIndicator = ::raze::buy_sell_indicator_e;
+    
+    using PriceType = ::raze::price_type;
+    using SharesType = ::raze::shares_type;
+    using ClOrderIdType = ::raze::clordid_type;
+    
+    static constexpr const std::int64_t InvalidPrice = razeapi::util::fixed_decimal::invalid_price;
+    
+    using ExtrasStorage = std::array<char, razeapi::messages::max_size_extra_data()>;
+    using NewOrderExtras = razeapi::messages::aggregated_messages<NewOrder, ExtrasStorage>;
+    using NewFpgaOrderExtras = razeapi::messages::aggregated_messages<NewFpgaOrder, ExtrasStorage>;
+}
+
+struct ParsedPacketInfo
+{
+    std::chrono::time_point<std::chrono::high_resolution_clock> ts_;
+    ParsedPacketInfo(std::chrono::time_point<std::chrono::high_resolution_clock> timestamp):ts_(timestamp)
+    {
+        return ts_;
+    }
+};
+
+class PacketProcessor {
+public:
+    PacketProcessor(const std::unordered_map<uint64_t, LatencyStats>& mapper);
+    ~PacketProcessor();
+    
+    std::unordered_map<uint64_t, std::vector<ParsedPacketInfo>> processFile(const std::string& filePath);
+    
+private:
+    // TCP Reassembly callbacks
+    static void onTcpMessageReadyCallback(int8_t side, const pcpp::TcpStreamData& tcpData, void* userCookie);
+    static void onTcpConnectionStartCallback(const pcpp::ConnectionData& connectionData, void* userCookie);
+    static void onTcpConnectionEndCallback(const pcpp::ConnectionData& connectionData, pcpp::TcpReassembly::ConnectionEndReason reason, void* userCookie);
+    
+    // UDP processing
+    void processUdpPacket(pcpp::Packet& packet);
+    void handleSpcastV3(pcpp::Packet& packet,
+                        pcpp::IPv4Layer* ipv4Layer,
+                        pcpp::UdpLayer* udpLayer,
+                        uint8_t* payload,
+                        size_t payloadSize);
+    void handleSpcastV4(pcpp::Packet& packet,
+                        pcpp::IPv4Layer* ipv4Layer,
+                        pcpp::UdpLayer* udpLayer,
+                        uint8_t* payload,
+                        size_t payloadSize);
+    
+    uint64_t generateHash(uint64_t seq, uint64_t recv, uint64_t send)
+    {
+        PME_LOG_INFO(log_, "Generating hash using 3 keys: " << seq << " " << recv << " " << send);
+        std::size_t seed = 0;
+        boost::hash_combine(seed, seq);
+        boost::hash_combine(seed, recv);
+        boost::hash_combine(seed, send);
+        return static_cast<uint64_t>(seed);
+    }
+    
+    static std::chrono::time_point<std::chrono::high_resolution_clock> timespecToTimePoint(const timespec& ts)
+    {
+        auto duration = std::chrono::duration_cast<std::chrono::high_resolution_clock::duration>(
+            std::chrono::seconds(ts.tv_sec) + std::chrono::nanoseconds(ts.tv_nsec));
+        return std::chrono::time_point<std::chrono::high_resolution_clock>(duration);
+    }
+    
+    // RazeProtocol processing
+    void handleUnsequencedData(RazeFormatter::UnsequencedHeader const* hdr, ParsedPacketInfo& packetInfo);
+    void handleNewOrder(RazeFormatter::NewOrder const* hdr, ParsedPacketInfo& packetInfo);
+    
+    uint64_t spcast_v3_message_total_ {0};
+    px::log* log_;
+    pcpp::TcpReassembly tcp_reassembly_;
+    std::map<uint32_t, std::vector<uint8_t>> partial_flow_buffers_; // Buffer for partial TCP messages per flow SID
+    
+    // Track last seen sequence per symbol for SPCast v3
+    std::unordered_map<std::string, uint64_t> spcast_v3_last_seq_;
+    const std::unordered_map<uint64_t, LatencyStats>& dropcopy_map_ref_;
+    std::unordered_map<uint64_t, std::vector<ParsedPacketInfo>> joinMap_;
+    
+    uint64_t last_udpseq_ {0};
+    // Custom UDP Reassembly related members:
+    // Example:
+    // struct UdpMessageFragment {
+    //     uint16_t messageId; // Or some identifier for the message
+    //     uint16_t fragmentOffset;
+    //     bool isLastFragment;
+    //     std::vector<uint8_t> payload;
+    // };
+    // std::map<uint32_t, std::vector<UdpMessageFragment>> udp_message_buffer_; // Key: sourceIP_sourcePort_destIP_destPort hash or similar
+    // void checkForCompleteUdpMessages(uint32_t flowKey);
+    
+    // Helper to get logger
+    static px::log* getLogger();
+};
+
+//FILENAME: OutputFileWriter.h
+#pragma once
+#include <unordered_map>
+#include <vector>
+#include <string>
+#include <fstream>
+#include <chrono>
+#include <algorithm>
+#include <iomanip>
+#include <cstdint>
+#include "Log.h"
+
+namespace OutputFileWriter
+{
+    bool write(
+        const std::unordered_map<uint64_t, std::vector<ParsedPacketInfo>>& packetMap,
+        const std::string& outputDir) {
+        
+        // Construct the output file path
+        std::string filename = outputDir;
+        if (!filename.empty() && filename.back() != '/' && filename.back() != '\\') {
+            filename += "/";
+        }
+        filename += "timestamp_deltas.csv";
+        
+        // Open the file for writing
+        std::ofstream csvFile(filename);
+        if (!csvFile.is_open()) {
+            return false;
+        }
+        
+        // Write CSV header
+        csvFile << "entry_id,timestamp1,timestamp2,delta_nanoseconds\n";
+        
+        // Process each entry in the map
+        for (const auto& [key, packetVector] : packetMap) {
+            // Skip if the vector doesn't contain exactly 2 packets
+            if (packetVector.size() != 2) {
+                continue;
+            }
+            
+            // Get timestamps from both packets
+            auto timestamp1 = packetVector[0].getTimestamp();
+            auto timestamp2 = packetVector[1].getTimestamp();
+            
+            if (timestamp1 > timestamp2) {
+                std::swap(timestamp1, timestamp2);
+            }
+            
+            // Convert both timestamps to nanoseconds since epoch
+            auto nanos1 = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                timestamp1.time_since_epoch()
+            ).count();
+            auto nanos2 = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                timestamp2.time_since_epoch()
+            ).count();
+            
+            // Calculate the delta in nanoseconds (absolute value)
+            uint64_t deltaNanos = std::abs(nanos2 - nanos1);
+            csvFile << key << "," << nanos1 << "," << nanos2 << "," << deltaNanos << "\n";
+        }
+        
+        // Check if writing was successful
+        if (csvFile.fail()) {
+            csvFile.close();
+            return false;
+        }
+        
+        csvFile.close();
+        return true;
+    }
+}
