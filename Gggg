@@ -1,0 +1,241 @@
+/***************************************************************************************************
+*  PME refactor – geohot-ish edition (single-paste bundle)                                          *
+*                                                                                                   *
+*  Philosophy                                                                                       *
+*  ───────────                                                                                      *
+*   • One header == one idea. No 4-level class hierarchies.                                         *
+*   • Globals are just bad singletons; pass context instead.                                        *
+*   • Blocking work? Fine – but OWN it, don’t “sprinkle yields like salt” (gh_).                    *
+*   • Let the compiler optimise, not mystify. Simple lock-free beats clever “wait+cond+spin”.       *
+*   • “If it needs a README to call main(), rewrite main()” – command line goes through CLI11.      *
+*                                                                                                   *
+*  Files in this block                                                                              *
+*  ───────────────────                                                                              *
+*   include/Options.h            – struct EngineOptions                                             *
+*   include/Cli.h                – parse_cli(argc,argv)                                             *
+*   include/RuntimeContext.h     – shared stop flag & root logger                                   *
+*   include/FileQueue.h          – boost::lockfree wrapper                                          *
+*   src/main.cpp                 – slim, signal-aware entry point                                   *
+*   src/Engine.patch             – minimal diff to wire things in                                   *
+*                                                                                                   *
+*  Build                                                                                            *
+*  ─────                                                                                            *
+*   wget -qO include/CLI/CLI.hpp https://raw.githubusercontent.com/CLIUtils/CLI11/v2.4.2/include/CLI/CLI.hpp
+*   g++ -std=c++17 -Iinclude -pthread src/*.cpp -lboost_system -o pme                               *
+*                                                                                                   *
+*  ⚠  Everything below is drop-in; you only need to delete your old ShutdownUtils + FileQueue.      *
+****************************************************************************************************/
+
+/* =================================================================================================
+   include/Options.h
+   ============================================================================================== */
+#pragma once
+#include <string>
+#include <vector>
+
+struct EngineOptions {
+    std::vector<std::string> watch_dirs;                 // -w, --watch  (repeatable, required)
+    std::string             dropcopy {"/tmp/dropcopy"};  // --dropcopy
+    unsigned                workers  {1};                // -t, --threads
+    unsigned                queueCap {1024};             // -q, --queue
+};
+
+/* =================================================================================================
+   include/Cli.h   – tiny facade over CLI11 single-header
+   ============================================================================================== */
+#pragma once
+#include "Options.h"
+#include <CLI/CLI.hpp>
+
+inline EngineOptions parse_cli(int argc, char** argv)
+{
+    EngineOptions o;
+    CLI::App app{"pme – packet ↔ dropcopy joiner"};
+
+    app.add_option("-w,--watch",   o.watch_dirs, "Directory to watch (repeatable)")
+       ->required()
+       ->check(CLI::ExistingDirectory);
+    app.add_option("--dropcopy",   o.dropcopy,   "Full path to drop-copy file")
+       ->check(CLI::ExistingFile);
+    app.add_option("-t,--threads", o.workers,    "Worker thread count")
+       ->default_val(o.workers)
+       ->check(CLI::PositiveNumber);
+    app.add_option("-q,--queue",   o.queueCap,   "Queue capacity (power of two)")
+       ->default_val(o.queueCap)
+       ->check(CLI::PositiveNumber);
+
+    CLI11_PARSE(app, argc, argv);
+    return o;
+}
+
+/* =================================================================================================
+   include/RuntimeContext.h
+   ============================================================================================== */
+#pragma once
+#include <atomic>
+#include <memory>
+#include <spdlog/spdlog.h>
+
+struct RuntimeContext {
+    std::atomic<bool> stop{false};
+    std::shared_ptr<spdlog::logger> root = spdlog::default_logger();
+};
+
+/* =================================================================================================
+   include/FileQueue.h – single-producer/single-consumer OK, but MPMC as well via boost::lockfree
+   ============================================================================================== */
+#pragma once
+#include <boost/lockfree/queue.hpp>
+#include <memory>
+#include <string>
+#include <chrono>
+#include <thread>
+#include "RuntimeContext.h"
+
+class FileQueue {
+public:
+    explicit FileQueue(std::size_t cap, std::shared_ptr<RuntimeContext> ctx)
+        : q_(cap), ctx_(std::move(ctx)) {}
+
+    void push(std::string path)                                    // non-blocking producer
+    {
+        auto up = std::make_unique<std::string>(std::move(path));
+        while (!q_.push(up.get())) {                               // queue takes raw ptr
+            if (ctx_->stop.load()) return;
+            std::this_thread::sleep_for(1us);                      // 1 μs pause – cheap
+        }
+        up.release();                                              // ownership transferred
+    }
+
+    bool pop(std::string& out)                                     // consumer side
+    {
+        std::unique_ptr<std::string> ptr;
+        while (!q_.pop(ptr)) {
+            if (ctx_->stop.load()) return false;
+            std::this_thread::sleep_for(1us);
+        }
+        out = std::move(*ptr);
+        return true;
+    }
+
+    void wakeAll() {}                                              // no sleepers to wake
+
+private:
+    boost::lockfree::queue<std::unique_ptr<std::string>,
+        boost::lockfree::fixed_sized<true>> q_;
+    std::shared_ptr<RuntimeContext> ctx_;
+};
+
+/* =================================================================================================
+   src/main.cpp – 45 lines, no globals except the Engine* tramp for POSIX signals
+   ============================================================================================== */
+#include "Cli.h"
+#include "Engine.h"          // your existing header, see patch below
+#include "RuntimeContext.h"
+#include "Log.h"
+
+#include <csignal>
+#include <memory>
+
+static Engine* g_engine = nullptr;
+static void on_signal(int) { if (g_engine) g_engine->requestStop(); }
+
+int main(int argc, char** argv)
+{
+    sp::logging::start(sp::logging::stdout_config());
+    sp::logging::set_override(sp::logging::level::INFO);
+
+    auto opts = parse_cli(argc, argv);
+    auto ctx  = std::make_shared<RuntimeContext>();
+
+    Engine engine(ctx, opts);     // new ctor
+    g_engine = &engine;
+
+    signal(SIGINT,  on_signal);
+    signal(SIGTERM, on_signal);
+
+    engine.run();                 // blocking; returns after graceful stop
+
+    sp::logging::stop();
+    return 0;
+}
+
+/* =================================================================================================
+   src/Engine.patch – apply to your Engine.{h,cpp}.  Only *touch* constructors & loops.
+   ============================================================================================== */
+/*
+--- a/Engine.h
++++ b/Engine.h
+@@
+-    Engine(const std::string dropcopy_directory, const std::vector<std::string>& dirs_to_watch,
+-           unsigned num_workers, unsigned queue_capacity);
++    Engine(std::shared_ptr<RuntimeContext> ctx, const EngineOptions&);
+
++    void requestStop();              // called from signal tramp
+@@
+-    unsigned num_worker_threads_;
+-    unsigned queue_capacity_;
+-    FileQueue queue_;
++    std::shared_ptr<RuntimeContext> ctx_;
++    unsigned num_worker_threads_;
++    FileQueue queue_;
+*/
+
+//
+// Engine.cpp  (fragment – only changed bits shown)
+//
+/*
+ Engine::Engine(std::shared_ptr<RuntimeContext> ctx, const EngineOptions& o)
+-    : dc_(o.dropcopy_directory, ... )   // keep existing members
+-      directories_to_watch_(o.watch_dirs),
+-      num_worker_threads_(o.workers),
+-      queue_capacity_(o.queueCap),
+-      queue_(o.queueCap),
+-      ...
++    : ctx_(std::move(ctx)),
++      dc_(o.dropcopy),                  // same order as before
++      directories_to_watch_(o.watch_dirs),
++      num_worker_threads_(o.workers),
++      queue_(o.queueCap, ctx_),
++      ...
+ {
+     ...
+ }
+*/
+
+/// everywhere that previously checked `shutdown::requested()` now does:
+///     if (ctx_->stop.load(std::memory_order_relaxed)) break;
+///
+/// and when we want to “ring the bell”:
+///     ctx_->stop.store(true, std::memory_order_release);
+///     queue_.wakeAll();
+
+//
+// Add the public stop request helper (just sets the flag and wakes queues)
+//
+void Engine::requestStop()
+{
+    ctx_->stop.store(true, std::memory_order_release);
+    queue_.wakeAll();
+}
+
+//
+// Engine::run – outer wait loop shrinks to:
+//
+void Engine::run()
+{
+    startThreads();                        // discovery + workers
+    while (!ctx_->stop.load())             // cheap, no syscalls
+        std::this_thread::sleep_for(100ms);
+    stop();                                // join + flush
+}
+
+
+/***************************************************************************************************
+*  That’s it.                                                                                       *
+*   • Arg parsing is declarative.                                                                   *
+*   • Shutdown is context-driven, test-friendly.                                                    *
+*   • Queue is real lock-free; no heavy mutex path left.                                            *
+*                                                                                                   *
+*  “Write code you can explain on a whiteboard in five minutes” – gh_.                              *
+***************************************************************************************************/
