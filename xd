@@ -231,3 +231,85 @@ private:
     std::unordered_set<std::string> processed_files_;
     std::mutex processed_files_mutex_;
 };
+
+
+#include "Discovery.h"
+#include <unistd.h> // For close()
+#include <sys/epoll.h> // For epoll functions
+#include <filesystem> // For path manipulation
+#include <cerrno> // for errno
+#include <cstring> // For strerror
+
+// Discovery Constructor (check watcher fd)
+Discovery::Discovery(std::string dir, FileQueue& q, px::Log* engine_logger, std::shared_ptr<RuntimeContext> ctx)
+    : watcher_(dir, [this](std::string_view name, uint32_t mask) { onEvent(name, mask); }),
+      queue_(q),
+      log_(engine_logger), // Use the passed logger, or create a specific one if desired
+      discovery_dir_path_(std::move(dir)), // Store the directory path
+      ctx_(ctx)
+{
+    PME_LOG_INFO(log_, "Discovery instance for directory: " << discovery_dir_path_);
+    if (watcher_.fd() < 0) {
+        PME_LOG_ERROR(log_, "Watcher initialization failed for directory: " << discovery_dir_path_);
+        throw std::runtime_error("Failed to initialize watcher for " + discovery_dir_path_);
+    }
+}
+
+void Discovery::run() {
+    // Queue all existing pcap files - trust they're ready
+    try {
+        for (const auto& entry : std::filesystem::directory_iterator(discovery_dir_path_)) {
+            if (entry.is_regular_file() && entry.path().extension() == ".pcap") {
+                queue_.push(entry.path().string());
+            }
+        }
+    } catch (const std::filesystem::filesystem_error& e) {
+        PME_LOG_ERROR(log_, "Failed to scan directory: " << e.what());
+        return;
+    }
+
+    // Setup epoll for new files
+    int epoll_fd = epoll_create1(EPOLL_CLOEXEC);
+    if (epoll_fd == -1) {
+        PME_LOG_ERROR(log_, "epoll_create1 failed: " << strerror(errno));
+        return;
+    }
+
+    struct epoll_event ev;
+    ev.events = EPOLLIN;
+    ev.data.fd = watcher_.fd();
+    
+    if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, watcher_.fd(), &ev) == -1) {
+        PME_LOG_ERROR(log_, "epoll_ctl failed: " << strerror(errno));
+        close(epoll_fd);
+        return;
+    }
+
+    // Event loop
+    struct epoll_event events[10];
+    while (!ctx_->stop.load()) {
+        int n = epoll_wait(epoll_fd, events, 10, 250);
+        if (n == -1 && errno != EINTR) {
+            PME_LOG_ERROR(log_, "epoll_wait failed: " << strerror(errno));
+            break;
+        }
+        
+        for (int i = 0; i < n; ++i) {
+            if (events[i].data.fd == watcher_.fd()) {
+                watcher_.handle();
+            }
+        }
+    }
+
+    close(epoll_fd);
+}
+
+void Discovery::onEvent(std::string_view filename, uint32_t mask) {
+    std::filesystem::path path = filename;
+    if (path.extension() != ".pcap") return;
+    
+    // Only care about completed writes or moves
+    if (mask & (IN_CLOSE_WRITE | IN_MOVED_TO)) {
+        queue_.push((std::filesystem::path(discovery_dir_path_) / filename).string());
+    }
+}
