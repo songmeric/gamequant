@@ -499,3 +499,52 @@ private:
     uint64_t last_udpseq_ {0};
     static px::Log* getLogger();
 };
+
+
+#include <sys/inotify.h>
+#include <unistd.h>
+#include <iostream>
+#include <cerrno>
+#include <cstring>
+
+int main() {
+    std::cout << "Testing inotify_init1..." << std::endl;
+    
+    // Try without any flags first
+    int fd1 = inotify_init();
+    std::cout << "inotify_init() returned: " << fd1;
+    if (fd1 == -1) {
+        std::cout << " (errno: " << errno << " - " << strerror(errno) << ")";
+    }
+    std::cout << std::endl;
+    if (fd1 != -1) close(fd1);
+    
+    // Try with flags
+    int fd2 = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
+    std::cout << "inotify_init1(IN_NONBLOCK | IN_CLOEXEC) returned: " << fd2;
+    if (fd2 == -1) {
+        std::cout << " (errno: " << errno << " - " << strerror(errno) << ")";
+    }
+    std::cout << std::endl;
+    if (fd2 != -1) close(fd2);
+    
+    // Try with just IN_CLOEXEC
+    int fd3 = inotify_init1(IN_CLOEXEC);
+    std::cout << "inotify_init1(IN_CLOEXEC) returned: " << fd3;
+    if (fd3 == -1) {
+        std::cout << " (errno: " << errno << " - " << strerror(errno) << ")";
+    }
+    std::cout << std::endl;
+    if (fd3 != -1) close(fd3);
+    
+    // Try with 0 flags
+    int fd4 = inotify_init1(0);
+    std::cout << "inotify_init1(0) returned: " << fd4;
+    if (fd4 == -1) {
+        std::cout << " (errno: " << errno << " - " << strerror(errno) << ")";
+    }
+    std::cout << std::endl;
+    if (fd4 != -1) close(fd4);
+    
+    return 0;
+}
