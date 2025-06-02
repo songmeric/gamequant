@@ -548,3 +548,136 @@ int main() {
     
     return 0;
 }
+
+
+#include "Watcher.h"
+#include "Log.h"
+#include <array>
+#include <filesystem>
+#include <stdexcept>
+#include <unistd.h>
+#include <sys/inotify.h>
+#include <cerrno>
+#include <cstring>
+#include <vector>
+#include <fcntl.h>  // for fcntl
+#include <sys/resource.h>  // for getrlimit
+#include <fstream>
+
+Watcher::Watcher(std::string dir, CB cb)
+    : dir_(std::move(dir)), cb_(std::move(cb))
+{
+    if(!std::filesystem::is_directory(dir_))
+    {
+        PME_LOG_FATAL(PME_GET_LOGGER("Watcher"), "NOT A DIRECTORY: " << dir_);
+        throw std::runtime_error("not a directory: " + dir_);
+    }
+    
+    // Debug: Check system limits and current FD usage
+    struct rlimit rlim;
+    if (getrlimit(RLIMIT_NOFILE, &rlim) == 0) {
+        PME_LOG_INFO(PME_GET_LOGGER("Watcher"), "File descriptor limits - soft: " << rlim.rlim_cur << ", hard: " << rlim.rlim_max);
+    }
+    
+    // Count open file descriptors
+    int fd_count = 0;
+    std::string fd_dir = "/proc/self/fd";
+    try {
+        for (const auto& entry : std::filesystem::directory_iterator(fd_dir)) {
+            fd_count++;
+        }
+        PME_LOG_INFO(PME_GET_LOGGER("Watcher"), "Current open file descriptors: " << fd_count);
+    } catch (...) {
+        PME_LOG_WARN(PME_GET_LOGGER("Watcher"), "Could not count file descriptors");
+    }
+    
+    // Debug: print flag values
+    PME_LOG_INFO(PME_GET_LOGGER("Watcher"), "IN_NONBLOCK = " << std::hex << IN_NONBLOCK << ", IN_CLOEXEC = " << std::hex << IN_CLOEXEC);
+    PME_LOG_INFO(PME_GET_LOGGER("Watcher"), "Combined flags = " << std::hex << (IN_NONBLOCK | IN_CLOEXEC));
+    
+    // Save errno before any other calls
+    errno = 0;
+    fd_ = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
+    int saved_errno = errno;
+    
+    PME_LOG_INFO(PME_GET_LOGGER("Watcher"), "inotify_init1 returned fd=" << fd_ << ", errno=" << saved_errno << " (" << strerror(saved_errno) << ")");
+    
+    if(fd_==-1)
+    {
+        PME_LOG_WARN(PME_GET_LOGGER("Watcher"), "inotify_init1 failed with errno " << saved_errno << ": " << strerror(saved_errno) << ", trying inotify_init");
+        
+        // Fallback to inotify_init
+        errno = 0;
+        fd_ = inotify_init();
+        saved_errno = errno;
+        
+        PME_LOG_INFO(PME_GET_LOGGER("Watcher"), "inotify_init returned fd=" << fd_ << ", errno=" << saved_errno);
+        
+        if(fd_ != -1) {
+            // Set flags manually
+            int flags = fcntl(fd_, F_GETFL);
+            fcntl(fd_, F_SETFL, flags | O_NONBLOCK);
+            fcntl(fd_, F_SETFD, FD_CLOEXEC);
+            PME_LOG_INFO(PME_GET_LOGGER("Watcher"), "inotify_init succeeded, fd = " << fd_ << ", flags set manually");
+        } else {
+            PME_LOG_FATAL(PME_GET_LOGGER("Watcher"), "Both inotify_init1 and inotify_init failed: " << strerror(saved_errno));
+            throw std::runtime_error("inotify initialization failed: " + std::string(strerror(saved_errno)));
+        }
+    }
+    
+    uint32_t watch_mask = IN_CREATE | IN_MOVED_TO | IN_CLOSE_WRITE;
+    wd_ = inotify_add_watch(fd_, dir_.c_str(), watch_mask);
+    if(wd_==-1)
+    {
+        PME_LOG_FATAL(PME_GET_LOGGER("Watcher"), "add_watch failed for " << dir_ << ": " << strerror(errno));
+        throw std::runtime_error("add_watch failed: " + std::string(strerror(errno)));
+    }
+}
+
+Watcher::~Watcher()
+{
+    if(fd_ != -1) {
+        if (wd_ != -1) {
+            inotify_rm_watch(fd_, wd_);
+        }
+        close(fd_);
+    }
+}
+
+void Watcher::handle()
+{
+    if (fd_ == -1) return;
+
+    char buffer[4096] __attribute__ ((aligned(__alignof__(struct inotify_event))));
+    ssize_t bytes_read;
+
+    while (true) {
+        bytes_read = read(fd_, buffer, sizeof(buffer));
+
+        if (bytes_read == -1) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                break;
+            } else if (errno == EINTR) {
+                continue;
+            } else {
+                return;
+            }
+        }
+
+        if (bytes_read == 0) {
+            break;
+        }
+
+        for (char* p = buffer; p < buffer + bytes_read; ) {
+            struct inotify_event* event = reinterpret_cast<struct inotify_event*>(p);
+
+            if (event->mask & (IN_CREATE | IN_MOVED_TO | IN_CLOSE_WRITE)) {
+                if (event->len > 0) {
+                    cb_(event->name, event->mask);
+                } else {
+                }
+            }
+            p += sizeof(struct inotify_event) + event->len;
+        }
+    }
+}
