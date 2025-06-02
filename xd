@@ -760,3 +760,240 @@ private:
     px::Log* log_;
 };
 
+
+
+#include "Discovery.h"
+#include <unistd.h> // For close()
+#include <sys/epoll.h> // For epoll functions
+#include <filesystem> // For path manipulation
+#include <chrono> // for std::chrono
+#include <thread> // for std::this_thread::sleep_for
+#include <cerrno> // for errno
+#include <cstring> // For strerror
+
+// Discovery Constructor (check watcher fd)
+Discovery::Discovery(std::string dir, FileQueue& q, px::Log* engine_logger, std::shared_ptr<RuntimeContext> ctx)
+    : watcher_(dir, [this](std::string_view name, uint32_t mask) { onEvent(name, mask); }),
+      queue_(q),
+      log_(engine_logger), // Use the passed logger, or create a specific one if desired
+      discovery_dir_path_(std::move(dir)), // Store the directory path
+      ctx_(ctx)
+{
+    PME_LOG_INFO(log_, "Discovery instance for directory: " << discovery_dir_path_);
+    if (watcher_.fd() < 0) {
+        // Watcher constructor failed to initialize inotify.
+        // This instance of Discovery is now in a bad state.
+        // The run() method will check fd() and refuse to start.
+        PME_LOG_ERROR(log_, "Watcher initialization failed for directory: " << discovery_dir_path_ << ". Discovery will not run.");
+    }
+}
+
+struct FileAttributes {
+    std::filesystem::file_time_type last_write_time;
+    std::uintmax_t file_size;
+    bool exists = false;
+};
+
+FileAttributes get_file_attributes(const std::filesystem::path& p, px::Log* logger) {
+    FileAttributes attrs;
+    try {
+        if (std::filesystem::exists(p) && std::filesystem::is_regular_file(p)) {
+            attrs.last_write_time = std::filesystem::last_write_time(p);
+            attrs.file_size = std::filesystem::file_size(p);
+            attrs.exists = true;
+        }
+    } catch (const std::filesystem::filesystem_error& e) {
+        PME_LOG_WARN(logger, "Error getting attributes for file " << p.string() << ": " << e.what());
+        attrs.exists = false; // Treat as non-existent or problematic
+    }
+    return attrs;
+}
+
+void Discovery::run() {
+    if (watcher_.fd() < 0) {
+        PME_LOG_ERROR(log_, "Watcher FD is invalid for dir '" << discovery_dir_path_ << "'. Discovery run loop cannot start.");
+        return; // Indicate failure to Engine
+    }
+
+    const std::chrono::milliseconds initial_scan_stability_delay(1500); // Configurable: e.g., 1.5 seconds
+
+    PME_LOG_INFO(log_, "Performing initial scan of directory: " << discovery_dir_path_ << " (stability delay: " << initial_scan_stability_delay.count() << "ms)");
+    try {
+        if (std::filesystem::exists(discovery_dir_path_) && std::filesystem::is_directory(discovery_dir_path_)) {
+            std::vector<std::filesystem::path> initial_pcap_files;
+            for (const auto& entry : std::filesystem::directory_iterator(discovery_dir_path_)) {
+                if (ctx_->stop.load()) {
+                    PME_LOG_INFO(log_, "Shutdown signaled during initial scan directory listing of " << discovery_dir_path_ << ", aborting scan.");
+                    return; // Normal shutdown, not an error for discovery itself
+                }
+                if (entry.is_regular_file() && entry.path().extension() == ".pcap") {
+                    initial_pcap_files.push_back(entry.path());
+                }
+            }
+
+            for (const auto& pcap_path : initial_pcap_files) {
+                if (ctx_->stop.load()) {
+                    PME_LOG_INFO(log_, "Shutdown signaled during initial scan stability check of " << discovery_dir_path_ << ", aborting scan.");
+                    return; // Normal shutdown, not an error for discovery itself
+                }
+
+                FileAttributes attrs1 = get_file_attributes(pcap_path, log_);
+                if (!attrs1.exists) continue;
+
+                PME_LOG_TRACE(log_, "Initial scan: First check for " << pcap_path.string() << ": size=" << attrs1.file_size << ", time=" << attrs1.last_write_time.time_since_epoch().count());
+
+                std::this_thread::sleep_for(initial_scan_stability_delay);
+
+                FileAttributes attrs2 = get_file_attributes(pcap_path, log_);
+                if (!attrs2.exists) { // File might have been deleted during sleep
+                    PME_LOG_INFO(log_, "Initial scan: File " << pcap_path.string() << " deleted during stability check.");
+                    continue;
+                }
+
+                PME_LOG_TRACE(log_, "Initial scan: Second check for " << pcap_path.string() << ": size=" << attrs2.file_size << ", time=" << attrs2.last_write_time.time_since_epoch().count());
+
+                if (attrs1.file_size == attrs2.file_size && attrs1.last_write_time == attrs2.last_write_time) {
+                    PME_LOG_INFO(log_, "Found stable pre-existing PCAP file during scan: " << pcap_path.string() << ". Enqueuing.");
+                    queue_.push(pcap_path.string());
+                } else {
+                    PME_LOG_INFO(log_, "Pre-existing PCAP file " << pcap_path.string() << " appears unstable or recently modified. Skipping enqueue. Will rely on inotify events.");
+                }
+            }
+        } else {
+            PME_LOG_ERROR(log_, "Directory '" << discovery_dir_path_ << "' does not exist or is not a directory during initial scan.");
+            // This could be considered a failure for this discovery instance.
+            return;
+        }
+    } catch (const std::filesystem::filesystem_error& e) {
+        PME_LOG_ERROR(log_, "Filesystem error during initial scan of " << discovery_dir_path_ << ": " << e.what() << ". Aborting discovery for this directory.");
+        return; // Indicate failure
+    }
+    PME_LOG_INFO(log_, "Initial scan of directory " << discovery_dir_path_ << " complete.");
+
+    // Setup epoll after the initial scan
+    int epoll_fd = epoll_create1(EPOLL_CLOEXEC);
+    if (epoll_fd == -1) {
+        PME_LOG_ERROR(log_, "epoll_create1 failed for dir '" << discovery_dir_path_ << "': " << strerror(errno));
+        return;
+    }
+
+    struct epoll_event ev;
+    ev.events = EPOLLIN;
+    ev.data.fd = watcher_.fd();
+    if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, watcher_.fd(), &ev) == -1) {
+        PME_LOG_ERROR(log_, "epoll_ctl ADD failed for dir '" << discovery_dir_path_ << "': " << strerror(errno));
+        close(epoll_fd);
+        return;
+    }
+
+    PME_LOG_INFO(log_, "Discovery run loop (event monitoring) starting for directory: " << discovery_dir_path_);
+    constexpr int MAX_EVENTS = 10;
+    struct epoll_event events[MAX_EVENTS];
+    bool success = true;
+
+    while (!ctx_->stop.load()) {
+        int nfds = epoll_wait(epoll_fd, events, MAX_EVENTS, 250);
+
+        if (nfds == -1) {
+            if (errno == EINTR) {
+                continue;
+            }
+            PME_LOG_ERROR(log_, "epoll_wait failed for dir '" << discovery_dir_path_ << "': " << strerror(errno));
+            success = false;
+            break;
+        }
+
+        for (int n = 0; n < nfds; ++n) {
+            if (events[n].data.fd == watcher_.fd()) {
+                watcher_.handle();
+            }
+        }
+    }
+
+    if (success) {
+        PME_LOG_INFO(log_, "Discovery run loop for dir '" << discovery_dir_path_ << "' finished (event monitoring ended. Success: " << success << ").");
+    } else {
+        PME_LOG_ERROR(log_, "Discovery run loop for dir '" << discovery_dir_path_ << "' finished due to an error (Success: " << success << ").");
+    }
+
+    close(epoll_fd);
+}
+
+// Updated onEvent callback
+void Discovery::onEvent(std::string_view filename_sv, uint32_t event_mask) {
+    std::filesystem::path fs_filename = filename_sv;
+    std::filesystem::path full_path = std::filesystem::path(discovery_dir_path_) / fs_filename;
+    std::string full_path_str = full_path.string();
+
+    // Filter by .pcap extension. This is a common requirement.
+    if (fs_filename.extension() != ".pcap") {
+        PME_LOG_TRACE(log_, "Ignoring non-pcap file event mask " << event_mask << " for '" << full_path_str << "'");
+        return;
+    }
+
+    if (event_mask & IN_CLOSE_WRITE) {
+        PME_LOG_INFO(log_, "PCAP file closed after write (IN_CLOSE_WRITE): '" << full_path_str << "'. Enqueuing.");
+        queue_.push(std::move(full_path_str));
+    } else if (event_mask & IN_MOVED_TO) {
+        PME_LOG_INFO(log_, "PCAP file moved into directory (IN_MOVED_TO): '" << full_path_str << "'. Enqueuing.");
+        queue_.push(std::move(full_path_str));
+    } else if (event_mask & IN_CREATE) {
+        PME_LOG_INFO(log_, "PCAP file created (IN_CREATE): '" << full_path_str << "'. Waiting for IN_CLOSE_WRITE or IN_MOVED_TO.");
+        // Do not enqueue on IN_CREATE alone for this use case.
+    } else {
+        PME_LOG_TRACE(log_, "Other subscribed inotify event (" << event_mask << ") for PCAP file '" << full_path_str << "'");
+    }
+}
+
+
+Watcher.cpp
+
+#include "Watcher.h"
+#include <filesystem>
+#include <stdexcept>
+#include <unistd.h>
+#include <sys/inotify.h>
+#include <cerrno>
+#include <cstring>
+
+Watcher::Watcher(std::string dir, CB cb)
+    : dir_(std::move(dir)), cb_(std::move(cb))
+{
+    if (!std::filesystem::is_directory(dir_))
+        throw std::runtime_error("not a directory: " + dir_);
+    
+    fd_ = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
+    if (fd_ == -1)
+        throw std::runtime_error("inotify_init1: " + std::string(strerror(errno)));
+    
+    wd_ = inotify_add_watch(fd_, dir_.c_str(), IN_CREATE | IN_MOVED_TO | IN_CLOSE_WRITE);
+    if (wd_ == -1)
+        throw std::runtime_error("inotify_add_watch: " + std::string(strerror(errno)));
+}
+
+Watcher::~Watcher()
+{
+    if (fd_ != -1) {
+        if (wd_ != -1) inotify_rm_watch(fd_, wd_);
+        close(fd_);
+    }
+}
+
+void Watcher::handle()
+{
+    char buffer[4096] __attribute__((aligned(__alignof__(struct inotify_event))));
+    
+    while (auto len = read(fd_, buffer, sizeof(buffer))) {
+        if (len == -1) {
+            if (errno == EAGAIN || errno == EINTR) break;
+            return;
+        }
+        
+        for (char* p = buffer; p < buffer + len; ) {
+            auto* event = reinterpret_cast<struct inotify_event*>(p);
+            if (event->len > 0 && (event->mask & (IN_CREATE | IN_MOVED_TO | IN_CLOSE_WRITE)))
+                cb_(event->name, event->mask);
+            p += sizeof(struct inotify_event) + event->len;
+        }
+    }
+}
