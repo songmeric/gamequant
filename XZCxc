@@ -1,0 +1,353 @@
+DROPCOPYHANDLERTEST
+
+#include "gtest/gtest.h"
+#include "../src/DropcopyHandler.h"
+#include <fstream>
+#include <filesystem>
+#include <chrono>
+
+class DropcopyHandlerTest : public ::testing::Test {
+protected:
+    void SetUp() override {
+        // Create temporary directory for test files
+        test_dir_ = std::filesystem::temp_directory_path() / "dropcopy_test";
+        std::filesystem::create_directories(test_dir_);
+    }
+
+    void TearDown() override {
+        // Clean up test files
+        std::filesystem::remove_all(test_dir_);
+    }
+
+    void CreateTestFile(const std::string& filename, const std::string& content) {
+        std::ofstream file(test_dir_ / filename);
+        file << content;
+        file.close();
+    }
+
+    std::filesystem::path test_dir_;
+};
+
+// Test timestamp parsing
+TEST_F(DropcopyHandlerTest, ParseTimestampValid) {
+    DropcopyHandler handler("");
+    
+    // Test full nanosecond precision
+    uint64_t result = handler.parseTimestamp("2024-01-15 14:30:45.123456789");
+    
+    // Verify the result (you may need to adjust expected value)
+    // This is 2024-01-15 14:30:45.123456789 UTC in nanoseconds since epoch
+    EXPECT_GT(result, 0);
+    
+    // Test with fewer nanoseconds
+    uint64_t result2 = handler.parseTimestamp("2024-01-15 14:30:45.123");
+    EXPECT_GT(result2, 0);
+    
+    // Test without nanoseconds
+    uint64_t result3 = handler.parseTimestamp("2024-01-15 14:30:45");
+    EXPECT_GT(result3, 0);
+}
+
+TEST_F(DropcopyHandlerTest, ParseTimestampEdgeCases) {
+    DropcopyHandler handler("");
+    
+    // Test epoch time
+    uint64_t epoch = handler.parseTimestamp("1970-01-01 00:00:00");
+    EXPECT_EQ(epoch, 0);
+    
+    // Test invalid format should return 0
+    uint64_t invalid = handler.parseTimestamp("invalid-timestamp");
+    EXPECT_EQ(invalid, 0);
+}
+
+// Test key-value parsing
+TEST_F(DropcopyHandlerTest, ParseKeyValue) {
+    DropcopyHandler handler("");
+    
+    std::string_view text = "key1=value1, key2='quoted value', key3=123";
+    size_t pos = 0;
+    
+    auto [k1, v1] = handler.parseKV(text, pos);
+    EXPECT_EQ(k1, "key1");
+    EXPECT_EQ(v1, "value1");
+    
+    auto [k2, v2] = handler.parseKV(text, pos);
+    EXPECT_EQ(k2, "key2");
+    EXPECT_EQ(v2, "'quoted value'");
+    
+    auto [k3, v3] = handler.parseKV(text, pos);
+    EXPECT_EQ(k3, "key3");
+    EXPECT_EQ(v3, "123");
+}
+
+// Test full file parsing
+TEST_F(DropcopyHandlerTest, ParseDropcopyFile) {
+    std::string test_content = R"(
+2024-01-15 14:30:45.123 [INFO] Order placed: clordid = 12345 , latency_stats = {event_type=QUOTE, md_seq_num=100, md_feed_name='FEED1', exch_seq_num=200, before_md_recv=2024-01-15 14:30:45.100000000, after_md_recv=2024-01-15 14:30:45.101000000}
+2024-01-15 14:30:46.456 [INFO] Order placed: clordid = 67890 , latency_stats = {event_type=TRADE, md_seq_num=101, md_feed_name='FEED2', exch_seq_num=201, before_md_recv=2024-01-15 14:30:46.400000000, after_md_recv=2024-01-15 14:30:46.401000000}
+)";
+    
+    CreateTestFile("test_dropcopy.log", test_content);
+    
+    DropcopyHandler handler((test_dir_ / "test_dropcopy.log").string());
+    auto map = handler.getMapRef();
+    
+    EXPECT_EQ(map.size(), 2);
+    
+    // Check first entry
+    auto it1 = map.find(12345);
+    ASSERT_NE(it1, map.end());
+    EXPECT_EQ(it1->second.event_type, "QUOTE");
+    EXPECT_EQ(it1->second.md_seq_num, 100);
+    EXPECT_EQ(it1->second.md_feed_name, "FEED1");
+    
+    // Check second entry
+    auto it2 = map.find(67890);
+    ASSERT_NE(it2, map.end());
+    EXPECT_EQ(it2->second.event_type, "TRADE");
+    EXPECT_EQ(it2->second.md_seq_num, 101);
+    EXPECT_EQ(it2->second.md_feed_name, "FEED2");
+}
+
+// Test empty file
+TEST_F(DropcopyHandlerTest, ParseEmptyFile) {
+    CreateTestFile("empty.log", "");
+    
+    DropcopyHandler handler((test_dir_ / "empty.log").string());
+    auto map = handler.getMapRef();
+    
+    EXPECT_TRUE(map.empty());
+}
+
+// Test malformed entries
+TEST_F(DropcopyHandlerTest, ParseMalformedEntries) {
+    std::string test_content = R"(
+This is not a valid line
+clordid = not_a_number , latency_stats = {event_type=QUOTE}
+2024-01-15 14:30:45.123 [INFO] Order placed: clordid = 12345 , latency_stats = {malformed
+)";
+    
+    CreateTestFile("malformed.log", test_content);
+    
+    DropcopyHandler handler((test_dir_ / "malformed.log").string());
+    auto map = handler.getMapRef();
+    
+    // Should skip malformed entries
+    EXPECT_EQ(map.size(), 0);
+} 
+
+
+
+
+
+FILEQUEUETEST
+
+
+
+
+
+#include "gtest/gtest.h"
+#include "gmock/gmock.h"
+#include "../src/FileQueue.h" // Adjust path as needed
+#include "../src/ShutdownUtils.h" // For the real g_shutdownRequested or a mockable version
+
+// Mocking rigtorp::MPMCQueue is complex. For these tests, we use the real one
+// and focus on the FileQueue wrapper logic (blocking, shutdown).
+
+// --- Test Fixture for FileQueue ---
+class FileQueueTest : public ::testing::Test {
+protected:
+    // Global shutdown flag for testing purposes.
+    // In a real test setup, you might link a test-specific ShutdownUtils.cpp
+    // or have a more sophisticated way to control this.
+    static std::atomic<bool> test_shutdown_requested_flag;
+
+    FileQueue* fq;
+    const size_t test_capacity = 3;
+
+    void SetUp() override {
+        // Override the global shutdown flag for testing
+        shutdown::g_shutdownRequested.store(false, std::memory_order_relaxed); // Ensure it's false initially
+        fq = new FileQueue(test_capacity);
+    }
+
+    void TearDown() override {
+        delete fq;
+        shutdown::g_shutdownRequested.store(false, std::memory_order_relaxed); // Reset for next test
+    }
+
+    // Helper to push items in a separate thread
+    void threaded_push(const std::string& item, int delay_ms = 0) {
+        if (delay_ms > 0) std::this_thread::sleep_for(std::chrono::milliseconds(delay_ms));
+        fq->push(item);
+    }
+
+    // Helper to pop items in a separate thread
+    bool threaded_pop(std::string& out_item, int delay_ms = 0, int timeout_ms = 1000) {
+        if (delay_ms > 0) std::this_thread::sleep_for(std::chrono::milliseconds(delay_ms));
+        
+        std::promise<bool> pop_promise;
+        std::future<bool> pop_future = pop_promise.get_future();
+        std::thread t([this, &out_item, &pop_promise](){
+            pop_promise.set_value(fq->pop(out_item));
+        });
+
+        auto status = pop_future.wait_for(std::chrono::milliseconds(timeout_ms));
+        bool result = false;
+        if (status == std::future_status::ready) {
+            result = pop_future.get();
+        }
+        // ensure thread t completes before stack unwinds in case of timeout
+        if (t.joinable()) t.join(); 
+        return result;
+    }
+};
+
+// Define the static member for the test fixture if you use it as above
+// std::atomic<bool> FileQueueTest::test_shutdown_requested_flag{false};
+// This approach of directly overriding g_shutdownRequested is a bit hacky.
+// A better way would be to inject the shutdown check callable into FileQueue.
+// For now, we assume direct control over the actual shutdown::g_shutdownRequested.
+
+TEST_F(FileQueueTest, PushAndPopSingleItem) {
+    fq->push("item1");
+    std::string item_out;
+    ASSERT_TRUE(fq->pop(item_out));
+    ASSERT_EQ(item_out, "item1");
+}
+
+TEST_F(FileQueueTest, PopBlocksUntilItemPushed) {
+    std::string item_out;
+    std::thread producer_thread(&FileQueueTest::threaded_push, this, "item_delayed", 100);
+    
+    ASSERT_TRUE(fq->pop(item_out)); // This should block until producer pushes
+    ASSERT_EQ(item_out, "item_delayed");
+    producer_thread.join();
+}
+
+TEST_F(FileQueueTest, PushBlocksWhenFull) {
+    fq->push("item1");
+    fq->push("item2");
+    fq->push("item3"); // Queue is now full (capacity 3)
+
+    std::promise<void> push_promise;
+    std::future<void> push_future = push_promise.get_future();
+
+    std::thread blocked_pusher([this, &push_promise](){
+        fq->push("item4_blocked"); // This should block
+        push_promise.set_value();
+    });
+
+    // Check that it hasn't completed immediately
+    auto status = push_future.wait_for(std::chrono::milliseconds(50));
+    ASSERT_EQ(status, std::future_status::timeout); 
+
+    // Pop an item to make space
+    std::string temp;
+    fq->pop(temp);
+
+    // Now the blocked pusher should complete
+    status = push_future.wait_for(std::chrono::milliseconds(100));
+    ASSERT_EQ(status, std::future_status::ready);
+
+    blocked_pusher.join();
+    // Verify item4 was indeed pushed after space was made
+    fq->pop(temp); ASSERT_EQ(temp, "item4_blocked");
+}
+
+TEST_F(FileQueueTest, PopReturnsFalseOnShutdownWhenEmpty) {
+    shutdown::g_shutdownRequested.store(true, std::memory_order_relaxed);
+    fq->wakeAll(); // Ensure any waiting pop unblocks
+
+    std::string item_out;
+    // Use threaded_pop to avoid main test thread blocking indefinitely if logic is wrong
+    ASSERT_FALSE(threaded_pop(item_out, 0, 50)); 
+}
+
+TEST_F(FileQueueTest, PopReturnsTrueOnShutdownWhenNotEmpty) {
+    fq->push("item_before_shutdown");
+    shutdown::g_shutdownRequested.store(true, std::memory_order_relaxed);
+    fq->wakeAll();
+
+    std::string item_out;
+    ASSERT_TRUE(fq->pop(item_out));
+    ASSERT_EQ(item_out, "item_before_shutdown");
+
+    // Subsequent pop on empty queue during shutdown should fail
+    ASSERT_FALSE(threaded_pop(item_out, 0, 50));
+}
+
+TEST_F(FileQueueTest, PushDoesNotBlockAndReturnsOnShutdown) {
+    fq->push("item1");
+    fq->push("item2");
+    fq->push("item3"); // Full
+
+    shutdown::g_shutdownRequested.store(true, std::memory_order_relaxed);
+    fq->wakeAll(); // Wake up any pushers potentially stuck on not_full
+
+    std::thread pusher_thread([this](){
+        fq->push("item_after_shutdown_signal"); // Should not block indefinitely, should return due to shutdown
+    });
+    
+    // Give thread a moment to run and potentially block/return
+    // This test is a bit tricky because push() returns void.
+    // We are testing that it doesn't deadlock.
+    // A better FileQueue::push could return bool or throw on shutdown condition.
+    pusher_thread.join(); // If it deadlocks, test will hang here.
+    // We can't easily verify if "item_after_shutdown_signal" was pushed or not without changing push's signature
+    // or checking queue size, but the main goal is no deadlock.
+    ASSERT_TRUE(true); // If join completes, it didn't deadlock.
+}
+
+TEST_F(FileQueueTest, WakeAllUnblocksPop) {
+    std::string item_out;
+    std::atomic<bool> pop_returned(false);
+    std::thread t_pop([&](){
+        fq->pop(item_out);
+        pop_returned.store(true);
+    });
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(50)); // Let pop block
+    ASSERT_FALSE(pop_returned.load());
+
+    fq->wakeAll();
+    std::this_thread::sleep_for(std::chrono::milliseconds(50)); 
+    // Pop will still be blocked if shutdown not requested & queue empty
+    // To properly test wakeAll effect on pop for shutdown, shutdown must be true
+    ASSERT_FALSE(pop_returned.load());
+
+    shutdown::g_shutdownRequested.store(true);
+    fq->wakeAll();
+    t_pop.join(); // Should join quickly now
+    ASSERT_TRUE(pop_returned.load());
+}
+
+TEST_F(FileQueueTest, WakeAllUnblocksPush) {
+    fq->push("1"); fq->push("2"); fq->push("3"); // Fill queue
+    std::atomic<bool> push_returned(false);
+
+    std::thread t_push([&](){
+        fq->push("4"); // This will block
+        push_returned.store(true);
+    });
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    ASSERT_FALSE(push_returned.load());
+
+    fq->wakeAll();
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    ASSERT_FALSE(push_returned.load()); // Still blocked if no shutdown and no space
+
+    shutdown::g_shutdownRequested.store(true);
+    fq->wakeAll(); 
+    t_push.join(); // Should join quickly
+    ASSERT_TRUE(push_returned.load());
+}
+
+// Main function for running tests (if compiling this file standalone for tests)
+// int main(int argc, char **argv) {
+//     ::testing::InitGoogleTest(&argc, argv);
+//     return RUN_ALL_TESTS();
+// } 
+
+
