@@ -1,0 +1,186 @@
+cmake_minimum_required(VERSION 3.25)
+project(pme 
+    VERSION 1.0.0
+    DESCRIPTION "Packet Matching Engine"
+    LANGUAGES CXX
+)
+
+# =============================================================================
+# Build Configuration
+# =============================================================================
+
+list(APPEND CMAKE_MODULE_PATH /opt/sp/cmake/2.25/modules/)
+include(Functions)
+add_compile_options(-Wall -Wno-interference-size)
+
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+
+if(NOT CMAKE_BUILD_TYPE)
+    set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
+endif()
+
+# =============================================================================
+# Dependencies
+# =============================================================================
+
+# --- PcapPlusPlus (local install)
+set(PCPP_ROOT "$ENV{HOME}/pcpp-install" CACHE PATH "PcapPlusPlus install root")
+set(PCPP_INCLUDE_DIR "${PCPP_ROOT}/include/pcapplusplus")
+set(PCPP_LIB_DIR     "${PCPP_ROOT}/lib64")
+set(CMAKE_PREFIX_PATH "${PCPP_ROOT}")
+find_package(PcapPlusPlus REQUIRED)
+
+# --- MPMC Queue
+set(MPMC_INCLUDE_DIR "$ENV{HOME}/pme/externals/MPMCQueue/include/rigtorp")
+
+# --- Boost
+set(BOOST_VERSION 1.60.0)
+sp_find_package(Boost ${BOOST_VERSION})
+
+# --- SP Application Framework
+set(SPAPP_VERSION 31)
+include(/opt/sp/spapp/${SPAPP_VERSION}/cmake/init.cmake)
+set(RAZEAPI_VERSION 3.24.2)
+set(MD_API_VERSION 1.606)
+sp_find_package(razeapi ${RAZEAPI_VERSION} NODEPEND)
+sp_find_package(md_api ${MD_API_VERSION} USEDEFAULTDEPENDCOMPONENTS)
+
+# --- GoogleTest (for tests)
+find_package(GTest REQUIRED)
+
+# =============================================================================
+# Source Files
+# =============================================================================
+
+# Core library sources (reusable components)
+set(PME_CORE_SOURCES
+    src/Discovery.cpp
+    src/DropcopyHandler.cpp
+    src/Engine.cpp
+    src/PacketProcessor.cpp
+    src/Watcher.cpp
+    util/ShutdownUtils.cpp
+)
+
+set(PME_CORE_HEADERS
+    src/Constants.h
+    src/Discovery.h
+    src/DropcopyHandler.h
+    src/Engine.h
+    src/FileQueue.h
+    src/MPMCQueue.h
+    src/Options.h
+    src/OutputFileWriter.h
+    src/PacketProcessor.h
+    src/RuntimeContext.h
+    src/Watcher.h
+    util/ShutdownUtils.h
+)
+
+# Application-specific sources
+set(PME_APP_SOURCES
+    src/main.cpp
+)
+
+set(PME_APP_HEADERS  
+    src/Cli.h
+)
+
+# Test sources
+set(PME_TEST_SOURCES
+    tests/DropcopyHandler_test.cpp
+    tests/FileQueue_test.cpp
+)
+
+# =============================================================================
+# Interface Library for Common Dependencies
+# =============================================================================
+
+add_library(pme_deps INTERFACE)
+target_link_libraries(pme_deps INTERFACE
+    PcapPlusPlus::Pcap++
+    PcapPlusPlus::Common++
+    PcapPlusPlus::Packet++
+    spapp_logging
+    spapp_app
+    boost_program_options-mt
+)
+target_include_directories(pme_deps INTERFACE
+    "${PCPP_INCLUDE_DIR}"
+    "${MPMC_INCLUDE_DIR}"
+)
+target_compile_features(pme_deps INTERFACE cxx_std_20)
+
+# =============================================================================
+# Core Library Target
+# =============================================================================
+
+add_library(pme_core ${PME_CORE_SOURCES} ${PME_CORE_HEADERS})
+target_include_directories(pme_core PUBLIC 
+    src 
+    util
+)
+target_link_libraries(pme_core PUBLIC pme_deps)
+
+# Make headers available for IDE
+set_target_properties(pme_core PROPERTIES
+    PUBLIC_HEADER "${PME_CORE_HEADERS}"
+)
+
+# =============================================================================
+# Main Executable Target
+# =============================================================================
+
+add_executable(pme ${PME_APP_SOURCES} ${PME_APP_HEADERS})
+target_include_directories(pme PRIVATE src util)
+target_link_libraries(pme PRIVATE
+    pme_core
+    pme_deps
+    spapp_app_cmdlne
+)
+
+# Make headers available for IDE
+set_target_properties(pme PROPERTIES
+    PRIVATE_HEADER "${PME_APP_HEADERS}"
+)
+
+# =============================================================================
+# Tests (Optional)
+# =============================================================================
+
+option(PME_ENABLE_TESTS "Build unit tests" ON)
+
+if(PME_ENABLE_TESTS)
+    enable_testing()
+    
+    add_executable(pme_tests ${PME_TEST_SOURCES})
+    target_include_directories(pme_tests PRIVATE src util)
+    target_link_libraries(pme_tests PRIVATE
+        pme_core
+        pme_deps
+        spapp_app_cmdline
+        GTest::gmock
+        GTest::gtest
+        GTest::gmock_main
+    )
+    
+    # Register test with CTest
+    include(GoogleTest)
+    gtest_discover_tests(pme_tests)
+    
+    # Also add a simple test command for convenience
+    add_test(NAME all_tests COMMAND pme_tests)
+endif()
+
+# =============================================================================
+# Installation (Optional)
+# =============================================================================
+
+install(TARGETS pme pme_core
+    RUNTIME DESTINATION bin
+    LIBRARY DESTINATION lib
+    ARCHIVE DESTINATION lib
+    PUBLIC_HEADER DESTINATION include/pme
+)
