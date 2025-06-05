@@ -1,0 +1,2905 @@
+
+### FILE: CMakeLists.txt ###
+cmake_minimum_required(VERSION 3.25)
+project(pme 
+    VERSION 1.0.0
+    DESCRIPTION "Packet Matching Engine"
+    LANGUAGES CXX
+)
+
+# =============================================================================
+# Build Configuration
+# =============================================================================
+
+list(APPEND CMAKE_MODULE_PATH /opt/sp/cmake/2.25/modules/)
+include(Functions)
+add_compile_options(-Wall -Wno-interference-size)
+
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+
+if(NOT CMAKE_BUILD_TYPE)
+    set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
+endif()
+
+# =============================================================================
+# Dependencies
+# =============================================================================
+
+# --- PcapPlusPlus (local install)
+set(PCPP_ROOT "$ENV{HOME}/pcpp-install" CACHE PATH "PcapPlusPlus install root")
+set(PCPP_INCLUDE_DIR "${PCPP_ROOT}/include/pcapplusplus")
+set(PCPP_LIB_DIR     "${PCPP_ROOT}/lib64")
+set(CMAKE_PREFIX_PATH "${PCPP_ROOT}")
+find_package(PcapPlusPlus REQUIRED)
+
+# --- Boost
+set(BOOST_VERSION 1.60.0)
+sp_find_package(Boost ${BOOST_VERSION})
+
+# --- SP Application Framework
+set(SPAPP_VERSION 31)
+include(/opt/sp/spapp/${SPAPP_VERSION}/cmake/init.cmake)
+set(RAZEAPI_VERSION 3.24.2)
+set(MD_API_VERSION 1.606)
+sp_find_package(razeapi ${RAZEAPI_VERSION} NODEPEND)
+sp_find_package(md_api ${MD_API_VERSION} USEDEFAULTDEPENDCOMPONENTS)
+
+# --- GoogleTest (for tests)
+find_package(GTest REQUIRED)
+
+# --- yaml-cpp
+find_package(yaml-cpp REQUIRED)
+
+# =============================================================================
+# Source Files
+# =============================================================================
+
+# Core library sources (reusable components)
+set(PME_CORE_SOURCES
+    src/Config.cpp
+    src/DropcopyHandler.cpp
+    src/Engine.cpp
+    src/PacketProcessor.cpp
+)
+
+set(PME_CORE_HEADERS
+    src/Config.h
+    src/DropcopyHandler.h
+    src/Engine.h
+    src/OutputFileWriter.h
+    src/PacketProcessor.h
+    src/ProtocolHandlers.h
+    src/RuntimeContext.h
+)
+
+# Application-specific sources
+set(PME_APP_SOURCES
+    src/main.cpp
+)
+
+set(PME_APP_HEADERS  
+    src/Cli.h
+)
+
+# Test sources
+set(PME_TEST_SOURCES
+    tests/DropcopyHandler_test.cpp
+)
+
+# =============================================================================
+# Interface Library for Common Dependencies
+# =============================================================================
+
+add_library(pme_deps INTERFACE)
+target_link_libraries(pme_deps INTERFACE
+    PcapPlusPlus::Pcap++
+    PcapPlusPlus::Common++
+    PcapPlusPlus::Packet++
+    spapp_logging
+    spapp_app
+    boost_program_options-mt
+    yaml-cpp
+)
+target_include_directories(pme_deps INTERFACE
+    "${PCPP_INCLUDE_DIR}"
+)
+target_compile_features(pme_deps INTERFACE cxx_std_20)
+
+# =============================================================================
+# Core Library Target
+# =============================================================================
+
+add_library(pme_core ${PME_CORE_SOURCES} ${PME_CORE_HEADERS})
+target_include_directories(pme_core PUBLIC 
+    src 
+    util
+)
+target_link_libraries(pme_core PUBLIC pme_deps)
+
+# Make headers available for IDE
+set_target_properties(pme_core PROPERTIES
+    PUBLIC_HEADER "${PME_CORE_HEADERS}"
+)
+
+# =============================================================================
+# Main Executable Target
+# =============================================================================
+
+add_executable(pme ${PME_APP_SOURCES} ${PME_APP_HEADERS})
+target_include_directories(pme PRIVATE src util)
+target_link_libraries(pme PRIVATE
+    pme_core
+    pme_deps
+    spapp_app_cmdlne
+)
+
+# =============================================================================
+# Tests (Optional)
+# =============================================================================
+
+option(PME_ENABLE_TESTS "Build unit tests" ON)
+
+if(PME_ENABLE_TESTS)
+    enable_testing()
+    
+    add_executable(pme_tests ${PME_TEST_SOURCES})
+    target_include_directories(pme_tests PRIVATE src util)
+    target_link_libraries(pme_tests PRIVATE
+        pme_core
+        pme_deps
+        spapp_app_cmdlne
+        GTest::gmock
+        GTest::gtest
+        GTest::gmock_main
+    )
+    
+    # Register test with CTest
+    include(GoogleTest)
+    gtest_discover_tests(pme_tests)
+    
+    # Also add a simple test command for convenience
+    add_test(NAME all_tests COMMAND pme_tests)
+endif()
+
+# =============================================================================
+# Installation (Optional)
+# =============================================================================
+
+install(TARGETS pme pme_core
+    RUNTIME DESTINATION bin
+    LIBRARY DESTINATION lib
+    ARCHIVE DESTINATION lib
+    PUBLIC_HEADER DESTINATION include/pme
+)
+### END: CMakeLists.txt ###
+
+### FILE: README_CONFIG.md ###
+# PME Configuration Guide
+
+The Packet Matching Engine (PME) now uses YAML configuration files to specify protocols and flow filters.
+
+## Usage
+
+```bash
+./pme -c config.yaml
+```
+
+## Configuration Structure
+
+### Required Sections
+
+#### `ingress_flow` - Ingress Traffic Configuration
+Defines which packets should be treated as ingress (incoming) traffic.
+- `protocol`: Protocol to use for matching packets (e.g., `spcastv3`, `spcastv4`, `raze`)
+- `src_ip`: Source IP filter (optional, empty = any)
+- `dst_ip`: Destination IP filter (optional, empty = any)  
+- `src_port`: Source port filter (optional, 0 = any)
+- `dst_port`: Destination port filter (optional, 0 = any)
+
+#### `egress_flow` - Egress Traffic Configuration
+Defines which packets should be treated as egress (outgoing) traffic.
+- `protocol`: Protocol to use for matching packets (e.g., `spcastv3`, `spcastv4`, `raze`)
+- `src_ip`: Source IP filter (optional, empty = any)
+- `dst_ip`: Destination IP filter (optional, empty = any)
+- `src_port`: Source port filter (optional, 0 = any)
+- `dst_port`: Destination port filter (optional, 0 = any)
+
+**Important**: Both TCP and UDP packets can be configured as either ingress or egress based on your network topology.
+
+#### `paths` - File Locations
+- `watch_directory`: Directory containing PCAP files to process
+- `dropcopy_file`: Path to GTAd dropcopy CSV file
+- `output_directory`: Where to write results (optional, default: ./)
+
+### Optional Section
+
+#### `settings` - Runtime Options
+- `debug_mode`: Enable debug logging (default: false)
+- `packet_yield_interval`: Yield after N packets (default: 200)
+
+## Examples
+
+### Example 1: Traditional Setup (UDP=Ingress, TCP=Egress)
+```yaml
+ingress_flow:
+  protocol: spcastv3
+  dst_ip: "224.0.0.1"      # Multicast market data
+  dst_port: 12345
+
+egress_flow:
+  protocol: raze
+  src_ip: "10.1.1.10"      # Order gateway
+  dst_port: 8080
+
+paths:
+  watch_directory: ./pcap_files
+  dropcopy_file: ./dropcopy.csv
+```
+
+### Example 2: TCP as Ingress
+Some systems might receive market data over TCP:
+```yaml
+ingress_flow:
+  protocol: raze           # Raze protocol for market data
+  dst_ip: "10.1.1.100"    # Market data server
+  dst_port: 9090
+
+egress_flow:
+  protocol: raze          # Raze protocol for orders
+  src_ip: "10.1.1.10"     # Order gateway
+  dst_port: 8080
+
+paths:
+  watch_directory: ./pcap_files
+  dropcopy_file: ./dropcopy.csv
+```
+
+### Example 3: Complex Filtering
+Process only specific flows:
+```yaml
+ingress_flow:
+  protocol: spcastv3
+  src_ip: "192.168.1.50"   # Specific source
+  dst_ip: "224.0.0.1"      # Multicast group
+  src_port: 0              # Any source port
+  dst_port: 12345          # Specific dest port
+
+egress_flow:
+  protocol: raze
+  src_ip: "10.1.1.10"      # Our order gateway
+  dst_ip: "10.1.1.20"      # Exchange server
+  src_port: 45678          # Specific source port
+  dst_port: 8080           # Exchange port
+
+paths:
+  watch_directory: /data/pcaps
+  dropcopy_file: /data/dropcopy.csv
+  output_directory: /data/output
+
+settings:
+  debug_mode: true
+  packet_yield_interval: 500
+```
+
+## How Flow Matching Works
+
+1. **Each packet is checked against both flow configurations**
+2. **If it matches `ingress_flow`**: Processed as ingress traffic using the specified protocol
+3. **If it matches `egress_flow`**: Processed as egress traffic using the specified protocol
+4. **If it matches neither**: Packet is ignored
+5. **If it matches both**: Treated as ingress (with a warning logged)
+
+## Key Points
+
+- **Protocol Independence**: Any protocol can be used for either ingress or egress
+- **Transport Flexibility**: Both TCP and UDP can be ingress or egress
+- **Precise Filtering**: Use IP addresses and ports to select exact flows
+- **Performance**: Packets are filtered early, reducing processing overhead
+
+## TCP Connection Handling
+
+For TCP connections:
+- Flow type is determined when the first data arrives
+- The entire TCP connection uses the same flow type
+- TCP reassembly is performed before protocol processing
+
+## Common Configurations
+
+### Market Data on Multicast UDP, Orders on TCP
+```yaml
+ingress_flow:
+  protocol: spcastv3
+  dst_ip: "224.0.0.0/4"    # All multicast
+  
+egress_flow:
+  protocol: raze
+  dst_port: 8080           # Order port
+```
+
+### Bi-directional TCP (Different Ports)
+```yaml
+ingress_flow:
+  protocol: raze
+  dst_port: 9090           # Market data port
+  
+egress_flow:
+  protocol: raze
+  dst_port: 8080           # Order port
+```
+
+### Filter by Source Network
+```yaml
+ingress_flow:
+  protocol: spcastv3
+  src_ip: "192.168.1.0/24" # From local network
+  
+egress_flow:
+  protocol: raze
+  dst_ip: "10.0.0.0/8"     # To corporate network
+```
+
+## Flow Filtering
+
+The configuration allows precise filtering of network flows:
+
+- **IP Filtering**: Specify exact source/destination IPs to process
+- **Port Filtering**: Filter by source/destination ports
+- **Protocol Selection**: Choose which protocol parser to use
+
+Only packets matching ALL specified criteria will be processed. Empty/zero values mean "accept any".
+
+## Adding New Protocols
+
+To add support for new protocols:
+
+1. Add the protocol handler in `src/ProtocolHandlers.h`
+2. Update validation in `src/Config.cpp` to accept the new protocol name
+3. Use the new protocol name in your configuration file
+
+See `README_PROTOCOLS.md` for detailed instructions.
+
+## Benefits
+
+- **Flexibility**: Change protocols and filters without recompiling
+- **Precision**: Process only the flows you're interested in
+- **Performance**: Skip unwanted packets early in processing
+- **Clarity**: Configuration clearly shows what's being analyzed 
+### END: README_CONFIG.md ###
+
+### FILE: README_PROTOCOLS.md ###
+# Adding New Protocols to PME
+
+The Packet Matching Engine (PME) uses a lightweight, namespace-based approach for protocol handling. All protocol logic is contained in a single header file: `src/ProtocolHandlers.h`.
+
+## Current Architecture
+
+- **ProtocolHandlers.h**: Contains all protocol handling logic in a single namespace
+- **ProtocolContext**: Lightweight struct with shared state (dropcopy map, logger, statistics)
+- **Protocol functions**: Simple inline functions in the `ProtocolHandlers` namespace
+
+## Adding a New Protocol
+
+### For UDP Protocols:
+
+1. Add a handler function in `ProtocolHandlers` namespace in `src/ProtocolHandlers.h`:
+
+```cpp
+inline std::unordered_map<uint64_t, ParsedPacketInfo> 
+handleYourProtocol(const uint8_t* payload, size_t payloadSize, 
+                   pcpp::Packet& packet, ProtocolContext& ctx) {
+    std::unordered_map<uint64_t, ParsedPacketInfo> result;
+    
+    // Your protocol parsing logic here
+    // Use ctx.log for logging
+    // Update ctx.stats.your_protocol_messages
+    // Generate hash using ProtocolContext::generateHash()
+    
+    return result;
+}
+```
+
+2. Add a case in the `processUdpPayload` switch statement:
+
+```cpp
+switch (version) {
+    case 3:
+        return handleSpcastV3(payload, payloadSize, packet, ctx);
+    case 4:
+        return handleSpcastV4(payload, payloadSize, packet, ctx);
+    case YOUR_VERSION:
+        return handleYourProtocol(payload, payloadSize, packet, ctx);
+    // ...
+}
+```
+
+### For TCP Protocols:
+
+1. Add a handler function similar to `handleRazeMessage()`
+2. Modify `PacketProcessor::processTcpMessage()` to dispatch to your handler based on some criteria
+
+## Example: Adding a New UDP Protocol
+
+Let's say you want to add support for "MyProtocol v5":
+
+```cpp
+// In ProtocolHandlers namespace:
+inline std::unordered_map<uint64_t, ParsedPacketInfo> 
+handleMyProtocolV5(const uint8_t* payload, size_t payloadSize, 
+                   pcpp::Packet& packet, ProtocolContext& ctx) {
+    std::unordered_map<uint64_t, ParsedPacketInfo> result;
+    
+    // Check minimum size
+    if (payloadSize < sizeof(MyProtocolHeader)) {
+        PME_LOG_WARN(ctx.log, "MyProtocol: Packet too small");
+        return result;
+    }
+    
+    // Parse and process...
+    auto timestamp = timespecToTimePoint(packet.getRawPacket()->getPacketTimeStamp());
+    // ... your logic ...
+    
+    // Generate hash and store result
+    uint64_t hash = ProtocolContext::generateHash(seq, timestamp1, timestamp2);
+    result[hash] = ParsedPacketInfo(timestamp);
+    
+    // Update stats
+    ctx.stats.my_protocol_messages++;  // Add this counter to ProtocolContext
+    
+    return result;
+}
+
+// In processUdpPayload(), add:
+case 5:
+    return handleMyProtocolV5(payload, payloadSize, packet, ctx);
+```
+
+## Benefits of This Approach
+
+1. **Simple**: All protocol logic in one place
+2. **Fast**: Inline functions, no virtual dispatch overhead
+3. **Easy to extend**: Just add a function and update the dispatcher
+4. **Minimal files**: No need for separate header/implementation files per protocol
+5. **Clear**: Easy to see all supported protocols at a glance
+
+## Notes
+
+- Keep handler functions focused and simple
+- Use the provided helpers (generateHash, timespecToTimePoint)
+- Update statistics for monitoring
+- Log warnings/errors appropriately
+- Return empty map on errors rather than throwing exceptions 
+### END: README_PROTOCOLS.md ###
+
+### FILE: README_simplified.md ###
+# PME - Simplified Packet Matching Engine
+
+A single-threaded packet processing application that matches ingress and egress packets based on dropcopy data.
+
+## Design Philosophy
+
+Following geohot's principle of simplicity:
+- Single-threaded execution - no complex synchronization
+- One directory to watch, one file at a time processing
+- No queues or worker pools - just a simple loop
+- Direct file processing with immediate results
+
+## Architecture
+
+```
+main.cpp
+  └── Engine
+       ├── Watches a single directory for new .pcap/.pcapng files
+       ├── Processes files sequentially
+       ├── Uses PacketProcessor to extract packet timestamps
+       └── Outputs results when stopped
+
+PacketProcessor
+  ├── Handles TCP stream reassembly (with ring buffers)
+  ├── Processes UDP packets directly
+  └── Returns indexed packets (INGRESS at index 0, EGRESS at index 1)
+```
+
+## How It Works
+
+1. **Engine Loop**: 
+   - Polls the watch directory every 100ms for new pcap files
+   - Processes each file exactly once
+   - Maintains a set of processed files to avoid reprocessing
+
+2. **Packet Processing**:
+   - UDP/SPCast packets → INGRESS_PACKET (index 0)
+   - TCP/Raze packets → EGRESS_PACKET (index 1)
+   - No sorting needed - packets are indexed by type
+
+3. **Output**:
+   - Results accumulate in memory
+   - Written to CSV file on shutdown (Ctrl+C)
+
+## Usage
+
+```bash
+./pme -w /path/to/pcap/directory -d /path/to/dropcopy.csv -o /output/directory
+```
+
+## Build
+
+```bash
+mkdir build && cd build
+cmake ..
+make
+```
+
+## Key Simplifications
+
+- **Removed Components**: Discovery, Watcher, FileQueue, MPMCQueue
+- **No Threading**: Single-threaded execution eliminates race conditions
+- **No Complex State**: Simple processed files tracking with std::unordered_set
+- **Direct Processing**: Files are processed immediately when found
+- **Fixed Packet Ordering**: Enum-based indexing eliminates sorting
+
+## Performance Considerations
+
+- Ring buffers for TCP stream reassembly (64KB per flow)
+- Yields CPU every 200 packets to avoid hogging resources
+- 100ms polling interval for new files (adjustable if needed) 
+### END: README_simplified.md ###
+
+### FILE: config_example.yaml ###
+# PME Configuration Example
+# This file demonstrates all available configuration options
+
+# Ingress flow configuration (UDP packets)
+ingress_flow:
+  protocol: spcastv3        # Protocol to use: spcastv3, spcastv4
+  src_ip: ""               # Source IP filter (empty = any)
+  dst_ip: "224.0.0.1"      # Destination IP filter (empty = any)
+  src_port: 0              # Source port filter (0 = any)
+  dst_port: 12345          # Destination port filter (0 = any)
+
+# Egress flow configuration (TCP packets)
+egress_flow:
+  protocol: raze           # Protocol to use: raze
+  src_ip: "10.1.1.10"     # Source IP filter (empty = any)
+  dst_ip: "10.1.1.20"     # Destination IP filter (empty = any)
+  src_port: 0             # Source port filter (0 = any)
+  dst_port: 8080          # Destination port filter (0 = any)
+
+# File paths
+paths:
+  watch_directory: /path/to/pcap/files    # Directory containing PCAP files
+  dropcopy_file: /path/to/dropcopy.csv    # GTAd dropcopy file
+  output_directory: ./output              # Output directory for results
+
+# Optional settings
+settings:
+  debug_mode: false                       # Enable debug logging
+  packet_yield_interval: 200              # Yield after processing N packets 
+### END: config_example.yaml ###
+
+### FILE: config_minimal.yaml ###
+# Minimal PME Configuration
+# Only required fields - all packets will be processed
+
+# Process all SPCast v3 UDP packets
+ingress_flow:
+  protocol: spcastv3
+
+# Process all Raze TCP packets  
+egress_flow:
+  protocol: raze
+
+# Required paths
+paths:
+  watch_directory: ./pcap_files
+  dropcopy_file: ./dropcopy.csv 
+### END: config_minimal.yaml ###
+
+### FILE: src/Cli.h ###
+#pragma once
+
+#include <filesystem>
+#include <iostream>
+#include <string>
+
+#include <boost/program_options.hpp>
+#include <spapp/app_cmdlne/setup.hpp>
+
+#include "Config.h"
+
+namespace pme {
+
+inline AppConfig parse_cli(int argc, char** argv)
+{
+    namespace po = boost::program_options;
+
+    std::string config_path;
+    po::options_description desc{"pme - Packet Matching Engine"};
+    desc.add_options()
+        ("config,c", po::value<std::string>(&config_path)->required(),
+         "Path to YAML configuration file");
+    
+    sp::app_cmdlne::default_setup(argc, argv, desc, sp::app_cmdlne::standard_options::BUILD_INFO);
+
+    if (config_path.empty()) {
+        throw std::invalid_argument("Configuration file path cannot be empty");
+    }
+
+    // Load and validate configuration
+    try {
+        auto config = AppConfig::load(config_path);
+        std::cout << "Configuration loaded successfully from: " << config_path << std::endl;
+        std::cout << "  Ingress: " << config.ingress_flow.protocol 
+                  << " (" << (config.ingress_flow.src_ip.empty() ? "any" : config.ingress_flow.src_ip)
+                  << ":" << (config.ingress_flow.src_port == 0 ? "any" : std::to_string(config.ingress_flow.src_port))
+                  << " -> " << (config.ingress_flow.dst_ip.empty() ? "any" : config.ingress_flow.dst_ip)
+                  << ":" << (config.ingress_flow.dst_port == 0 ? "any" : std::to_string(config.ingress_flow.dst_port))
+                  << ")" << std::endl;
+        std::cout << "  Egress: " << config.egress_flow.protocol
+                  << " (" << (config.egress_flow.src_ip.empty() ? "any" : config.egress_flow.src_ip)
+                  << ":" << (config.egress_flow.src_port == 0 ? "any" : std::to_string(config.egress_flow.src_port))
+                  << " -> " << (config.egress_flow.dst_ip.empty() ? "any" : config.egress_flow.dst_ip)
+                  << ":" << (config.egress_flow.dst_port == 0 ? "any" : std::to_string(config.egress_flow.dst_port))
+                  << ")" << std::endl;
+        return config;
+    } catch (const std::exception& e) {
+        std::cerr << "Error loading configuration: " << e.what() << std::endl;
+        throw;
+    }
+}
+
+} // namespace pme
+
+### END: src/Cli.h ###
+
+### FILE: src/Config.cpp ###
+#include "Config.h"
+#include <yaml-cpp/yaml.h>
+#include <filesystem>
+#include <stdexcept>
+#include <iostream>
+
+namespace pme {
+
+namespace {
+    FlowConfig parseFlowConfig(const YAML::Node& node) {
+        FlowConfig flow;
+        
+        if (node["protocol"]) {
+            flow.protocol = node["protocol"].as<std::string>();
+        }
+        if (node["src_ip"]) {
+            flow.src_ip = node["src_ip"].as<std::string>();
+        }
+        if (node["dst_ip"]) {
+            flow.dst_ip = node["dst_ip"].as<std::string>();
+        }
+        if (node["src_port"]) {
+            flow.src_port = node["src_port"].as<uint16_t>();
+        }
+        if (node["dst_port"]) {
+            flow.dst_port = node["dst_port"].as<uint16_t>();
+        }
+        
+        return flow;
+    }
+}
+
+AppConfig AppConfig::load(const std::string& config_path) {
+    if (!std::filesystem::exists(config_path)) {
+        throw std::runtime_error("Config file not found: " + config_path);
+    }
+    
+    try {
+        YAML::Node root = YAML::LoadFile(config_path);
+        AppConfig config;
+        
+        // Parse flow configurations
+        if (root["ingress_flow"]) {
+            config.ingress_flow = parseFlowConfig(root["ingress_flow"]);
+        } else {
+            throw std::runtime_error("Missing required 'ingress_flow' section");
+        }
+        
+        if (root["egress_flow"]) {
+            config.egress_flow = parseFlowConfig(root["egress_flow"]);
+        } else {
+            throw std::runtime_error("Missing required 'egress_flow' section");
+        }
+        
+        // Parse file paths
+        if (root["paths"]) {
+            auto paths = root["paths"];
+            if (paths["watch_directory"]) {
+                config.watch_directory = paths["watch_directory"].as<std::string>();
+            }
+            if (paths["dropcopy_file"]) {
+                config.dropcopy_path = paths["dropcopy_file"].as<std::string>();
+            }
+            if (paths["output_directory"]) {
+                config.output_directory = paths["output_directory"].as<std::string>();
+            } else {
+                config.output_directory = "./";  // Default
+            }
+        } else {
+            throw std::runtime_error("Missing required 'paths' section");
+        }
+        
+        // Parse optional settings
+        if (root["settings"]) {
+            auto settings = root["settings"];
+            if (settings["debug_mode"]) {
+                config.debug_mode = settings["debug_mode"].as<bool>();
+            }
+            if (settings["packet_yield_interval"]) {
+                config.packet_yield_interval = settings["packet_yield_interval"].as<int>();
+            }
+        }
+        
+        config.validate();
+        return config;
+        
+    } catch (const YAML::Exception& e) {
+        throw std::runtime_error("YAML parse error: " + std::string(e.what()));
+    }
+}
+
+void AppConfig::validate() const {
+    // Validate required fields
+    if (watch_directory.empty()) {
+        throw std::invalid_argument("watch_directory cannot be empty");
+    }
+    if (dropcopy_path.empty()) {
+        throw std::invalid_argument("dropcopy_path cannot be empty");
+    }
+    
+    // Validate protocols
+    if (ingress_flow.protocol.empty()) {
+        throw std::invalid_argument("ingress_flow.protocol cannot be empty");
+    }
+    if (egress_flow.protocol.empty()) {
+        throw std::invalid_argument("egress_flow.protocol cannot be empty");
+    }
+    
+    // Validate paths exist
+    if (!std::filesystem::exists(watch_directory)) {
+        throw std::invalid_argument("watch_directory does not exist: " + watch_directory);
+    }
+    if (!std::filesystem::exists(dropcopy_path)) {
+        throw std::invalid_argument("dropcopy_path does not exist: " + dropcopy_path);
+    }
+    
+    // Validate supported protocols
+    const std::vector<std::string> supported_udp = {"spcastv3", "spcastv4"};
+    const std::vector<std::string> supported_tcp = {"raze"};
+    
+    bool ingress_valid = std::find(supported_udp.begin(), supported_udp.end(), 
+                                   ingress_flow.protocol) != supported_udp.end();
+    bool egress_valid = std::find(supported_tcp.begin(), supported_tcp.end(), 
+                                 egress_flow.protocol) != supported_tcp.end();
+    
+    if (!ingress_valid) {
+        throw std::invalid_argument("Unsupported ingress protocol: " + ingress_flow.protocol);
+    }
+    if (!egress_valid) {
+        throw std::invalid_argument("Unsupported egress protocol: " + egress_flow.protocol);
+    }
+}
+
+} // namespace pme 
+### END: src/Config.cpp ###
+
+### FILE: src/Config.h ###
+#pragma once
+
+#include <string>
+#include <cstdint>
+
+namespace pme {
+
+/**
+ * Flow configuration for filtering network traffic
+ */
+struct FlowConfig {
+    std::string protocol;      // Protocol name (e.g., "spcastv3", "spcastv4", "raze")
+    std::string src_ip;        // Source IP address (empty = any)
+    std::string dst_ip;        // Destination IP address (empty = any)
+    uint16_t src_port = 0;     // Source port (0 = any)
+    uint16_t dst_port = 0;     // Destination port (0 = any)
+    
+    bool matches_any() const {
+        return src_ip.empty() && dst_ip.empty() && src_port == 0 && dst_port == 0;
+    }
+};
+
+/**
+ * Application configuration loaded from YAML
+ */
+struct AppConfig {
+    // Flow specifications
+    FlowConfig ingress_flow;   // UDP flow configuration
+    FlowConfig egress_flow;    // TCP flow configuration
+    
+    // File paths
+    std::string watch_directory;
+    std::string dropcopy_path;
+    std::string output_directory;
+    
+    // Optional settings
+    bool debug_mode = false;
+    int packet_yield_interval = 200;  // Yield after N packets
+    
+    /**
+     * Load configuration from YAML file
+     * @param config_path Path to YAML configuration file
+     * @return Loaded configuration
+     * @throws std::runtime_error on parse errors
+     */
+    static AppConfig load(const std::string& config_path);
+    
+    /**
+     * Validate configuration
+     * @throws std::invalid_argument if configuration is invalid
+     */
+    void validate() const;
+};
+
+} // namespace pme 
+### END: src/Config.h ###
+
+### FILE: src/DropcopyHandler.cpp ###
+#include "DropcopyHandler.h"
+
+namespace pme {
+
+DropcopyHandler::DropcopyHandler(const std::string dropcopy_path)
+    : dir_(std::move(dropcopy_path)), log_(PME_GET_LOGGER("DropcopyHandler"))
+{
+    map_ = parseDropcopy(dir_);
+
+    PME_LOG_INFO(log_, "Parsed " << map_.size() << " entries from dropcopy file");
+}
+
+} // namespace pme
+### END: src/DropcopyHandler.cpp ###
+
+### FILE: src/DropcopyHandler.h ###
+#pragma once
+
+#include <charconv>
+#include <chrono>
+#include <cstdint>
+#include <ctime>
+#include <fstream>
+#include <iomanip>
+#include <iostream>
+#include <regex>
+#include <sstream>
+#include <string>
+#include <string_view>
+#include <unordered_map>
+#include <utility>
+
+#include "Log.h"
+
+namespace pme {
+
+// Holds both known and unknown fields
+struct LatencyStats {
+    std::string event_type{};      // Explicitly initialize strings
+    uint64_t    md_seq_num        = 0;
+    std::string md_feed_name{};    // Explicitly initialize strings
+    int         exch_seq_num      = 0;
+    int         exch_src_id       = 0;
+    uint64_t    md_sec_ric        = 0;
+    int         oms_queue_size    = 0;
+    uint64_t before_md_recv       = 0;
+    uint64_t after_md_recv        = 0;
+    uint64_t before_md_decode     = 0;
+    uint64_t after_md_decode      = 0;
+    uint64_t before_strategy      = 0;
+    uint64_t before_slice_new     = 0;
+    uint64_t before_soflomo_check = 0;
+    uint64_t before_oms_send      = 0;
+    uint64_t before_driver_send   = 0;
+    uint64_t after_driver_send    = 0;
+    uint64_t md_recv_time         = 0;
+    uint64_t md_send_time         = 0;
+    uint64_t md_exchange_time     = 0;
+    int md_event_id               = 0;
+    uint64_t hw_recv_time         = 0;
+
+    // Default constructor to ensure all members are initialized
+    LatencyStats() = default;
+    
+    // Copy constructor
+    LatencyStats(const LatencyStats&) = default;
+    
+    // Move constructor
+    LatencyStats(LatencyStats&&) = default;
+    
+    // Copy assignment
+    LatencyStats& operator=(const LatencyStats&) = default;
+    
+    // Move assignment
+    LatencyStats& operator=(LatencyStats&&) = default;
+
+    friend std::ostream& operator<<(std::ostream& os, LatencyStats const& s) {
+        os << "event_type=" << s.event_type
+           << " md_seq_num=" << s.md_seq_num
+           << " md_feed_name=" << s.md_feed_name
+           << " exch_seq_num=" << s.exch_seq_num
+           << " exch_src_id=" << s.exch_src_id
+           << " md_sec_ric=" << s.md_sec_ric
+           << " oms_queue_size=" << s.oms_queue_size
+           << " before_md_recv=" << s.before_md_recv
+           << " after_md_recv=" << s.after_md_recv
+           << " before_md_decode=" << s.before_md_decode
+           << " after_md_decode=" << s.after_md_decode
+           << " before_strategy=" << s.before_strategy
+           << " before_slice_new=" << s.before_slice_new
+           << " before_soflomo_check=" << s.before_soflomo_check
+           << " before_oms_send=" << s.before_oms_send
+           << " before_driver_send=" << s.before_driver_send
+           << " after_driver_send=" << s.after_driver_send
+           << " md_recv_time=" << s.md_recv_time
+           << " md_send_time=" << s.md_send_time
+           << " md_exchange_time=" << s.md_exchange_time
+           << " md_event_id=" << s.md_event_id
+           << " hw_recv_time=" << s.hw_recv_time;
+
+        return os;
+    }
+};
+
+class DropcopyHandler
+{
+public:
+    DropcopyHandler(const std::string dropcopy_path);
+
+    ~DropcopyHandler() = default;
+
+    // Parse UTC timestamp string_view to uint64_t nanoseconds since epoch
+    // format: YYYY-MM-DD HH:MM:SS.nnnnnnnnn
+    uint64_t parseTimestamp(std::string_view timestamp) {
+        // Expected format: "YYYY-MM-DD HH:MM:SS.nnnnnnnnn"
+        // Positions:       01234567890123456789012345567
+        
+        // Initialize all variables to avoid -Wmaybe-uninitialized
+        int year = 0, month = 0, day = 0, hour = 0, minute = 0, second = 0;
+
+        // Validate minimum length
+        if (timestamp.length() < 19) {
+            return 0;  // Invalid timestamp format
+        }
+
+        auto res = std::from_chars(timestamp.data(), timestamp.data() + 4, year);
+        if (res.ec != std::errc()) return 0;  // Failed to parse year
+        
+        res = std::from_chars(timestamp.data() + 5, timestamp.data() + 7, month);
+        if (res.ec != std::errc()) return 0;  // Failed to parse month
+        
+        res = std::from_chars(timestamp.data() + 8, timestamp.data() + 10, day);
+        if (res.ec != std::errc()) return 0;  // Failed to parse day
+        
+        res = std::from_chars(timestamp.data() + 11, timestamp.data() + 13, hour);
+        if (res.ec != std::errc()) return 0;  // Failed to parse hour
+        
+        res = std::from_chars(timestamp.data() + 14, timestamp.data() + 16, minute);
+        if (res.ec != std::errc()) return 0;  // Failed to parse minute
+        
+        res = std::from_chars(timestamp.data() + 17, timestamp.data() + 19, second);
+        if (res.ec != std::errc()) return 0;  // Failed to parse second
+
+        // Parse nanoseconds
+        uint64_t nanos_frac = 0;
+        if (timestamp.length() > 20 && timestamp[19] == '.') {
+            // Get nanosecond substring
+            auto nano_start = timestamp.data() + 20;
+            auto nano_len = std::min<size_t>(9, timestamp.length() - 20);
+
+            // Parse what we have
+            uint64_t parsed_value = 0;
+            std::from_chars(nano_start, nano_start + nano_len, parsed_value);
+
+            // Scale to nanoseconds (multiply by 10^(9-nano_len))
+            uint64_t scale = 1;
+            for (size_t i = nano_len; i < 9; ++i) {
+                scale *= 10;
+            }
+            nanos_frac = parsed_value * scale;
+        }
+
+        // Convert to UTC time
+        std::tm tm = {};
+        tm.tm_year = year - 1900;
+        tm.tm_mon = month - 1;
+        tm.tm_mday = day;
+        tm.tm_hour = hour;
+        tm.tm_min = minute;
+        tm.tm_sec = second;
+        tm.tm_isdst = 0;
+
+        // timegm for UTC (available on Linux)
+        std::time_t time_seconds = timegm(&tm);
+
+        // Check for negative time (before 1970)
+        if (time_seconds < 0) {
+            return 0; // or handle pre-1970 dates as needed
+        }
+
+        // Now safe to cast
+        return static_cast<uint64_t>(time_seconds) * 1'000'000'000ULL + nanos_frac;
+    }
+
+    // Key-Value parser
+    std::pair<std::string_view,std::string_view>
+        parseKV(std::string_view text, size_t& pos)
+    {
+        // skip whitespace
+        while (pos < text.size() && isspace(text[pos])) pos++;
+        auto start = pos;
+        // read key
+        while (pos < text.size() && text[pos] != '=') pos++;
+        auto key = text.substr(start, pos - start);
+        pos++; // skip '='
+        // skip whitespace
+        while (pos < text.size() && isspace(text[pos])) pos++;
+        // read value (up to comma or end)
+        start = pos;
+        // Add bounds check before accessing text[pos]
+        bool in_quotes = (pos < text.size() && text[pos]=='\'');
+        if (in_quotes) pos++;
+        while (pos < text.size() &&
+               (in_quotes ? text[pos] != '\'' : text[pos] != ',' && text[pos] != '}'))
+        {
+            pos++;
+        }
+        auto value = text.substr(start, pos - start);
+        if (in_quotes && pos<text.size() && text[pos]=='\'') pos++;
+        // skip comma
+        if (pos<text.size() && text[pos]==',') pos++;
+        return {key, value};
+    }
+
+    std::string_view trim_sv(std::string_view sv) {
+        size_t b = 0, e = sv.size();
+        while (b < e && std::isspace((unsigned char)sv[b])) ++b;
+        while (e > b && std::isspace((unsigned char)sv[e-1])) --e;
+        return sv.substr(b, e-b);
+    }
+
+    std::unordered_map<uint64_t, LatencyStats>
+    parseDropcopy(const std::string& filename) {
+        static const std::regex line_re{
+            R"(.*clordid\s*=\s*(\d+)\s*,\s*latency_stats\s*=\s*\{(.*)\}.*)"};
+        std::unordered_map<uint64_t, LatencyStats> out;
+        std::ifstream in{filename};
+        if (!in.is_open()) {
+            PME_LOG_ERROR(log_, "Failed to open dropcopy file: " << filename);
+            return out;
+        }
+        
+        std::string line;
+        int line_num = 0;
+        while (std::getline(in, line)) {
+            line_num++;
+            std::smatch m;
+            if (!std::regex_match(line, m, line_re)) {
+                continue;
+            }
+            
+            try {
+                uint64_t cid = std::stoull(m[1].str());
+                std::string body_str = m[2].str();
+                std::string_view body = body_str;
+
+                LatencyStats stats{};  // Use value initialization
+                size_t pos = 0;
+                while (pos < body.size()) {
+                    auto [k_raw, v_raw] = parseKV(body, pos);
+                    auto k = trim_sv(k_raw);
+                    auto v = trim_sv(v_raw);
+
+                    if (k == "event_type") {
+                        stats.event_type = std::string(v);
+                    } else if (k == "md_seq_num") {
+                        stats.md_seq_num = std::stoull(std::string(v));
+                    } else if (k == "md_feed_name") {
+                        // strip quotes if present - add bounds checking
+                        stats.md_feed_name = (!v.empty() && v.front()=='\'' && v.back()=='\'')
+                            ? std::string(v.substr(1, v.size()-2))
+                            : std::string(v);
+                    } else if (k == "exch_seq_num") {
+                        stats.exch_seq_num = std::stoi(std::string(v));
+                    } else if (k == "exch_src_id") {
+                        stats.exch_src_id = std::stoi(std::string(v));
+                    } else if (k == "md_sec_ric") {
+                        stats.md_sec_ric = std::stoull(std::string(v));
+                    } else if (k == "oms_queue_size") {
+                        stats.oms_queue_size = std::stoi(std::string(v));
+                    } else if (k == "before_md_recv") {
+                        stats.before_md_recv = parseTimestamp(v);
+                        if (stats.before_md_recv == 0 && !v.empty()) {
+                            PME_LOG_WARN(log_, "Failed to parse timestamp 'before_md_recv': " << v);
+                        }
+                    } else if (k == "after_md_recv") {
+                        stats.after_md_recv = parseTimestamp(v);
+                    } else if (k == "before_md_decode") {
+                        stats.before_md_decode = parseTimestamp(v);
+                    } else if (k == "after_md_decode") {
+                        stats.after_md_decode = parseTimestamp(v);
+                    } else if (k == "before_strategy") {
+                        stats.before_strategy = parseTimestamp(v);
+                    } else if (k == "before_slice_new") {
+                        stats.before_slice_new = parseTimestamp(v);
+                    } else if (k == "before_soflomo_check") {
+                        stats.before_soflomo_check = parseTimestamp(v);
+                    } else if (k == "before_oms_send") {
+                        stats.before_oms_send = parseTimestamp(v);
+                    } else if (k == "before_driver_send") {
+                        stats.before_driver_send = parseTimestamp(v);
+                    } else if (k == "after_driver_send") {
+                        stats.after_driver_send = parseTimestamp(v);
+                    } else if (k == "md_recv_time") {
+                        stats.md_recv_time = parseTimestamp(v);
+                        if (stats.md_recv_time == 0 && !v.empty()) {
+                            PME_LOG_WARN(log_, "Failed to parse timestamp 'md_recv_time': " << v);
+                        }
+                    } else if (k == "md_send_time") {
+                        stats.md_send_time = parseTimestamp(v);
+                        if (stats.md_send_time == 0 && !v.empty()) {
+                            PME_LOG_WARN(log_, "Failed to parse timestamp 'md_send_time': " << v);
+                        }
+                    } else if (k == "md_exchange_time") {
+                        stats.md_exchange_time = parseTimestamp(v);
+                    } else if (k == "md_event_id") {
+                        stats.md_event_id = std::stoi(std::string(v));
+                    }
+                }
+                // Use operator[] to avoid -Wmaybe-uninitialized warning
+                // This constructs the value in-place if it doesn't exist
+                out[cid] = std::move(stats);
+            } catch (const std::exception& e) {
+                PME_LOG_ERROR(log_, "Error parsing line " << line_num << ": " << e.what());
+            }
+        }
+        
+        return out;
+    }
+
+    const std::unordered_map<uint64_t, LatencyStats>& getMapRef() const
+    {
+        return map_;
+    }
+
+private:
+    std::unordered_map<uint64_t, LatencyStats> map_;
+    std::string dir_;
+    px::Log* log_;
+};
+
+} // namespace pme
+
+### END: src/DropcopyHandler.h ###
+
+### FILE: src/Engine.cpp ###
+#include "Engine.h"
+
+#include <chrono>
+#include <filesystem>
+#include <iostream>
+#include <thread>
+
+#include <spapp/app/wait.hpp>
+
+#include "OutputFileWriter.h"
+
+namespace pme {
+
+Engine::Engine(std::shared_ptr<RuntimeContext> ctx, const AppConfig& config)
+    : ctx_(ctx),
+      dc_(config.dropcopy_path),
+      config_(config),
+      log_(PME_GET_LOGGER("Engine"))
+{
+    PME_LOG_INFO(log_, "Engine initialized to watch: " << config_.watch_directory);
+    PME_LOG_INFO(log_, "Ingress protocol: " << config_.ingress_flow.protocol);
+    PME_LOG_INFO(log_, "Egress protocol: " << config_.egress_flow.protocol);
+}
+
+void Engine::stop() {
+    ctx_->stop.store(true);
+    
+    if(OutputFileWriter::write(outputMap_, config_.output_directory))
+    {
+        PME_LOG_INFO(log_, "Output written to " << config_.output_directory);
+    }
+    else
+    {
+        PME_LOG_ERROR(log_, "Failed to write output to " << config_.output_directory);
+    }
+}
+
+std::filesystem::path Engine::getNextPcapFile() {
+    namespace fs = std::filesystem;
+    
+    if (!fs::exists(config_.watch_directory)) {
+        return {};
+    }
+    
+    for (const auto& entry : fs::directory_iterator(config_.watch_directory)) {
+        if (entry.is_regular_file()) {
+            auto path = entry.path();
+            auto extension = path.extension().string();
+            
+            // Check if it's a pcap file
+            if (extension == ".pcap" || extension == ".pcapng") {
+                // Check if we've already processed this file
+                if (processed_files_.find(path.string()) == processed_files_.end()) {
+                    return path;
+                }
+            }
+        }
+    }
+    
+    return {};
+}
+
+void Engine::run() {
+    PacketProcessor packet_processor(dc_.getMapRef(), ctx_, config_);
+    
+    PME_LOG_INFO(log_, "Engine started. Processing files from: " << config_.watch_directory);
+    
+    while (!ctx_->stop.load()) {
+        auto pcap_file = getNextPcapFile();
+        
+        if (!pcap_file.empty()) {
+            PME_LOG_INFO(log_, "Processing file: " << pcap_file.string());
+            
+            // Process the file
+            auto tMap = packet_processor.processFile(pcap_file.string());
+            
+            // Merge results into outputMap
+            outputMap_.insert(tMap.begin(), tMap.end());
+            
+            // Mark file as processed
+            processed_files_.insert(pcap_file.string());
+            
+            PME_LOG_INFO(log_, "Finished processing: " << pcap_file.string() 
+                         << " - Total entries: " << outputMap_.size());
+        } else {
+            // No new files, wait a bit before checking again
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+        
+        // Check for shutdown signal
+        if (sp::app::signaled()) {
+            int sig = sp::app::last_signal();
+            PME_LOG_INFO(log_, "Shutdown signal " << sig << " received");
+            break;
+        }
+    }
+    
+    stop();
+}
+
+} // namespace pme
+### END: src/Engine.cpp ###
+
+### FILE: src/Engine.h ###
+#pragma once
+
+#include <memory>
+#include <string>
+#include <unordered_map>
+#include <unordered_set>
+#include <array>
+#include <filesystem>
+
+#include "Log.h"
+#include "DropcopyHandler.h"
+#include "Config.h"
+#include "PacketProcessor.h"
+#include "RuntimeContext.h"
+
+namespace pme {
+
+class Engine {
+public:
+    Engine(std::shared_ptr<RuntimeContext> ctx, const AppConfig& config);
+    ~Engine() = default;
+    void run();
+    void stop();
+
+private:
+    std::filesystem::path getNextPcapFile();
+    
+    std::shared_ptr<RuntimeContext> ctx_;
+    std::unordered_map<uint64_t, std::array<ParsedPacketInfo, static_cast<size_t>(PacketType::PACKET_COUNT)>> outputMap_;
+    DropcopyHandler dc_;
+    AppConfig config_;
+    
+    std::unordered_set<std::string> processed_files_;
+    px::Log* log_;
+};
+
+} // namespace pme
+
+### END: src/Engine.h ###
+
+### FILE: src/OutputFileWriter.h ###
+#pragma once
+
+#include <algorithm>
+#include <chrono>
+#include <cstdint>
+#include <fstream>
+#include <iomanip>
+#include <string>
+#include <unordered_map>
+#include <vector>
+#include <array>
+
+#include "Log.h"
+
+namespace pme {
+
+// Forward declaration for ParsedPacketInfo
+struct ParsedPacketInfo;
+enum class PacketType : size_t;
+
+namespace OutputFileWriter
+{
+    bool write(
+        const std::unordered_map<uint64_t, std::array<ParsedPacketInfo, 2>>& packetMap,
+        const std::string& outputDir) {
+        
+        // Construct the output file path
+        std::string filename = outputDir;
+        if (!filename.empty() && filename.back() != '/' && filename.back() != '\\') {
+            filename += "/";
+        }
+        filename += "timestamp_deltas.csv";
+        
+        // Open the file for writing
+        std::ofstream csvFile(filename);
+        if (!csvFile.is_open()) {
+            return false;
+        }
+        
+        // Write CSV header
+        csvFile << "entry_id,timestamp1,timestamp2,delta_nanoseconds\n";
+        
+        // Process each entry in the map
+        for (const auto& [key, packetArray] : packetMap) {
+            // Check if both packets are valid
+            if (!packetArray[0].isValid() || !packetArray[1].isValid()) {
+                continue;
+            }
+            
+            // Get timestamps from both packets (index 0 = INGRESS, index 1 = EGRESS)
+            auto timestamp1 = packetArray[0].getTimeStamp();
+            auto timestamp2 = packetArray[1].getTimeStamp();
+            
+            // Convert both timestamps to nanoseconds since epoch
+            auto nanos1 = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                timestamp1.time_since_epoch()
+            ).count();
+            auto nanos2 = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                timestamp2.time_since_epoch()
+            ).count();
+            
+            // Calculate the delta in nanoseconds (timestamp2 >= timestamp1 guaranteed)
+            uint64_t deltaNanos = nanos2 - nanos1;
+            csvFile << key << "," << nanos1 << "," << nanos2 << "," << deltaNanos << "\n";
+        }
+        
+        // Check if writing was successful
+        if (csvFile.fail()) {
+            csvFile.close();
+            return false;
+        }
+        
+        csvFile.close();
+        return true;
+    }
+}
+
+} // namespace pme
+### END: src/OutputFileWriter.h ###
+
+### FILE: src/PacketProcessor.cpp ###
+#include "PacketProcessor.h"
+#include "Log.h"
+#include <PcapFileDevice.h>
+#include <Packet.h>
+#include <IPv4Layer.h>
+#include <TcpLayer.h>
+#include <UdpLayer.h>
+#include <thread>
+#include <chrono>
+#include <algorithm>
+
+namespace pme {
+
+px::Log* PacketProcessor::getLogger() {
+    static px::Log* logger = PME_GET_LOGGER("PacketProcessor");
+    return logger;
+}
+
+PacketProcessor::PacketProcessor(const std::unordered_map<uint64_t, LatencyStats>& mapRef, 
+                               std::shared_ptr<RuntimeContext> ctx,
+                               const AppConfig& config)
+    : log_(getLogger()),
+      tcp_reassembly_(
+          onTcpMessageReadyCallback,
+          this,
+          onTcpConnectionStartCallback,
+          onTcpConnectionEndCallback
+      ),
+      dropcopy_map_ref_(mapRef),
+      ctx_(ctx),
+      config_(config),
+      protocol_context_{mapRef, log_, last_udpseq_}
+{
+}
+
+PacketProcessor::~PacketProcessor() {
+}
+
+// Flow filtering implementation
+bool PacketProcessor::matchesFlowFilter(const pcpp::Packet& packet, bool isTcp) const {
+    const FlowConfig& flow = isTcp ? config_.egress_flow : config_.ingress_flow;
+    
+    // If no filters specified, accept all
+    if (flow.matches_any()) {
+        return true;
+    }
+    
+    // Get IP layer
+    pcpp::IPv4Layer* ipv4Layer = packet.getLayerOfType<pcpp::IPv4Layer>();
+    if (!ipv4Layer) {
+        return false;  // Only support IPv4 for now
+    }
+    
+    // Check IP addresses if specified
+    if (!flow.src_ip.empty()) {
+        if (ipv4Layer->getSrcIPAddress().toString() != flow.src_ip) {
+            return false;
+        }
+    }
+    
+    if (!flow.dst_ip.empty()) {
+        if (ipv4Layer->getDstIPAddress().toString() != flow.dst_ip) {
+            return false;
+        }
+    }
+    
+    // Check ports if specified
+    if (flow.src_port != 0 || flow.dst_port != 0) {
+        if (isTcp) {
+            pcpp::TcpLayer* tcpLayer = packet.getLayerOfType<pcpp::TcpLayer>();
+            if (!tcpLayer) return false;
+            
+            if (flow.src_port != 0 && pcpp::netToHost16(tcpLayer->getTcpHeader()->portSrc) != flow.src_port) {
+                return false;
+            }
+            if (flow.dst_port != 0 && pcpp::netToHost16(tcpLayer->getTcpHeader()->portDst) != flow.dst_port) {
+                return false;
+            }
+        } else {
+            pcpp::UdpLayer* udpLayer = packet.getLayerOfType<pcpp::UdpLayer>();
+            if (!udpLayer) return false;
+            
+            if (flow.src_port != 0 && pcpp::netToHost16(udpLayer->getUdpHeader()->portSrc) != flow.src_port) {
+                return false;
+            }
+            if (flow.dst_port != 0 && pcpp::netToHost16(udpLayer->getUdpHeader()->portDst) != flow.dst_port) {
+                return false;
+            }
+        }
+    }
+    
+    return true;
+}
+
+// New method to match packet against a specific flow config
+bool PacketProcessor::matchesFlow(const pcpp::Packet& packet, const FlowConfig& flow) const {
+    // If no filters specified, accept all
+    if (flow.matches_any()) {
+        return true;
+    }
+    
+    // Get IP layer
+    pcpp::IPv4Layer* ipv4Layer = packet.getLayerOfType<pcpp::IPv4Layer>();
+    if (!ipv4Layer) {
+        return false;  // Only support IPv4 for now
+    }
+    
+    // Check IP addresses if specified
+    if (!flow.src_ip.empty()) {
+        if (ipv4Layer->getSrcIPAddress().toString() != flow.src_ip) {
+            return false;
+        }
+    }
+    
+    if (!flow.dst_ip.empty()) {
+        if (ipv4Layer->getDstIPAddress().toString() != flow.dst_ip) {
+            return false;
+        }
+    }
+    
+    // Check ports if specified
+    if (flow.src_port != 0 || flow.dst_port != 0) {
+        if (packet.isPacketOfType(pcpp::TCP)) {
+            pcpp::TcpLayer* tcpLayer = packet.getLayerOfType<pcpp::TcpLayer>();
+            if (!tcpLayer) return false;
+            
+            if (flow.src_port != 0 && pcpp::netToHost16(tcpLayer->getTcpHeader()->portSrc) != flow.src_port) {
+                return false;
+            }
+            if (flow.dst_port != 0 && pcpp::netToHost16(tcpLayer->getTcpHeader()->portDst) != flow.dst_port) {
+                return false;
+            }
+        } else if (packet.isPacketOfType(pcpp::UDP)) {
+            pcpp::UdpLayer* udpLayer = packet.getLayerOfType<pcpp::UdpLayer>();
+            if (!udpLayer) return false;
+            
+            if (flow.src_port != 0 && pcpp::netToHost16(udpLayer->getUdpHeader()->portSrc) != flow.src_port) {
+                return false;
+            }
+            if (flow.dst_port != 0 && pcpp::netToHost16(udpLayer->getUdpHeader()->portDst) != flow.dst_port) {
+                return false;
+            }
+        }
+    }
+    
+    return true;
+}
+
+// Determine if packet is ingress, egress, or neither based on config
+PacketProcessor::FlowType PacketProcessor::determineFlowType(const pcpp::Packet& packet) const {
+    bool matchesIngress = matchesFlow(packet, config_.ingress_flow);
+    bool matchesEgress = matchesFlow(packet, config_.egress_flow);
+    
+    // Check for ambiguous configuration
+    if (matchesIngress && matchesEgress) {
+        PME_LOG_WARN(log_, "Packet matches both ingress and egress filters - treating as ingress");
+        return FlowType::INGRESS;
+    }
+    
+    if (matchesIngress) {
+        return FlowType::INGRESS;
+    }
+    
+    if (matchesEgress) {
+        return FlowType::EGRESS;
+    }
+    
+    return FlowType::NONE;
+}
+
+// TCP connection lifecycle callbacks
+void PacketProcessor::onTcpConnectionStartCallback(const pcpp::ConnectionData& connectionData, void* userCookie) {
+    PacketProcessor* self = static_cast<PacketProcessor*>(userCookie);
+    if (!self) return;
+    
+    uint32_t flow_id = connectionData.flowKey;
+    
+    // Reset ring buffer for new connection
+    self->flow_buffers_[flow_id].reset();
+    
+    // Determine and store flow type for this TCP connection
+    // We need to create a temporary packet to check flow type
+    // For now, we'll determine this when we get the first data
+}
+
+void PacketProcessor::onTcpConnectionEndCallback(const pcpp::ConnectionData& connectionData, 
+                                                  pcpp::TcpReassembly::ConnectionEndReason reason, 
+                                                  void* userCookie) {
+    PacketProcessor* self = static_cast<PacketProcessor*>(userCookie);
+    if (!self) return;
+    
+    uint32_t flow_id = connectionData.flowKey;
+    
+    // Check for unprocessed data before removing
+    auto it = self->flow_buffers_.find(flow_id);
+    if (it != self->flow_buffers_.end()) {
+        if (it->second.available_data() > 0) {
+            PME_LOG_WARN(self->log_, "TCP Connection Ended for flow key: " << flow_id 
+                         << " with " << it->second.available_data() << " bytes unprocessed");
+        }
+        self->flow_buffers_.erase(it);
+    }
+    
+    // Clean up flow type tracking
+    self->tcp_flow_types_.erase(flow_id);
+}
+
+void PacketProcessor::onTcpMessageReadyCallback(int8_t side, const pcpp::TcpStreamData& tcpData, void* userCookie) {
+    PacketProcessor* self = static_cast<PacketProcessor*>(userCookie);
+    if (!self) {
+        PME_LOG_ERROR(PME_GET_LOGGER("PacketProcessor"), "TCP MessageReady callback: userCookie is null.");
+        return;
+    }
+    
+    uint32_t flow_id = tcpData.getConnectionData().flowKey;
+    
+    // Check if we have flow type stored for this connection
+    auto flowTypeIt = self->tcp_flow_types_.find(flow_id);
+    if (flowTypeIt == self->tcp_flow_types_.end()) {
+        // First time seeing data for this flow, determine its type
+        // We'll use connection info to match against configs
+        const auto& connData = tcpData.getConnectionData();
+        
+        // Check against ingress flow config
+        bool matchesIngress = true;
+        if (!self->config_.ingress_flow.src_ip.empty() && 
+            connData.srcIP.toString() != self->config_.ingress_flow.src_ip) {
+            matchesIngress = false;
+        }
+        if (!self->config_.ingress_flow.dst_ip.empty() && 
+            connData.dstIP.toString() != self->config_.ingress_flow.dst_ip) {
+            matchesIngress = false;
+        }
+        if (self->config_.ingress_flow.src_port != 0 && 
+            connData.srcPort != self->config_.ingress_flow.src_port) {
+            matchesIngress = false;
+        }
+        if (self->config_.ingress_flow.dst_port != 0 && 
+            connData.dstPort != self->config_.ingress_flow.dst_port) {
+            matchesIngress = false;
+        }
+        
+        // Check against egress flow config
+        bool matchesEgress = true;
+        if (!self->config_.egress_flow.src_ip.empty() && 
+            connData.srcIP.toString() != self->config_.egress_flow.src_ip) {
+            matchesEgress = false;
+        }
+        if (!self->config_.egress_flow.dst_ip.empty() && 
+            connData.dstIP.toString() != self->config_.egress_flow.dst_ip) {
+            matchesEgress = false;
+        }
+        if (self->config_.egress_flow.src_port != 0 && 
+            connData.srcPort != self->config_.egress_flow.src_port) {
+            matchesEgress = false;
+        }
+        if (self->config_.egress_flow.dst_port != 0 && 
+            connData.dstPort != self->config_.egress_flow.dst_port) {
+            matchesEgress = false;
+        }
+        
+        FlowType flowType = FlowType::NONE;
+        if (matchesIngress && matchesEgress) {
+            PME_LOG_WARN(self->log_, "TCP connection matches both flows, treating as ingress");
+            flowType = FlowType::INGRESS;
+        } else if (matchesIngress) {
+            flowType = FlowType::INGRESS;
+        } else if (matchesEgress) {
+            flowType = FlowType::EGRESS;
+        }
+        
+        self->tcp_flow_types_[flow_id] = flowType;
+        flowTypeIt = self->tcp_flow_types_.find(flow_id);
+    }
+    
+    // Only process if this connection matches a configured flow
+    if (flowTypeIt->second != FlowType::NONE) {
+        self->processTcpFlowData(flow_id, tcpData);
+    }
+}
+
+void PacketProcessor::processTcpFlowData(uint32_t flow_id, const pcpp::TcpStreamData& tcpData) {
+    auto& ring = flow_buffers_[flow_id];
+    
+    // Write new data to ring buffer
+    const uint8_t* new_data = tcpData.getData();
+    size_t new_len = tcpData.getDataLength();
+    
+    if (new_data && new_len > 0) {
+        size_t written = ring.write(new_data, new_len);
+        if (written < new_len) {
+            PME_LOG_WARN(log_, "Flow key: " << flow_id << " - Ring buffer full, dropped " 
+                         << (new_len - written) << " bytes");
+        }
+    }
+    
+    // Process messages from ring buffer
+    while (ring.available_data() > 0) {
+        // For now we assume Raze protocol which has a header with packet_length
+        if (ring.available_data() < sizeof(uint16_t)) {
+            break;
+        }
+        
+        // Peek at the packet length (assuming it's at the beginning like in Raze)
+        uint16_t message_len;
+        ring.peek(reinterpret_cast<uint8_t*>(&message_len), sizeof(message_len));
+        
+        if (message_len == 0) {
+            PME_LOG_ERROR(log_, "Flow key: " << flow_id << " - Invalid message length 0. Clearing buffer.");
+            ring.reset();
+            break;
+        }
+        
+        if (ring.available_data() < message_len) {
+            // Not enough data for complete message
+            break;
+        }
+        
+        // Check if message is contiguous in buffer
+        auto [data_ptr, contiguous_size] = ring.get_contiguous_data();
+        
+        if (contiguous_size >= message_len) {
+            // Fast path: process directly from ring buffer
+            processTcpMessage(data_ptr, message_len, tcpData);
+        } else {
+            // Slow path: message wraps around, need to copy
+            std::vector<uint8_t> temp(message_len);
+            ring.peek(temp.data(), message_len);
+            processTcpMessage(temp.data(), message_len, tcpData);
+        }
+        
+        ring.consume(message_len);
+    }
+}
+
+void PacketProcessor::processTcpMessage(const uint8_t* data, size_t len, const pcpp::TcpStreamData& tcpData) {
+    // Get flow type for this connection
+    uint32_t flow_id = tcpData.getConnectionData().flowKey;
+    auto flowTypeIt = tcp_flow_types_.find(flow_id);
+    
+    if (flowTypeIt == tcp_flow_types_.end() || flowTypeIt->second == FlowType::NONE) {
+        // This shouldn't happen as we filter in the callback
+        return;
+    }
+    
+    // Use the appropriate protocol based on flow type
+    const std::string& protocol = (flowTypeIt->second == FlowType::INGRESS) 
+        ? config_.ingress_flow.protocol 
+        : config_.egress_flow.protocol;
+    
+    auto results = ProtocolHandlers::processTcpByProtocol(
+        protocol, data, len, tcpData, protocol_context_);
+    
+    // Store with appropriate packet type
+    PacketType pktType = (flowTypeIt->second == FlowType::INGRESS) 
+        ? PacketType::INGRESS_PACKET 
+        : PacketType::EGRESS_PACKET;
+    
+    mergeMaps(results, joinMap_, pktType);
+}
+
+// Process generic packet - can be UDP or TCP
+void PacketProcessor::processPacket(pcpp::Packet& packet) {
+    FlowType flowType = determineFlowType(packet);
+    
+    if (flowType == FlowType::NONE) {
+        // Packet doesn't match any configured flow
+        return;
+    }
+    
+    if (packet.isPacketOfType(pcpp::UDP)) {
+        pcpp::UdpLayer* udpLayer = packet.getLayerOfType<pcpp::UdpLayer>();
+        if (!udpLayer) return;
+        
+        uint8_t* payload = udpLayer->getLayerPayload();
+        size_t payloadSize = udpLayer->getLayerPayloadSize();
+        
+        // Use the appropriate protocol based on flow type
+        const std::string& protocol = (flowType == FlowType::INGRESS) 
+            ? config_.ingress_flow.protocol 
+            : config_.egress_flow.protocol;
+            
+        auto results = ProtocolHandlers::processUdpByProtocol(
+            protocol, payload, payloadSize, packet, protocol_context_);
+        
+        // Store with appropriate packet type
+        PacketType pktType = (flowType == FlowType::INGRESS) 
+            ? PacketType::INGRESS_PACKET 
+            : PacketType::EGRESS_PACKET;
+            
+        mergeMaps(results, joinMap_, pktType);
+        
+    } else if (packet.isPacketOfType(pcpp::TCP)) {
+        // For TCP, we need to track flow type per connection
+        // This will be handled in TCP reassembly callbacks
+        pcpp::TcpLayer* tcpLayer = packet.getLayerOfType<pcpp::TcpLayer>();
+        pcpp::IPv4Layer* ipv4Layer = packet.getLayerOfType<pcpp::IPv4Layer>();
+        
+        if (tcpLayer && ipv4Layer) {
+            tcp_reassembly_.reassemblePacket(packet);
+        }
+    }
+}
+
+// UDP packet processing
+void PacketProcessor::processUdpPacket(pcpp::Packet& packet) {
+    // Apply flow filter
+    if (!matchesFlowFilter(packet, false)) {
+        return;
+    }
+    
+    pcpp::UdpLayer* udpLayer = packet.getLayerOfType<pcpp::UdpLayer>();
+    if (!udpLayer) {
+        return;
+    }
+    
+    pcpp::IPv4Layer* ipv4Layer = packet.getLayerOfType<pcpp::IPv4Layer>();
+    if (!ipv4Layer) {
+        return;
+    }
+    
+    uint8_t* payload = udpLayer->getLayerPayload();
+    size_t payloadSize = udpLayer->getLayerPayloadSize();
+    
+    // Use the configured protocol handler
+    auto results = ProtocolHandlers::processUdpByProtocol(
+        config_.ingress_flow.protocol, payload, payloadSize, packet, protocol_context_);
+    
+    // Merge results into joinMap_ with INGRESS_PACKET type
+    mergeMaps(results, joinMap_, PacketType::INGRESS_PACKET);
+}
+
+void PacketProcessor::mergeMaps(
+    std::unordered_map<uint64_t, ParsedPacketInfo>& from,
+    std::unordered_map<uint64_t, std::array<ParsedPacketInfo, static_cast<size_t>(PacketType::PACKET_COUNT)>>& to,
+    PacketType packetType
+) {
+    for (auto& [hash, packetInfo] : from) {
+        to[hash][static_cast<size_t>(packetType)] = packetInfo;
+    }
+}
+
+// Main processing function
+std::unordered_map<uint64_t, std::array<ParsedPacketInfo, static_cast<size_t>(PacketType::PACKET_COUNT)>> PacketProcessor::processFile(const std::string& filePath) {
+    joinMap_.clear();
+    
+    std::unique_ptr<pcpp::IFileReaderDevice> reader(pcpp::IFileReaderDevice::getReader(filePath));
+    if (!reader || !reader->open()) {
+        PME_LOG_ERROR(log_, "Cannot open PCAP file: " << filePath);
+        return joinMap_;
+    }
+    
+    // Clean up any existing state
+    tcp_reassembly_.closeAllConnections();
+    flow_buffers_.clear();
+    tcp_flow_types_.clear();
+    
+    // Process packets
+    pcpp::RawPacket rawPacket;
+    int packetCount = 0;
+    int ingressCount = 0;
+    int egressCount = 0;
+    int ignoredCount = 0;
+    
+    while (reader->getNextPacket(rawPacket)) {
+        if (ctx_->stop.load()) {
+            break;
+        }
+        
+        packetCount++;
+        pcpp::Packet parsedPacket(&rawPacket);
+        
+        // Determine flow type for this packet
+        FlowType flowType = determineFlowType(parsedPacket);
+        
+        if (flowType == FlowType::NONE) {
+            ignoredCount++;
+            continue;
+        }
+        
+        if (flowType == FlowType::INGRESS) {
+            ingressCount++;
+        } else {
+            egressCount++;
+        }
+        
+        // Process packet based on its transport protocol
+        processPacket(parsedPacket);
+        
+        // Yield periodically to avoid hogging CPU
+        if (packetCount % config_.packet_yield_interval == 0) {
+            std::this_thread::sleep_for(std::chrono::microseconds(50));
+        } else {
+            std::this_thread::yield();
+        }
+    }
+    
+    // Clean up
+    tcp_reassembly_.closeAllConnections();
+    flow_buffers_.clear();
+    tcp_flow_types_.clear();
+    
+    PME_LOG_INFO(log_, "Processed " << filePath 
+                       << " - Total: " << packetCount
+                       << ", Ingress: " << ingressCount
+                       << ", Egress: " << egressCount
+                       << ", Ignored: " << ignoredCount
+                       << ", SPCastV3: " << protocol_context_.stats.spcast_v3_messages
+                       << ", SPCastV4: " << protocol_context_.stats.spcast_v4_messages
+                       << ", Raze: " << protocol_context_.stats.raze_messages);
+    
+    reader->close();
+    
+    return joinMap_;
+}
+
+} // namespace pme
+
+### END: src/PacketProcessor.cpp ###
+
+### FILE: src/PacketProcessor.h ###
+#pragma once
+
+#include <cassert>
+#include <chrono>
+#include <cstdint>
+#include <cstring>
+#include <memory>
+#include <string>
+#include <unordered_map>
+#include <utility>
+#include <vector>
+#include <array>
+
+#include <PcapFileDevice.h>
+#include <Packet.h>
+#include <TcpReassembly.h>
+#include <boost/functional/hash.hpp>
+#include <razeapi/messages/raze.hpp>
+#include <razeapi/messages/xraze.hpp>
+#include <md_api/proto/spcast_v3.h>
+#include <md_api/proto/spcast_v4.h>
+#include "Log.h"
+
+#include "DropcopyHandler.h"
+#include "RuntimeContext.h"
+#include "ProtocolHandlers.h"
+#include "Config.h"
+
+namespace spcast {
+    namespace SpcastVersion3Traits {
+        using PacketHeader = md_api::proto::spcast_v3::packet_header_t;
+        using MessageHeader = md_api::proto::spcast_v3::message_header_t;
+    };
+    
+    namespace SpcastVersion4Traits {
+        using PacketHeader = md_api::proto::spcast_v4::packet_header_t;
+        using MessageHeader = md_api::proto::spcast_v4::message_header_t;
+    };
+}
+
+namespace RazeFormatter {
+    using Header = xraze::header;
+    using UnsequencedHeader = ::raze::unsequenced_header;
+    using NewOrder = ::raze::new_order;
+    using MessageType = ::raze::message_type_e;
+    using PacketType = xraze::packet_type_e;
+}
+
+namespace pme {
+
+// Forward declarations
+class IProtocolHandler;
+class ITcpProtocolHandler;
+
+// Enum class for packet indexing
+enum class PacketType : size_t {
+    INGRESS_PACKET = 0,
+    EGRESS_PACKET = 1,
+    PACKET_COUNT = 2  // Total number of packet types
+};
+
+struct ParsedPacketInfo
+{
+    std::chrono::time_point<std::chrono::high_resolution_clock> ts_;
+    bool valid_ = false;  // Track if this slot has been filled
+    
+    ParsedPacketInfo() = default;  // Default constructor for array initialization
+    ParsedPacketInfo(std::chrono::time_point<std::chrono::high_resolution_clock> timestamp)
+        : ts_(timestamp), valid_(true) {}
+    
+    std::chrono::time_point<std::chrono::high_resolution_clock> getTimeStamp() const 
+    {
+        return ts_;
+    }
+    
+    bool isValid() const { return valid_; }
+};
+
+template<size_t SIZE = 65536>  // 64KB per flow
+class FlowRingBuffer {
+    alignas(64) uint8_t buffer_[SIZE];  // Cache line aligned
+    size_t write_pos_ = 0;
+    size_t read_pos_ = 0;
+    
+public:
+    size_t available_space() const {
+        return SIZE - (write_pos_ - read_pos_);
+    }
+    
+    size_t available_data() const {
+        return write_pos_ - read_pos_;
+    }
+    
+    // Write data into buffer
+    size_t write(const uint8_t* data, size_t len) {
+        len = std::min(len, available_space());
+        size_t write_idx = write_pos_ % SIZE;
+        size_t first_part = std::min(len, SIZE - write_idx);
+        
+        // Bounds check
+        assert(write_idx < SIZE);
+        assert(first_part <= SIZE);
+        
+        std::memcpy(&buffer_[write_idx], data, first_part);
+        if (len > first_part) {
+            std::memcpy(&buffer_[0], data + first_part, len - first_part);
+        }
+        
+        write_pos_ += len;
+        return len;
+    }
+    
+    // Peek at data without consuming
+    size_t peek(uint8_t* dest, size_t len) const {
+        len = std::min(len, available_data());
+        size_t read_idx = read_pos_ % SIZE;
+        size_t first_part = std::min(len, SIZE - read_idx);
+        
+        // Bounds check
+        assert(read_idx < SIZE);
+        assert(first_part <= SIZE);
+        
+        std::memcpy(dest, &buffer_[read_idx], first_part);
+        if (len > first_part) {
+            std::memcpy(dest + first_part, &buffer_[0], len - first_part);
+        }
+        
+        return len;
+    }
+    
+    // Get pointer to contiguous readable data
+    std::pair<const uint8_t*, size_t> get_contiguous_data() const {
+        if (available_data() == 0) return {nullptr, 0};
+        
+        size_t read_idx = read_pos_ % SIZE;
+        size_t contiguous = std::min(available_data(), SIZE - read_idx);
+        return {&buffer_[read_idx], contiguous};
+    }
+    
+    // Consume data
+    void consume(size_t len) {
+        read_pos_ += std::min(len, available_data());
+    }
+    
+    void reset() {
+        write_pos_ = 0;
+        read_pos_ = 0;
+    }
+};
+
+class PacketProcessor {
+public:
+    PacketProcessor(const std::unordered_map<uint64_t, LatencyStats>& mapRef, 
+                    std::shared_ptr<RuntimeContext> ctx,
+                    const AppConfig& config);
+    ~PacketProcessor();
+    
+    std::unordered_map<uint64_t, std::array<ParsedPacketInfo, static_cast<size_t>(PacketType::PACKET_COUNT)>> processFile(const std::string& filePath);
+    
+    /**
+     * Get protocol statistics after processing.
+     * @return The protocol context statistics
+     */
+    const ProtocolContext& getProtocolContext() const { return protocol_context_; }
+    
+private:
+    // TCP Reassembly callbacks
+    static void onTcpMessageReadyCallback(int8_t side, const pcpp::TcpStreamData& tcpData, void* userCookie);
+    static void onTcpConnectionStartCallback(const pcpp::ConnectionData& connectionData, void* userCookie);
+    static void onTcpConnectionEndCallback(const pcpp::ConnectionData& connectionData, 
+                                          pcpp::TcpReassembly::ConnectionEndReason reason, void* userCookie);
+    
+    // Protocol processing
+    void processTcpFlowData(uint32_t flow_id, const pcpp::TcpStreamData& tcpData);
+    void processTcpMessage(const uint8_t* data, size_t len, const pcpp::TcpStreamData& tcpData);
+    void processUdpPacket(pcpp::Packet& packet);
+    void processPacket(pcpp::Packet& packet);  // New unified packet processor
+    
+    // Flow filtering
+    bool matchesFlowFilter(const pcpp::Packet& packet, bool isTcp) const;
+    
+    // New method to determine packet flow type
+    enum class FlowType { INGRESS, EGRESS, NONE };
+    FlowType determineFlowType(const pcpp::Packet& packet) const;
+    bool matchesFlow(const pcpp::Packet& packet, const FlowConfig& flow) const;
+    
+    // Helper methods
+    void mergeMaps(
+        std::unordered_map<uint64_t, ParsedPacketInfo>& from,
+        std::unordered_map<uint64_t, std::array<ParsedPacketInfo, static_cast<size_t>(PacketType::PACKET_COUNT)>>& to,
+        PacketType packetType
+    );
+    
+    px::Log* log_;
+    pcpp::TcpReassembly tcp_reassembly_;
+    std::unordered_map<uint32_t, FlowRingBuffer<>> flow_buffers_;  // Ring buffers per flow
+    
+    const std::unordered_map<uint64_t, LatencyStats>& dropcopy_map_ref_;
+    std::shared_ptr<RuntimeContext> ctx_;
+    AppConfig config_;
+    std::unordered_map<uint64_t, std::array<ParsedPacketInfo, static_cast<size_t>(PacketType::PACKET_COUNT)>> joinMap_;
+    
+    // Track flow type per TCP connection
+    std::unordered_map<uint32_t, FlowType> tcp_flow_types_;
+    
+    uint64_t last_udpseq_ {0};
+    ProtocolContext protocol_context_;
+    
+    static px::Log* getLogger();
+};
+
+} // namespace pme
+
+### END: src/PacketProcessor.h ###
+
+### FILE: src/ProtocolHandlers.h ###
+#pragma once
+
+#include <cstdint>
+#include <memory>
+#include <string>
+#include <chrono>
+#include <vector>
+#include <unordered_map>
+#include <functional>
+
+#include <PcapFileDevice.h>
+#include <Packet.h>
+#include <TcpReassembly.h>
+#include <boost/functional/hash.hpp>
+#include <razeapi/messages/raze.hpp>
+#include <razeapi/messages/xraze.hpp>
+#include <md_api/proto/spcast_v3.h>
+#include <md_api/proto/spcast_v4.h>
+
+#include "DropcopyHandler.h"
+#include "Log.h"
+
+namespace pme {
+
+// Forward declarations
+enum class PacketType : size_t;
+struct ParsedPacketInfo;
+
+/**
+ * Lightweight protocol context - just what handlers need
+ */
+struct ProtocolContext {
+    const std::unordered_map<uint64_t, LatencyStats>& dropcopy_map_ref;
+    px::Log* log;
+    uint64_t& last_udp_seq;
+    
+    // Statistics
+    struct {
+        uint64_t spcast_v3_messages = 0;
+        uint64_t spcast_v4_messages = 0;
+        uint64_t raze_messages = 0;
+    } stats;
+    
+    // Helper for consistent hash generation
+    static uint64_t generateHash(uint64_t seq, uint64_t recv, uint64_t send) {
+        std::size_t seed = 0;
+        boost::hash_combine(seed, seq);
+        boost::hash_combine(seed, recv);
+        boost::hash_combine(seed, send);
+        return static_cast<uint64_t>(seed);
+    }
+};
+
+/**
+ * Protocol handlers namespace - contains all protocol processing logic
+ * Add new protocol handlers here as static functions
+ */
+namespace ProtocolHandlers {
+    
+    // Helper to convert timespec to chrono time_point
+    inline std::chrono::time_point<std::chrono::high_resolution_clock> 
+    timespecToTimePoint(const timespec& in) {
+        auto duration = std::chrono::duration_cast<std::chrono::high_resolution_clock::duration>(
+            std::chrono::seconds(in.tv_sec) + std::chrono::nanoseconds(in.tv_nsec));
+        return std::chrono::time_point<std::chrono::high_resolution_clock>(duration);
+    }
+    
+    /**
+     * Handle SPCast V3 UDP packets
+     */
+    inline std::unordered_map<uint64_t, ParsedPacketInfo> 
+    handleSpcastV3(const uint8_t* payload, size_t payloadSize, pcpp::Packet& packet, ProtocolContext& ctx) {
+        using PacketHeader = md_api::proto::spcast_v3::packet_header_t;
+        using MessageHeader = md_api::proto::spcast_v3::message_header_t;
+        
+        std::unordered_map<uint64_t, ParsedPacketInfo> result;
+        
+        if (payloadSize < sizeof(PacketHeader)) {
+            PME_LOG_WARN(ctx.log, "SPCastV3: Datagram too small (" << payloadSize << " bytes)");
+            return result;
+        }
+        
+        auto timestamp = timespecToTimePoint(packet.getRawPacket()->getPacketTimeStamp());
+        const auto* pktHdr = reinterpret_cast<const PacketHeader*>(payload);
+        
+        const uint64_t recv_timestamp_ns = pktHdr->recv_timestamp_ns;
+        const uint64_t send_timestamp_ns = pktHdr->send_timestamp_ns;
+        
+        // Process messages in packet
+        const uint8_t* cursor = payload + sizeof(PacketHeader);
+        const uint8_t* end = payload + payloadSize;
+        
+        while (cursor + sizeof(MessageHeader) <= end) {
+            const auto* msgHdr = reinterpret_cast<const MessageHeader*>(cursor);
+            uint16_t msg_len = msgHdr->length;
+            
+            if (msg_len == 0) {
+                PME_LOG_WARN(ctx.log, "SPCastV3: Message length 0");
+                break;
+            }
+            
+            if (cursor + msg_len > end) {
+                PME_LOG_WARN(ctx.log, "SPCastV3: Truncated message");
+                break;
+            }
+            
+            uint64_t seq = msgHdr->seq_num;
+            
+            // Deduplicate by sequence number
+            if (seq != ctx.last_udp_seq) {
+                uint64_t hash = ProtocolContext::generateHash(seq, recv_timestamp_ns, send_timestamp_ns);
+                result[hash] = ParsedPacketInfo(timestamp);
+                ctx.last_udp_seq = seq;
+            }
+            
+            ++ctx.stats.spcast_v3_messages;
+            cursor += msg_len;
+        }
+        
+        return result;
+    }
+    
+    /**
+     * Handle SPCast V4 UDP packets (placeholder)
+     */
+    inline std::unordered_map<uint64_t, ParsedPacketInfo> 
+    handleSpcastV4(const uint8_t* payload, size_t payloadSize, pcpp::Packet& packet, ProtocolContext& ctx) {
+        std::unordered_map<uint64_t, ParsedPacketInfo> result;
+        PME_LOG_WARN(ctx.log, "SPCastV4 handling not implemented - packet ignored");
+        ++ctx.stats.spcast_v4_messages;
+        return result;
+    }
+    
+    /**
+     * Handle Raze TCP protocol messages
+     */
+    inline std::unordered_map<uint64_t, ParsedPacketInfo> 
+    handleRazeMessage(const uint8_t* data, size_t len, const pcpp::TcpStreamData& tcpData, ProtocolContext& ctx) {
+        using Header = xraze::header;
+        using UnsequencedHeader = ::raze::unsequenced_header;
+        using NewOrder = ::raze::new_order;
+        using MessageType = ::raze::message_type_e;
+        using PacketType = xraze::packet_type_e;
+        
+        std::unordered_map<uint64_t, ParsedPacketInfo> result;
+        
+        if (len < sizeof(Header)) {
+            return result;
+        }
+        
+        const auto* hdr = reinterpret_cast<const Header*>(data);
+        
+        // Only process unsequenced_data packets
+        if (hdr->packet_type == PacketType::unsequenced_data) {
+            const auto* unSeqHdr = reinterpret_cast<const UnsequencedHeader*>(hdr);
+            
+            // Only process new_order messages
+            if (unSeqHdr->message_type == MessageType::new_order) {
+                const auto* newOrder = reinterpret_cast<const NewOrder*>(hdr);
+                
+                auto it = ctx.dropcopy_map_ref.find(static_cast<uint64_t>(newOrder->data.order_token));
+                if (it != ctx.dropcopy_map_ref.end()) {
+                    auto stat = it->second;
+                    uint64_t hash = ProtocolContext::generateHash(
+                        stat.md_seq_num, 
+                        stat.md_recv_time, 
+                        stat.md_send_time
+                    );
+                    result[hash] = ParsedPacketInfo(tcpData.getTimeStampPrecise());
+                } else {
+                    PME_LOG_WARN(ctx.log, "Order token " << newOrder->data.order_token 
+                                         << " not found in dropcopy map");
+                }
+            }
+        }
+        
+        ++ctx.stats.raze_messages;
+        return result;
+    }
+    
+    /**
+     * UDP protocol dispatcher - add new UDP protocols here
+     */
+    inline std::unordered_map<uint64_t, ParsedPacketInfo> 
+    processUdpPayload(const uint8_t* payload, size_t payloadSize, pcpp::Packet& packet, ProtocolContext& ctx) {
+        if (payloadSize == 0) {
+            return {};
+        }
+        
+        // First byte is version in SPCAST protocols
+        uint8_t version = *payload;
+        
+        switch (version) {
+            case 3:
+                return handleSpcastV3(payload, payloadSize, packet, ctx);
+            case 4:
+                return handleSpcastV4(payload, payloadSize, packet, ctx);
+            default:
+                PME_LOG_WARN(ctx.log, "Unknown UDP protocol version: " << static_cast<int>(version));
+                return {};
+        }
+    }
+    
+    /**
+     * Process UDP payload based on protocol name from config
+     */
+    inline std::unordered_map<uint64_t, ParsedPacketInfo> 
+    processUdpByProtocol(const std::string& protocol, const uint8_t* payload, size_t payloadSize, 
+                         pcpp::Packet& packet, ProtocolContext& ctx) {
+        if (protocol == "spcastv3") {
+            // Check version byte
+            if (payloadSize > 0 && payload[0] == 3) {
+                return handleSpcastV3(payload, payloadSize, packet, ctx);
+            }
+        } else if (protocol == "spcastv4") {
+            // Check version byte
+            if (payloadSize > 0 && payload[0] == 4) {
+                return handleSpcastV4(payload, payloadSize, packet, ctx);
+            }
+        }
+        // Add more UDP protocols here
+        
+        return {};
+    }
+    
+    /**
+     * Process TCP data based on protocol name from config
+     */
+    inline std::unordered_map<uint64_t, ParsedPacketInfo> 
+    processTcpByProtocol(const std::string& protocol, const uint8_t* data, size_t len,
+                         const pcpp::TcpStreamData& tcpData, ProtocolContext& ctx) {
+        if (protocol == "raze") {
+            return handleRazeMessage(data, len, tcpData, ctx);
+        }
+        // Add more TCP protocols here
+        
+        PME_LOG_WARN(ctx.log, "Unknown TCP protocol: " << protocol);
+        return {};
+    }
+    
+    // Future protocol handlers can be added here as simple functions:
+    // - handleSomeOtherProtocol(...)
+    // - handleYetAnotherProtocol(...)
+}
+
+} // namespace pme 
+### END: src/ProtocolHandlers.h ###
+
+### FILE: src/RuntimeContext.h ###
+#pragma once
+
+#include <atomic>
+#include <memory>
+
+namespace pme {
+
+struct RuntimeContext
+{
+    std::atomic<bool> stop{false};
+};
+
+} // namespace pme
+
+### END: src/RuntimeContext.h ###
+
+### FILE: src/main.cpp ###
+#include <memory>
+
+#include <spapp/logging/logging.hpp>
+
+#include "Cli.h"
+#include "Engine.h"
+#include "RuntimeContext.h"
+#include "Log.h"
+
+int main(int argc, char** argv)
+{
+    sp::logging::start(sp::logging::stdout_config());
+    sp::logging::set_override(sp::logging::level::DEBUG);
+
+    auto config = pme::parse_cli(argc, argv);
+    auto ctx = std::make_shared<pme::RuntimeContext>();
+
+    pme::Engine g_engine(ctx, config);
+    g_engine.run();
+
+    sp::logging::stop();
+    return 0;
+}
+
+### END: src/main.cpp ###
+
+### FILE: src/protocols/IProtocolHandler.h ###
+#pragma once
+
+#include <cstdint>
+#include <memory>
+#include <string>
+#include <chrono>
+#include <vector>
+#include <unordered_map>
+
+namespace pcpp {
+    class Packet;
+    class TcpStreamData;
+}
+
+namespace pme {
+
+// Forward declarations
+struct ParsedPacketInfo;
+struct ProtocolContext;
+
+/**
+ * Base interface for all protocol handlers.
+ * This interface defines the contract that all protocol implementations must follow.
+ */
+class IProtocolHandler {
+public:
+    virtual ~IProtocolHandler() = default;
+    
+    /**
+     * Get the name of the protocol handler.
+     * @return The protocol name (e.g., "SPCastV3", "Raze", etc.)
+     */
+    virtual std::string getName() const = 0;
+    
+    /**
+     * Check if this handler can process the given packet.
+     * @param packet The packet to check
+     * @return true if this handler can process the packet, false otherwise
+     */
+    virtual bool canHandle(const pcpp::Packet& packet) const = 0;
+    
+    /**
+     * Process a packet and extract relevant information.
+     * @param packet The packet to process
+     * @param context Protocol processing context containing shared state
+     * @return A map of hash keys to parsed packet information
+     */
+    virtual std::unordered_map<uint64_t, ParsedPacketInfo> processPacket(
+        pcpp::Packet& packet,
+        ProtocolContext& context
+    ) = 0;
+};
+
+/**
+ * Interface for UDP-based protocol handlers.
+ */
+class IUdpProtocolHandler : public IProtocolHandler {
+public:
+    /**
+     * Get the protocol version this handler supports.
+     * @return The protocol version number
+     */
+    virtual uint8_t getVersion() const = 0;
+    
+    /**
+     * Process UDP payload data.
+     * @param payload The UDP payload data
+     * @param payloadSize Size of the payload
+     * @param packet The original packet for timestamp extraction
+     * @param context Protocol processing context
+     * @return A map of hash keys to parsed packet information
+     */
+    virtual std::unordered_map<uint64_t, ParsedPacketInfo> processPayload(
+        const uint8_t* payload,
+        size_t payloadSize,
+        pcpp::Packet& packet,
+        ProtocolContext& context
+    ) = 0;
+};
+
+/**
+ * Interface for TCP-based protocol handlers.
+ */
+class ITcpProtocolHandler : public IProtocolHandler {
+public:
+    /**
+     * Process reassembled TCP stream data.
+     * @param data The reassembled TCP data
+     * @param len Length of the data
+     * @param tcpData TCP stream metadata
+     * @param context Protocol processing context
+     * @return A map of hash keys to parsed packet information
+     */
+    virtual std::unordered_map<uint64_t, ParsedPacketInfo> processTcpData(
+        const uint8_t* data,
+        size_t len,
+        const pcpp::TcpStreamData& tcpData,
+        ProtocolContext& context
+    ) = 0;
+    
+    /**
+     * Check if this handler can process the given TCP stream.
+     * @param tcpData The TCP stream data to check
+     * @return true if this handler can process the stream, false otherwise
+     */
+    virtual bool canHandleTcpStream(const pcpp::TcpStreamData& tcpData) const = 0;
+};
+
+} // namespace pme 
+### END: src/protocols/IProtocolHandler.h ###
+
+### FILE: src/protocols/ProtocolContext.h ###
+#pragma once
+
+#include <cstdint>
+#include <unordered_map>
+#include <boost/functional/hash.hpp>
+#include "DropcopyHandler.h"
+#include "Log.h"
+
+namespace pme {
+
+/**
+ * Context structure that holds shared state for protocol processing.
+ * This allows protocol handlers to access common resources without tight coupling.
+ */
+struct ProtocolContext {
+    // Reference to the dropcopy map for order token lookups
+    const std::unordered_map<uint64_t, LatencyStats>& dropcopy_map_ref;
+    
+    // Logger instance
+    px::Log* log;
+    
+    // Last processed UDP sequence number (for deduplication)
+    uint64_t& last_udp_seq;
+    
+    // Statistics counters
+    struct Statistics {
+        uint64_t spcast_v3_messages = 0;
+        uint64_t spcast_v4_messages = 0;
+        uint64_t raze_messages = 0;
+        uint64_t unknown_messages = 0;
+    } stats;
+    
+    /**
+     * Generate a hash from packet attributes.
+     * @param seq Sequence number
+     * @param recv Receive timestamp
+     * @param send Send timestamp
+     * @return Generated hash value
+     */
+    static uint64_t generateHash(uint64_t seq, uint64_t recv, uint64_t send) {
+        std::size_t seed = 0;
+        boost::hash_combine(seed, seq);
+        boost::hash_combine(seed, recv);
+        boost::hash_combine(seed, send);
+        return static_cast<uint64_t>(seed);
+    }
+    
+    // Constructor
+    ProtocolContext(
+        const std::unordered_map<uint64_t, LatencyStats>& dropcopy_ref,
+        px::Log* logger,
+        uint64_t& last_seq
+    ) : dropcopy_map_ref(dropcopy_ref), log(logger), last_udp_seq(last_seq) {}
+};
+
+} // namespace pme 
+### END: src/protocols/ProtocolContext.h ###
+
+### FILE: src/protocols/ProtocolRegistry.cpp ###
+#include "ProtocolRegistry.h"
+#include "SpcastV3Handler.h"
+#include "SpcastV4Handler.h"
+#include "RazeProtocolHandler.h"
+#include <algorithm>
+
+namespace pme {
+
+void ProtocolRegistry::registerUdpHandler(std::shared_ptr<IUdpProtocolHandler> handler) {
+    if (!handler) return;
+    
+    udp_handlers_.push_back(handler);
+    handlers_by_name_[handler->getName()] = handler;
+}
+
+void ProtocolRegistry::registerTcpHandler(std::shared_ptr<ITcpProtocolHandler> handler) {
+    if (!handler) return;
+    
+    tcp_handlers_.push_back(handler);
+    handlers_by_name_[handler->getName()] = handler;
+}
+
+std::shared_ptr<IUdpProtocolHandler> ProtocolRegistry::findUdpHandlerByVersion(uint8_t version) const {
+    auto it = std::find_if(udp_handlers_.begin(), udp_handlers_.end(),
+        [version](const std::shared_ptr<IUdpProtocolHandler>& handler) {
+            return handler->getVersion() == version;
+        });
+    
+    return (it != udp_handlers_.end()) ? *it : nullptr;
+}
+
+std::shared_ptr<IProtocolHandler> ProtocolRegistry::findHandlerByName(const std::string& name) const {
+    auto it = handlers_by_name_.find(name);
+    return (it != handlers_by_name_.end()) ? it->second : nullptr;
+}
+
+void ProtocolRegistry::clear() {
+    udp_handlers_.clear();
+    tcp_handlers_.clear();
+    handlers_by_name_.clear();
+}
+
+void ProtocolRegistry::initializeDefaultHandlers() {
+    // Clear any existing handlers
+    clear();
+    
+    // Register SPCast V3 handler
+    registerUdpHandler(std::make_shared<SpcastV3Handler>());
+    
+    // Register SPCast V4 handler (placeholder for now)
+    registerUdpHandler(std::make_shared<SpcastV4Handler>());
+    
+    // Register Raze protocol handler
+    registerTcpHandler(std::make_shared<RazeProtocolHandler>());
+    
+    // Future protocols can be added here:
+    // registerUdpHandler(std::make_shared<SomeOtherUdpProtocolHandler>());
+    // registerTcpHandler(std::make_shared<SomeOtherTcpProtocolHandler>());
+}
+
+} // namespace pme 
+### END: src/protocols/ProtocolRegistry.cpp ###
+
+### FILE: src/protocols/ProtocolRegistry.h ###
+#pragma once
+
+#include <memory>
+#include <vector>
+#include <unordered_map>
+#include <string>
+#include "IProtocolHandler.h"
+
+namespace pme {
+
+/**
+ * Registry for managing protocol handlers.
+ * This class provides a central place to register and retrieve protocol handlers.
+ */
+class ProtocolRegistry {
+public:
+    static ProtocolRegistry& getInstance() {
+        static ProtocolRegistry instance;
+        return instance;
+    }
+    
+    /**
+     * Register a UDP protocol handler.
+     * @param handler The protocol handler to register
+     */
+    void registerUdpHandler(std::shared_ptr<IUdpProtocolHandler> handler);
+    
+    /**
+     * Register a TCP protocol handler.
+     * @param handler The protocol handler to register
+     */
+    void registerTcpHandler(std::shared_ptr<ITcpProtocolHandler> handler);
+    
+    /**
+     * Get all registered UDP handlers.
+     * @return Vector of UDP protocol handlers
+     */
+    const std::vector<std::shared_ptr<IUdpProtocolHandler>>& getUdpHandlers() const {
+        return udp_handlers_;
+    }
+    
+    /**
+     * Get all registered TCP handlers.
+     * @return Vector of TCP protocol handlers
+     */
+    const std::vector<std::shared_ptr<ITcpProtocolHandler>>& getTcpHandlers() const {
+        return tcp_handlers_;
+    }
+    
+    /**
+     * Find a UDP handler by version.
+     * @param version The protocol version
+     * @return The handler if found, nullptr otherwise
+     */
+    std::shared_ptr<IUdpProtocolHandler> findUdpHandlerByVersion(uint8_t version) const;
+    
+    /**
+     * Find a handler by name.
+     * @param name The protocol name
+     * @return The handler if found, nullptr otherwise
+     */
+    std::shared_ptr<IProtocolHandler> findHandlerByName(const std::string& name) const;
+    
+    /**
+     * Clear all registered handlers.
+     */
+    void clear();
+    
+    /**
+     * Initialize with default protocol handlers.
+     * This method registers the built-in protocols (SPCastV3, Raze, etc.)
+     */
+    void initializeDefaultHandlers();
+    
+private:
+    ProtocolRegistry() = default;
+    ~ProtocolRegistry() = default;
+    
+    // Prevent copying
+    ProtocolRegistry(const ProtocolRegistry&) = delete;
+    ProtocolRegistry& operator=(const ProtocolRegistry&) = delete;
+    
+    std::vector<std::shared_ptr<IUdpProtocolHandler>> udp_handlers_;
+    std::vector<std::shared_ptr<ITcpProtocolHandler>> tcp_handlers_;
+    std::unordered_map<std::string, std::shared_ptr<IProtocolHandler>> handlers_by_name_;
+};
+
+} // namespace pme 
+### END: src/protocols/ProtocolRegistry.h ###
+
+### FILE: tests/DropcopyHandler_test.cpp ###
+#include "gtest/gtest.h"
+#include "../src/DropcopyHandler.h"
+#include <fstream>
+#include <filesystem>
+#include <chrono>
+
+class DropcopyHandlerTest : public ::testing::Test {
+protected:
+    void SetUp() override {
+        // Create temporary directory for test files
+        test_dir_ = std::filesystem::temp_directory_path() / "dropcopy_test";
+        std::filesystem::create_directories(test_dir_);
+    }
+
+    void TearDown() override {
+        // Clean up test files
+        std::filesystem::remove_all(test_dir_);
+    }
+
+    void CreateTestFile(const std::string& filename, const std::string& content) {
+        std::ofstream file(test_dir_ / filename);
+        file << content;
+        file.close();
+    }
+
+    std::filesystem::path test_dir_;
+};
+
+// Test timestamp parsing
+TEST_F(DropcopyHandlerTest, ParseTimestampValid) {
+    DropcopyHandler handler("");
+    
+    // Test full nanosecond precision
+    uint64_t result = handler.parseTimestamp("2024-01-15 14:30:45.123456789");
+    
+    // Verify the result (you may need to adjust expected value)
+    // This is 2024-01-15 14:30:45.123456789 UTC in nanoseconds since epoch
+    EXPECT_GT(result, 0);
+    
+    // Test with fewer nanoseconds
+    uint64_t result2 = handler.parseTimestamp("2024-01-15 14:30:45.123");
+    EXPECT_GT(result2, 0);
+    
+    // Test without nanoseconds
+    uint64_t result3 = handler.parseTimestamp("2024-01-15 14:30:45");
+    EXPECT_GT(result3, 0);
+}
+
+TEST_F(DropcopyHandlerTest, ParseTimestampEdgeCases) {
+    DropcopyHandler handler("");
+    
+    // Test epoch time
+    uint64_t epoch = handler.parseTimestamp("1970-01-01 00:00:00");
+    EXPECT_EQ(epoch, 0);
+    
+    // Test invalid format should return 0
+    uint64_t invalid = handler.parseTimestamp("invalid-timestamp");
+    EXPECT_EQ(invalid, 0);
+}
+
+// Test key-value parsing
+TEST_F(DropcopyHandlerTest, ParseKeyValue) {
+    DropcopyHandler handler("");
+    
+    std::string_view text = "key1=value1, key2='quoted value', key3=123";
+    size_t pos = 0;
+    
+    auto [k1, v1] = handler.parseKV(text, pos);
+    EXPECT_EQ(k1, "key1");
+    EXPECT_EQ(v1, "value1");
+    
+    auto [k2, v2] = handler.parseKV(text, pos);
+    EXPECT_EQ(k2, "key2");
+    EXPECT_EQ(v2, "'quoted value'");
+    
+    auto [k3, v3] = handler.parseKV(text, pos);
+    EXPECT_EQ(k3, "key3");
+    EXPECT_EQ(v3, "123");
+}
+
+// Test full file parsing
+TEST_F(DropcopyHandlerTest, ParseDropcopyFile) {
+    std::string test_content = R"(
+2024-01-15 14:30:45.123 [INFO] Order placed: clordid = 12345 , latency_stats = {event_type=QUOTE, md_seq_num=100, md_feed_name='FEED1', exch_seq_num=200, before_md_recv=2024-01-15 14:30:45.100000000, after_md_recv=2024-01-15 14:30:45.101000000}
+2024-01-15 14:30:46.456 [INFO] Order placed: clordid = 67890 , latency_stats = {event_type=TRADE, md_seq_num=101, md_feed_name='FEED2', exch_seq_num=201, before_md_recv=2024-01-15 14:30:46.400000000, after_md_recv=2024-01-15 14:30:46.401000000}
+)";
+    
+    CreateTestFile("test_dropcopy.log", test_content);
+    
+    DropcopyHandler handler((test_dir_ / "test_dropcopy.log").string());
+    auto map = handler.getMapRef();
+    
+    EXPECT_EQ(map.size(), 2);
+    
+    // Check first entry
+    auto it1 = map.find(12345);
+    ASSERT_NE(it1, map.end());
+    EXPECT_EQ(it1->second.event_type, "QUOTE");
+    EXPECT_EQ(it1->second.md_seq_num, 100);
+    EXPECT_EQ(it1->second.md_feed_name, "FEED1");
+    
+    // Check second entry
+    auto it2 = map.find(67890);
+    ASSERT_NE(it2, map.end());
+    EXPECT_EQ(it2->second.event_type, "TRADE");
+    EXPECT_EQ(it2->second.md_seq_num, 101);
+    EXPECT_EQ(it2->second.md_feed_name, "FEED2");
+}
+
+// Test empty file
+TEST_F(DropcopyHandlerTest, ParseEmptyFile) {
+    CreateTestFile("empty.log", "");
+    
+    DropcopyHandler handler((test_dir_ / "empty.log").string());
+    auto map = handler.getMapRef();
+    
+    EXPECT_TRUE(map.empty());
+}
+
+// Test malformed entries
+TEST_F(DropcopyHandlerTest, ParseMalformedEntries) {
+    std::string test_content = R"(
+This is not a valid line
+clordid = not_a_number , latency_stats = {event_type=QUOTE}
+2024-01-15 14:30:45.123 [INFO] Order placed: clordid = 12345 , latency_stats = {malformed
+)";
+    
+    CreateTestFile("malformed.log", test_content);
+    
+    DropcopyHandler handler((test_dir_ / "malformed.log").string());
+    auto map = handler.getMapRef();
+    
+    // Should skip malformed entries
+    EXPECT_EQ(map.size(), 0);
+} 
+### END: tests/DropcopyHandler_test.cpp ###
