@@ -1380,11 +1380,6 @@ public:
      */
     const Flow* classify(const pcpp::ConnectionData& conn) const;
 
-    /**
-     * Get all flows for a specific direction (for compatibility/debugging)
-     */
-    std::vector<const Flow*> getFlowsByDirection(FlowDirection direction) const;
-
 private:
     // Helper methods
     bool matchesPacket(const pcpp::Packet& packet, const Flow& flow) const;
@@ -1499,11 +1494,10 @@ std::unique_ptr<IProtocolHandler> createProtocolHandler(MessageProtocol protocol
 
 #include "Log.h"
 #include "PacketProcessor.h"  // For JoinedPackets
+#include "ParsedPacketInfo.h"  // For ParsedPacketInfo struct
+#include "FlowClassifier.h"    // For FLOW_TYPE_COUNT
 
 namespace pme {
-
-// Forward declaration for ParsedPacketInfo
-struct ParsedPacketInfo;
 
 namespace OutputFileWriter
 {
@@ -2200,9 +2194,6 @@ private:
 #pragma once
 #include <chrono>
 #include <cstdint>
-
-// Constants for array sizing
-static constexpr size_t FLOW_TYPE_COUNT = 2;  // INGRESS and EGRESS (NONE is not stored)
 
 struct ParsedPacketInfo
 {
