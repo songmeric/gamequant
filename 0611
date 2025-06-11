@@ -2227,8 +2227,11 @@ namespace pme {
 
 // Helper implementation for hash generation
 uint64_t ProtocolContext::generateHash(uint64_t seq, uint64_t recv, uint64_t send) {
-    // Simple hash combining - same as before
-    return seq ^ (recv << 16) ^ (send << 32);
+        std::size_t seed = 0;
+        boost::hash_combine(seed, seq);
+        boost::hash_combine(seed, recv);
+        boost::hash_combine(seed, send);
+        return static_cast<uint64_t>(seed);
 }
 
 std::unique_ptr<IProtocolHandler> createProtocolHandler(MessageProtocol protocol) {
