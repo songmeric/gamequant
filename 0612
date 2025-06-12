@@ -1,0 +1,108 @@
+#include <sys/epoll.h>
+#include <sys/inotify.h>
+#include <unistd.h>
+#include <queue>
+#include <unordered_map>
+#include <filesystem>
+
+// -----------------------------------------------------------------------------
+//  Engine::getNextPcapFile()
+//  Call this at the start of your main loop to obtain the next finished capture
+// -----------------------------------------------------------------------------
+std::filesystem::path Engine::getNextPcapFile()
+{
+    namespace fs = std::filesystem;
+
+    /* ---------- one-time initialisation ----------------------------------- */
+    static bool        initialised = false;
+    static int         epfd        = -1;            // epoll instance
+    static int         inofd       = -1;            // inotify instance
+    static std::unordered_map<int, fs::path> wd2dir; // watch-descriptor → dir
+    using QItem = std::pair<fs::file_time_type, fs::path>;
+    static std::priority_queue<
+        QItem,
+        std::vector<QItem>,
+        std::greater<>> ready;                       // min-heap (youngest first)
+
+    if (!initialised)
+    {
+        inofd = ::inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
+        epfd  = ::epoll_create1(EPOLL_CLOEXEC);
+
+        epoll_event ev{};
+        ev.events  = EPOLLIN;
+        ev.data.fd = inofd;
+        ::epoll_ctl(epfd, EPOLL_CTL_ADD, inofd, &ev);
+
+        for (const auto& fs_def : config_.flow_sets)
+        {
+            if (fs::exists(fs_def.watch_directory))
+            {
+                int wd = ::inotify_add_watch(inofd,
+                                             fs_def.watch_directory.c_str(),
+                                             IN_CLOSE_WRITE);
+                wd2dir.emplace(wd, fs_def.watch_directory);
+            }
+        }
+        initialised = true;
+    }
+
+    /* ---------- discard already-handled items at top of heap -------------- */
+    while (!ready.empty() &&
+           processed_files_.count(ready.top().second.string()))
+    {
+        ready.pop();
+    }
+    if (!ready.empty())
+    {
+        auto p = ready.top().second;
+        ready.pop();
+        return p;                         // O(1) fast-path
+    }
+
+    /* ---------- poll kernel once (non-blocking) --------------------------- */
+    epoll_event evt[8];
+    int n = ::epoll_wait(epfd, evt, 8, /*timeout ms*/ 0);
+
+    if (n > 0 && evt[0].data.fd == inofd)
+    {
+        char buf[4096] __attribute__((aligned(8)));
+        ssize_t len = ::read(inofd, buf, sizeof(buf));
+
+        for (char* ptr = buf; len >= static_cast<ssize_t>(sizeof(inotify_event));
+             /* advance below */)
+        {
+            auto* ev = reinterpret_cast<inotify_event*>(ptr);
+
+            if (ev->mask & IN_CLOSE_WRITE && ev->len)
+            {
+                fs::path file = wd2dir[ev->wd] / ev->name;
+                auto ext      = file.extension().string();
+
+                if ((ext == ".pcap" || ext == ".pcapng") &&
+                    !processed_files_.count(file.string()))
+                {
+                    ready.emplace(fs::last_write_time(file), file);
+                }
+            }
+
+            std::size_t step = sizeof(inotify_event) + ev->len;
+            ptr += step;
+            len -= step;
+        }
+    }
+
+    /* ---------- return next file if any ----------------------------------- */
+    while (!ready.empty() &&
+           processed_files_.count(ready.top().second.string()))
+    {
+        ready.pop();
+    }
+    if (!ready.empty())
+    {
+        auto p = ready.top().second;
+        ready.pop();
+        return p;
+    }
+    return {};            // nothing ready right now
+}
