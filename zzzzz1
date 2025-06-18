@@ -1,0 +1,30 @@
+size_t RazeHandler::getTcpMessageLength(const uint8_t* data, size_t available_size) const {
+    size_t total_parsable_bytes = 0;
+    size_t offset = 0;
+    
+    while (offset < available_size) {
+        // Check if we have enough bytes to read packet_length
+        if (available_size - offset < sizeof(uint16_t)) {
+            break;  // Truncated message, stop here
+        }
+        
+        // Read packet_length at current offset
+        uint16_t packet_length = *reinterpret_cast<const uint16_t*>(data + offset);
+        
+        // Validate packet length
+        if (packet_length == 0) {
+            break;  // Invalid packet, stop processing
+        }
+        
+        // Check if we have the complete packet
+        if (offset + packet_length > available_size) {
+            break;  // Truncated message, stop here
+        }
+        
+        // We have a complete packet, include it in parsable bytes
+        total_parsable_bytes += packet_length;
+        offset += packet_length;
+    }
+    
+    return total_parsable_bytes;
+}
