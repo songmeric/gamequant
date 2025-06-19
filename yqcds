@@ -1,0 +1,178 @@
+#!/usr/bin/env python3
+"""
+Combine PME project files into a single portable text file.
+This script collects all source files, protocol files, tests, and configuration files
+into a single text file that can be easily shared or pasted.
+"""
+
+import os
+import glob
+from pathlib import Path
+from datetime import datetime
+
+
+def read_file_safely(filepath):
+    """Read file content safely, handling different encodings."""
+    encodings = ['utf-8', 'utf-8-sig', 'latin-1', 'cp1252']
+    
+    for encoding in encodings:
+        try:
+            with open(filepath, 'r', encoding=encoding) as f:
+                return f.read()
+        except (UnicodeDecodeError, UnicodeError):
+            continue
+    
+    # If all encodings fail, read as binary and convert
+    try:
+        with open(filepath, 'rb') as f:
+            content = f.read()
+            return content.decode('utf-8', errors='replace')
+    except Exception as e:
+        return f"[ERROR reading file: {e}]"
+
+
+def get_file_info(filepath):
+    """Get file size and line count."""
+    try:
+        size = os.path.getsize(filepath)
+        content = read_file_safely(filepath)
+        lines = content.count('\n') + 1 if content and not content.endswith('\n') else content.count('\n')
+        return size, lines
+    except:
+        return 0, 0
+
+
+def format_file_header(filepath, base_path):
+    """Format a nice header for each file."""
+    rel_path = os.path.relpath(filepath, base_path).replace('\\', '/')
+    size, lines = get_file_info(filepath)
+    
+    header = f"""
+{"="*80}
+FILE: {rel_path}
+SIZE: {size:,} bytes
+LINES: {lines:,}
+{"="*80}
+"""
+    return header
+
+
+def collect_files(base_path):
+    """Collect all relevant files from the project."""
+    files_to_collect = []
+    
+    # Root directory files (CMakeLists.txt, *.md, *.yaml)
+    root_patterns = ['CMakeLists.txt', '*.md', '*.yaml']
+    for pattern in root_patterns:
+        files_to_collect.extend(glob.glob(os.path.join(base_path, pattern)))
+    
+    # src/ directory (all files)
+    src_path = os.path.join(base_path, 'src')
+    if os.path.exists(src_path):
+        for file in os.listdir(src_path):
+            filepath = os.path.join(src_path, file)
+            if os.path.isfile(filepath):
+                files_to_collect.append(filepath)
+    
+    # src/protocols/ directory (all files)
+    protocols_path = os.path.join(base_path, 'src', 'protocols')
+    if os.path.exists(protocols_path):
+        for file in os.listdir(protocols_path):
+            filepath = os.path.join(protocols_path, file)
+            if os.path.isfile(filepath):
+                files_to_collect.append(filepath)
+    
+    # tests/ directory (all files)
+    tests_path = os.path.join(base_path, 'tests')
+    if os.path.exists(tests_path):
+        for file in os.listdir(tests_path):
+            filepath = os.path.join(tests_path, file)
+            if os.path.isfile(filepath):
+                files_to_collect.append(filepath)
+    
+    # Remove duplicates and sort
+    files_to_collect = sorted(list(set(files_to_collect)))
+    
+    return files_to_collect
+
+
+def main():
+    """Main function to combine all project files."""
+    # Get the base path (current directory)
+    base_path = os.getcwd()
+    
+    print(f"PME Project File Combiner")
+    print(f"Base path: {base_path}")
+    print("-" * 50)
+    
+    # Collect all files
+    files = collect_files(base_path)
+    
+    if not files:
+        print("No files found to collect!")
+        return
+    
+    print(f"Found {len(files)} files to combine")
+    
+    # Create output filename with timestamp
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_file = f"pme_combined_{timestamp}.txt"
+    
+    # Write all files to the output
+    with open(output_file, 'w', encoding='utf-8') as out:
+        # Write header
+        out.write(f"""PME PROJECT COMBINED FILES
+Generated: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
+Total files: {len(files)}
+
+This file contains all source code, configuration, and test files from the PME project.
+Each file is clearly marked with separators for easy extraction.
+
+{"="*80}
+
+TABLE OF CONTENTS:
+""")
+        
+        # Write table of contents
+        for i, filepath in enumerate(files, 1):
+            rel_path = os.path.relpath(filepath, base_path).replace('\\', '/')
+            out.write(f"{i:3d}. {rel_path}\n")
+        
+        out.write("\n" + "="*80 + "\n\n")
+        
+        # Write each file
+        for filepath in files:
+            rel_path = os.path.relpath(filepath, base_path).replace('\\', '/')
+            print(f"Processing: {rel_path}")
+            
+            # Write file header
+            out.write(format_file_header(filepath, base_path))
+            
+            # Write file content
+            content = read_file_safely(filepath)
+            out.write(content)
+            
+            # Write file footer
+            out.write(f"\n{'='*80}\n")
+            out.write(f"END OF FILE: {rel_path}\n")
+            out.write(f"{'='*80}\n\n")
+    
+    print("-" * 50)
+    print(f"✓ Combined file created: {output_file}")
+    print(f"✓ Total size: {os.path.getsize(output_file):,} bytes")
+    
+    # Also create a simpler version without headers for easier copy-paste
+    simple_output = f"pme_simple_{timestamp}.txt"
+    with open(simple_output, 'w', encoding='utf-8') as out:
+        for filepath in files:
+            rel_path = os.path.relpath(filepath, base_path).replace('\\', '/')
+            out.write(f"\n### FILE: {rel_path} ###\n")
+            content = read_file_safely(filepath)
+            out.write(content)
+            out.write(f"\n### END: {rel_path} ###\n")
+    
+    print(f"✓ Simple version created: {simple_output}")
+
+
+if __name__ == "__main__":
+    main() 
