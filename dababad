@@ -7,12 +7,12 @@ project(pme
     LANGUAGES CXX
 )
 
-#
+# 
 # Build Configuration
 #
 
-include(Functions)
 list(APPEND CMAKE_MODULE_PATH /opt/sp/cmake/2.25/modules/)
+include(Functions)
 add_compile_options(-Wall -Wno-interference-size)
 
 set(CMAKE_CXX_STANDARD 20)
@@ -29,7 +29,7 @@ set(CMAKE_BUILD_TYPE Debug)
 # Dependencies
 #
 
-# PcapPlusPlus (local install)
+# --- PcapPlusPlus (local install)
 set(PCPP_ROOT "$ENV{HOME}/pcpp-install" CACHE PATH "PcapPlusPlus install root")
 set(PCPP_INCLUDE_DIR "${PCPP_ROOT}/include/pcapplusplus")
 set(PCPP_LIB_DIR "${PCPP_ROOT}/lib64")
@@ -233,7 +233,7 @@ flow_sets:
         src_port: 0
         dst_port: 2528
     watch_directory: /apps/home/songjoon/pme_new/pcaps # Directory containing PCAP files
-    output_directory: ./output # Output directory for result CSV files
+    output_directory: ../output # Output directory for result CSV files
 
 other_configs:
   dropcopy_path: /apps/home/songjoon/pme_new/dropcopy/live_dropcopy #GTAd dropcopy file path
@@ -261,7 +261,7 @@ inline AppConfig parse_cli(int argc, char** argv)
     namespace po = boost::program_options;
 
     std::string config_path;
-    po::options_description desc{"pme Packet Matching Engine"};
+    po::options_description desc{"pme - Packet Matching Engine"};
     desc.add_options()
         ("config,c", po::value<std::string>(&config_path)->required(),
          "Path to YAML configuration file");
@@ -275,7 +275,6 @@ inline AppConfig parse_cli(int argc, char** argv)
     // Load and validate configuration
     try {
         auto config = AppConfig::load(config_path);
-
         std::cout << "Configuration loaded successfully from: " << config_path << std::endl;
         std::cout << "Number of flow sets: " << config.flow_sets.size() << std::endl;
 
@@ -293,7 +292,6 @@ inline AppConfig parse_cli(int argc, char** argv)
                           << ":" << (flow.dst_port == 0 ? "any" : std::to_string(flow.dst_port))
                           << ")" << std::endl;
             }
-
             std::cout << "  Egress flows: " << flow_set.egress_flows.size() << std::endl;
             for (size_t i = 0; i < flow_set.egress_flows.size(); ++i) {
                 const auto& flow = flow_set.egress_flows[i];
@@ -328,7 +326,7 @@ inline AppConfig parse_cli(int argc, char** argv)
 namespace pme {
 
 Protocol parseProtocol(const YAML::Node& protocol_node) {
-    if (!protocol_node["communication"] || !protocol_node["message"]) {
+    if(!protocol_node["communication"] || !protocol_node["message"]) {
         throw std::runtime_error("Protocol definition must include 'communication' and 'message' fields");
     }
 
@@ -339,7 +337,7 @@ Protocol parseProtocol(const YAML::Node& protocol_node) {
     protocol.communication = stringToCommunicationProtocol(comm_str);
     protocol.message = stringToMessageProtocol(msg_str);
 
-    if (!protocol.is_valid()) {
+    if(!protocol.is_valid()) {
         throw std::runtime_error("Invalid protocol specified: " + comm_str + "/" + msg_str);
     }
 
@@ -350,12 +348,11 @@ Flow parseFlow(const YAML::Node& node, FlowDirection direction, const std::strin
     Flow flow;
     flow.parent_set = parent_set;
     flow.direction = direction;
-
-    if (!node["name"]) {
+    if(!node["name"]) {
         throw std::runtime_error("Each flow must have a 'name' field");
     }
 
-    if (node["name"]) {
+    if(node["name"]) {
         flow.name = node["name"].as<std::string>();
     }
 
@@ -590,7 +587,7 @@ struct AppConfig {
 
 namespace pme {
 
-DropcopyHandler::DropcopyHandler(const std::string& dropcopy_path)
+DropcopyHandler::DropcopyHandler(const std::string dropcopy_path)
     : dir_(std::move(dropcopy_path)), log_(PME_GET_LOGGER("DropcopyHandler"))
 {
     map_ = parseDropcopy(dir_);
@@ -600,7 +597,7 @@ DropcopyHandler::DropcopyHandler(const std::string& dropcopy_path)
 
 std::unordered_map<uint64_t, LatencyStats>& DropcopyHandler::refreshDcMap() {
     map_ = parseDropcopy(dir_);
-    PME_LOG_INFO(log_, "Dropcopy file Refreshed: Parsed " << map_.size() << " entries from dropcopy file");
+    PME_LOG_INFO(log_, "Dropcopyfile Refreshed: Parsed " << map_.size() << " entries from dropcopy file");
     return map_;
 }
 
@@ -641,7 +638,7 @@ public:
     // format: YYYY-MM-DD HH:MM:SS.nnnnnnnnn
     uint64_t parseTimestamp(std::string_view timestamp) {
         // Expected format: "YYYY-MM-DD HH:MM:SS.nnnnnnnnn"
-        // Positions:        01234567890123456789012345678
+        // Positions:        01234567890123456789012345567
         
         // Initialize all variables to avoid -Wmaybe-uninitialized
         int year = 0, month = 0, day = 0, hour = 0, minute = 0, second = 0;
@@ -710,7 +707,7 @@ public:
     }
 
     // Key-Value parser
-    std::pair<std::string_view, std::string_view>
+    std::pair<std::string_view,std::string_view>
     parseKV(std::string_view text, size_t& pos)
     {
         // skip whitespace
@@ -782,9 +779,9 @@ public:
                     if (k == "event_type") {
                         stats.event_type = std::string(v);
                     } else if (k == "md_seq_num") {
-                        stats.md_seq_num = std::stoi(std::string(v));
+                        stats.md_seq_num = std::stoull(std::string(v));
                     } else if (k == "md_feed_name") {
-                        // strip quotes if present add bounds checking
+                        // strip quotes if present - add bounds checking
                         stats.md_feed_name = (!v.empty() && v.front()=='\"' && v.back()=='\"')
                             ? std::string(v.substr(1, v.size()-2))
                             : std::string(v);
@@ -793,7 +790,7 @@ public:
                     } else if (k == "exch_src_id") {
                         stats.exch_src_id = std::stoi(std::string(v));
                     } else if (k == "md_sec_ric") {
-                        stats.md_sec_ric = std::stoi(std::string(v));
+                        stats.md_sec_ric = std::stoull(std::string(v));
                     } else if (k == "oms_queue_size") {
                         stats.oms_queue_size = std::stoi(std::string(v));
                     } else if (k == "before_md_recv") {
@@ -887,7 +884,7 @@ Engine::Engine(std::shared_ptr<RuntimeContext> ctx, const AppConfig& config)
       config_(config),
       log_(PME_GET_LOGGER("Engine"))
 {
-    PME_LOG_INFO(log_, "Engine initialized with " << config.flow_sets.size() << " flow sets:");
+    PME_LOG_INFO(log_, "Engine initialized with " << config_.flow_sets.size() << " flow sets:");
     for (const auto& flow_set : config_.flow_sets) {
         PME_LOG_INFO(log_, "  Flow set: " << flow_set.set_name);
         PME_LOG_INFO(log_, "    Watch directory: " << flow_set.watch_directory);
@@ -1065,8 +1062,8 @@ void Engine::workerMain() {
                 total_entries += packets.size();
             }
             PME_LOG_INFO(log_, "Finished processing: " << pcap_file.string()
-                         << ", Total flow sets: " << outputMap_.size()
-                         << ", Total entries: " << total_entries);
+                         << " - Total flow sets: " << outputMap_.size()
+                         << " - Total entries: " << total_entries);
 
             // Write output files after each PCAP file (overwrites existing)
             writeOutputFiles();
@@ -1692,7 +1689,7 @@ void PacketProcessor::handlePacket(pcpp::Packet& packet, const Flow* flow) {
         }
 
         processMessages(handler, payload, payloadSize,
-                       timespecToTimePoint(packet.getRawPacket()->getPacketTimestamp()),
+                       timespecToTimePoint(packet.getRawPacket()->getPacketTimeStamp()),
                        flow->direction, flow);
 
     } else if (packet.isPacketOfType(pcpp::TCP)) {
@@ -1782,7 +1779,7 @@ std::unordered_map<std::string, std::vector<JoinedMsgs>> PacketProcessor::proces
                  << ", Ignored: " << ignoredCount);
 
     if (buffer_stats.max_buffer_size > DEFAULT_BUFFER_SIZE) {
-        PME_LOG_INFO(log_, "Buffer Statistics: Active flows: " << buffer_stats.active_flows
+        PME_LOG_INFO(log_, "Buffer Statistics - Active flows: " << buffer_stats.active_flows
                      << ", Max buffer size reached: " << buffer_stats.max_buffer_size
                      << " bytes (initial: " << DEFAULT_BUFFER_SIZE << ")");
     }
@@ -2057,9 +2054,9 @@ namespace SpcastVersion4Traits {
 
 namespace RazeFormatter {
     using Header = xraze::header;
-    using UnsequencedHeader = xraze::unsequenced_header;
-    using NewOrder = xraze::new_order;
-    using MessageType = xraze::message_type_e;
+    using UnsequencedHeader = ::raze::unsequenced_header;
+    using NewOrder = ::raze::new_order;
+    using MessageType = ::raze::message_type_e;
     using PacketType = xraze::packet_type_e;
 }
 
@@ -2453,27 +2450,27 @@ struct LatencyStats {
 
     friend std::ostream& operator<<(std::ostream& os, LatencyStats const& s) {
         os << "event_type=" << s.event_type
-           << ", md_seq_num=" << s.md_seq_num
-           << ", md_feed_name=" << s.md_feed_name
-           << ", exch_seq_num=" << s.exch_seq_num
-           << ", exch_src_id=" << s.exch_src_id
-           << ", md_sec_ric=" << s.md_sec_ric
-           << ", oms_queue_size=" << s.oms_queue_size
-           << ", before_md_recv=" << s.before_md_recv
-           << ", after_md_recv=" << s.after_md_recv
-           << ", before_md_decode=" << s.before_md_decode
-           << ", after_md_decode=" << s.after_md_decode
-           << ", before_strategy=" << s.before_strategy
-           << ", before_slice_new=" << s.before_slice_new
-           << ", before_soflomo_check=" << s.before_soflomo_check
-           << ", before_oms_send=" << s.before_oms_send
-           << ", before_driver_send=" << s.before_driver_send
-           << ", after_driver_send=" << s.after_driver_send
-           << ", md_recv_time=" << s.md_recv_time
-           << ", md_send_time=" << s.md_send_time
-           << ", md_exchange_time=" << s.md_exchange_time
-           << ", md_event_id=" << s.md_event_id
-           << ", hw_recv_time=" << s.hw_recv_time;
+           << " md_seq_num=" << s.md_seq_num
+           << " md_feed_name=" << s.md_feed_name
+           << " exch_seq_num=" << s.exch_seq_num
+           << " exch_src_id=" << s.exch_src_id
+           << " md_sec_ric=" << s.md_sec_ric
+           << " oms_queue_size=" << s.oms_queue_size
+           << " before_md_recv=" << s.before_md_recv
+           << " after_md_recv=" << s.after_md_recv
+           << " before_md_decode=" << s.before_md_decode
+           << " after_md_decode=" << s.after_md_decode
+           << " before_strategy=" << s.before_strategy
+           << " before_slice_new=" << s.before_slice_new
+           << " before_soflomo_check=" << s.before_soflomo_check
+           << " before_oms_send=" << s.before_oms_send
+           << " before_driver_send=" << s.before_driver_send
+           << " after_driver_send=" << s.after_driver_send
+           << " md_recv_time=" << s.md_recv_time
+           << " md_send_time=" << s.md_send_time
+           << " md_exchange_time=" << s.md_exchange_time
+           << " md_event_id=" << s.md_event_id
+           << " hw_recv_time=" << s.hw_recv_time;
 
         return os;
     }
@@ -2620,8 +2617,8 @@ TEST_F(DropcopyHandlerTest, ParseEmptyFile) {
 TEST_F(DropcopyHandlerTest, ParseMalformedEntries) {
     std::string test_content = R"(
 This is not a valid line
-clordid = not_a_number latency_stats = {event_type=QUOTE}
-2024-01-15 14:30:45.123 [INFO] Order placed: clordid = 12345 latency_stats = {malformed
+clordid = not_a_number, latency_stats = {event_type=QUOTE}
+2024-01-15 14:30:45.123 [INFO] Order placed: clordid = 12345, latency_stats = {malformed
 )";
 
     CreateTestFile("malformed.log", test_content);
@@ -2644,11 +2641,11 @@ clordid = not_a_number latency_stats = {event_type=QUOTE}
 #include <chrono>
 
 #include "Config.h"
-#include "../src/RazeHandler.h"
-#include "../src/Types.h"
-#include "../src/Hash.h"
-#include "../src/Protocols.h"
-#include "../src/DropcopyHandler.h"
+#include "RazeHandler.h"
+#include "Types.h"
+#include "Hash.h"
+#include "Protocols.h"
+#include "DropcopyHandler.h"
 
 namespace pme {
 
@@ -2697,16 +2694,16 @@ TEST(RazeHandlerTest, ParseValidMessages) {
 
 ### FILE: tests/SpcastV3Handler_test.cpp ###
 #include <gtest/gtest.h>
-#include "../src/SpcastV3Handler.h"
-#include "../src/Types.h"//for LatencyStats header
-#include "../src/Hash.h"
+#include "SpcastV3Handler.h"
+#include "Types.h"//for LatencyStats header
+#include "Hash.h"
 #include <md_api/proto/spcast_v3.h>
 #include <unordered_map>
 #include <vector>
 #include <chrono>
-#include "../src/Protocols.h"
-#include "../src/Log.h"
-#include "../src/Config.h"
+#include "Protocols.h"
+#include "Log.h"
+#include "Config.h"
 
 namespace pme {
 
