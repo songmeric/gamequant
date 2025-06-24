@@ -14,16 +14,7 @@ namespace pme {
 
 // Test fixture for common setup
 class SpcastV3HandlerTest : public ::testing::Test {
-protected:
-    AppConfig config;
-    std::unique_ptr<SpcastV3Handler> handler;
-    Flow test_flow{"TestFlow", "TestSet", Protocol{}, "", "", 0, 0, FlowDirection::INGRESS};
-    
-    void SetUp() override {
-        config.oldest_spcast_date = parseDateToHighResolutionClock("01/01/2024");
-        handler = std::make_unique<SpcastV3Handler>(config);
-    }
-    
+public:
     // Helper to create a valid SpcastV3 packet header
     static std::vector<uint8_t> createPacketHeader(uint64_t recv_timestamp = 1750000000000000000,
                                            uint64_t send_timestamp = 1750000000000000000) {
@@ -61,6 +52,16 @@ protected:
         }
         
         return packet;
+    }
+
+protected:
+    AppConfig config;
+    std::unique_ptr<SpcastV3Handler> handler;
+    Flow test_flow{"TestFlow", "TestSet", Protocol{}, "", "", 0, 0, FlowDirection::INGRESS};
+    
+    void SetUp() override {
+        config.oldest_spcast_date = parseDateToHighResolutionClock("01/01/2024");
+        handler = std::make_unique<SpcastV3Handler>(config);
     }
 };
 
