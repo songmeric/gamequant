@@ -1,149 +1,152 @@
 #include <gtest/gtest.h>
-#include "RingBuffer.h"
-#include <cstring>
+#include "SpcastV3Handler.h"
+#include <md_api/proto/spcast_v3.h>
+#include "Types.h"
+#include "Hash.h"
+#include "Config.h"
 
 namespace pme {
 
-class RingBufferTest : public ::testing::Test {
+class SpcastV3HandlerTest : public ::testing::Test {
 protected:
-    static constexpr size_t BUFFER_SIZE = 1024;
+    AppConfig config;
+    std::unique_ptr<SpcastV3Handler> handler;
+    
+    void SetUp() override {
+        config.oldest_spcast_date = parseDateToHighResolutionClock("01/01/2020");
+        handler = std::make_unique<SpcastV3Handler>(config);
+    }
 };
 
-// Test basic write and read
-TEST_F(RingBufferTest, WriteAndRead) {
-    RingBuffer buffer(BUFFER_SIZE);
+// Test parsing a real SpcastV3 packet with one message
+TEST_F(SpcastV3HandlerTest, ParseSingleMessage) {
+    // Create packet header + one message
+    const uint16_t msg_size = sizeof(spcast::SpcastVersion3Traits::MessageHeader) + 8; // header + symbol
+    std::vector<uint8_t> packet(sizeof(spcast::SpcastVersion3Traits::PacketHeader) + msg_size);
     
-    // Write some data
-    const char* data = "Hello, World!";
-    size_t data_len = strlen(data);
+    // Fill packet header
+    auto* pktHdr = reinterpret_cast<spcast::SpcastVersion3Traits::PacketHeader*>(packet.data());
+    pktHdr->version = spcast::SpcastVersion3Traits::Version;
+    pktHdr->recv_timestamp_ns = 1750000000000000000;
+    pktHdr->send_timestamp_ns = 1750000000000000001;
     
-    EXPECT_EQ(buffer.write(reinterpret_cast<const uint8_t*>(data), data_len), data_len);
-    EXPECT_EQ(buffer.available_data(), data_len);
+    // Fill message header
+    auto* msgHdr = reinterpret_cast<spcast::SpcastVersion3Traits::MessageHeader*>(
+        packet.data() + sizeof(spcast::SpcastVersion3Traits::PacketHeader));
+    msgHdr->length = msg_size;
+    msgHdr->symbol_offset = sizeof(spcast::SpcastVersion3Traits::MessageHeader);
+    msgHdr->symbol_size = 8;
+    msgHdr->seq_num = 12345;
+    msgHdr->exch_timestamp_ns = 1750000000000000000;
     
-    // Read it back
-    std::vector<uint8_t> read_data(data_len);
-    EXPECT_EQ(buffer.read(read_data.data(), data_len), data_len);
+    Flow flow{"TestFlow", "Set1", Protocol{}, "", "", 0, 0, FlowDirection::INGRESS};
+    auto timestamp = std::chrono::high_resolution_clock::now();
     
-    // Verify data matches
-    EXPECT_EQ(memcmp(data, read_data.data(), data_len), 0);
+    auto messages = handler->getMessages(&flow, packet.data(), packet.size(), timestamp);
+    
+    ASSERT_EQ(messages.size(), 1);
+    EXPECT_EQ(messages[0].join_key, generateHash(12345, 1750000000000000000, 1750000000000000001));
 }
 
-// Test multiple writes and reads
-TEST_F(RingBufferTest, MultipleWritesAndReads) {
-    RingBuffer buffer(BUFFER_SIZE);
+// Test duplicate detection - same sequence should be ignored
+TEST_F(SpcastV3HandlerTest, SkipDuplicateSequence) {
+    // Create same packet
+    const uint16_t msg_size = sizeof(spcast::SpcastVersion3Traits::MessageHeader) + 8;
+    std::vector<uint8_t> packet(sizeof(spcast::SpcastVersion3Traits::PacketHeader) + msg_size);
     
-    // Write three messages
-    const char* msg1 = "First message";
-    const char* msg2 = "Second message";
-    const char* msg3 = "Third message";
+    auto* pktHdr = reinterpret_cast<spcast::SpcastVersion3Traits::PacketHeader*>(packet.data());
+    pktHdr->version = spcast::SpcastVersion3Traits::Version;
+    pktHdr->recv_timestamp_ns = 1750000000000000000;
+    pktHdr->send_timestamp_ns = 1750000000000000001;
     
-    buffer.write(reinterpret_cast<const uint8_t*>(msg1), strlen(msg1));
-    buffer.write(reinterpret_cast<const uint8_t*>(msg2), strlen(msg2));
-    buffer.write(reinterpret_cast<const uint8_t*>(msg3), strlen(msg3));
+    auto* msgHdr = reinterpret_cast<spcast::SpcastVersion3Traits::MessageHeader*>(
+        packet.data() + sizeof(spcast::SpcastVersion3Traits::PacketHeader));
+    msgHdr->length = msg_size;
+    msgHdr->symbol_offset = sizeof(spcast::SpcastVersion3Traits::MessageHeader);
+    msgHdr->symbol_size = 8;
+    msgHdr->seq_num = 99999;
+    msgHdr->exch_timestamp_ns = 1750000000000000000;
     
-    // Read all back at once
-    size_t total_size = strlen(msg1) + strlen(msg2) + strlen(msg3);
-    std::vector<uint8_t> all_data(total_size);
-    EXPECT_EQ(buffer.read(all_data.data(), total_size), total_size);
+    Flow flow{"TestFlow", "Set1", Protocol{}, "", "", 0, 0, FlowDirection::INGRESS};
+    auto timestamp = std::chrono::high_resolution_clock::now();
     
-    // Verify all messages are there in order
-    size_t offset = 0;
-    EXPECT_EQ(memcmp(all_data.data() + offset, msg1, strlen(msg1)), 0);
-    offset += strlen(msg1);
-    EXPECT_EQ(memcmp(all_data.data() + offset, msg2, strlen(msg2)), 0);
-    offset += strlen(msg2);
-    EXPECT_EQ(memcmp(all_data.data() + offset, msg3, strlen(msg3)), 0);
+    // First call processes
+    auto messages1 = handler->getMessages(&flow, packet.data(), packet.size(), timestamp);
+    ASSERT_EQ(messages1.size(), 1);
+    
+    // Second call with same sequence skips
+    auto messages2 = handler->getMessages(&flow, packet.data(), packet.size(), timestamp);
+    EXPECT_EQ(messages2.size(), 0);
 }
 
-// Test consume functionality
-TEST_F(RingBufferTest, ConsumeData) {
-    RingBuffer buffer(BUFFER_SIZE);
+// Test different flows track sequences independently
+TEST_F(SpcastV3HandlerTest, FlowsAreIndependent) {
+    // Create a fresh handler to ensure clean state
+    AppConfig fresh_config;
+    fresh_config.oldest_spcast_date = parseDateToHighResolutionClock("01/01/2020");
+    auto fresh_handler = std::make_unique<SpcastV3Handler>(fresh_config);
     
-    // Write 100 bytes
-    std::vector<uint8_t> data(100, 0xAA);
-    buffer.write(data.data(), data.size());
-    EXPECT_EQ(buffer.available_data(), 100);
+    const uint16_t msg_size = sizeof(spcast::SpcastVersion3Traits::MessageHeader) + 8;
+    std::vector<uint8_t> packet(sizeof(spcast::SpcastVersion3Traits::PacketHeader) + msg_size);
     
-    // Consume 50 bytes
-    buffer.consume(50);
-    EXPECT_EQ(buffer.available_data(), 50);
+    auto* pktHdr = reinterpret_cast<spcast::SpcastVersion3Traits::PacketHeader*>(packet.data());
+    pktHdr->version = spcast::SpcastVersion3Traits::Version;
+    pktHdr->recv_timestamp_ns = 1750000000000000000;
+    pktHdr->send_timestamp_ns = 1750000000000000001;
     
-    // Read remaining 50 bytes
-    std::vector<uint8_t> remaining(50);
-    EXPECT_EQ(buffer.read(remaining.data(), 50), 50);
+    auto* msgHdr = reinterpret_cast<spcast::SpcastVersion3Traits::MessageHeader*>(
+        packet.data() + sizeof(spcast::SpcastVersion3Traits::PacketHeader));
+    msgHdr->length = msg_size;
+    msgHdr->symbol_offset = sizeof(spcast::SpcastVersion3Traits::MessageHeader);
+    msgHdr->symbol_size = 8;
+    msgHdr->seq_num = 5000;
+    msgHdr->exch_timestamp_ns = 1750000000000000000;
     
-    // Should all be 0xAA
-    for (uint8_t byte : remaining) {
-        EXPECT_EQ(byte, 0xAA);
-    }
+    Flow flow1{"Set1", "Flow1", Protocol{}, "", "", 0, 0, FlowDirection::INGRESS};
+    Flow flow2{"Set1", "Flow2", Protocol{}, "", "", 0, 0, FlowDirection::INGRESS};
+    auto timestamp = std::chrono::high_resolution_clock::now();
+    
+    // Same packet on different flows should both process
+    auto messages1 = fresh_handler->getMessages(&flow1, packet.data(), packet.size(), timestamp);
+    auto messages2 = fresh_handler->getMessages(&flow2, packet.data(), packet.size(), timestamp);
+    
+    EXPECT_EQ(messages1.size(), 1);
+    EXPECT_EQ(messages2.size(), 1);
 }
 
-// Test wrap-around behavior
-TEST_F(RingBufferTest, WrapAround) {
-    RingBuffer buffer(64);  // Small buffer to force wrap
+// Test invalid version is rejected
+TEST_F(SpcastV3HandlerTest, RejectWrongVersion) {
+    std::vector<uint8_t> packet(sizeof(spcast::SpcastVersion3Traits::PacketHeader));
+    auto* pktHdr = reinterpret_cast<spcast::SpcastVersion3Traits::PacketHeader*>(packet.data());
+    pktHdr->version = static_cast<md_api::proto::spcast_v3::version_enum>(1); // Wrong version
     
-    // Fill most of the buffer
-    std::vector<uint8_t> data1(50, 0x11);
-    buffer.write(data1.data(), data1.size());
+    Flow flow{"TestFlow", "Set1", Protocol{}, "", "", 0, 0, FlowDirection::INGRESS};
+    auto timestamp = std::chrono::high_resolution_clock::now();
     
-    // Consume some to make room at the beginning
-    buffer.consume(30);
-    
-    // Write more data that will wrap around
-    std::vector<uint8_t> data2(40, 0x22);
-    buffer.write(data2.data(), data2.size());
-    
-    // Read all data
-    std::vector<uint8_t> all_data(60);  // 20 from data1 + 40 from data2
-    EXPECT_EQ(buffer.read(all_data.data(), 60), 60);
-    
-    // Verify first 20 bytes are 0x11
-    for (int i = 0; i < 20; i++) {
-        EXPECT_EQ(all_data[i], 0x11);
-    }
-    // Verify next 40 bytes are 0x22
-    for (int i = 20; i < 60; i++) {
-        EXPECT_EQ(all_data[i], 0x22);
-    }
+    auto messages = handler->getMessages(&flow, packet.data(), packet.size(), timestamp);
+    EXPECT_TRUE(messages.empty());
 }
 
-// Test peek functionality
-TEST_F(RingBufferTest, PeekData) {
-    RingBuffer buffer(BUFFER_SIZE);
+// Test old timestamps are rejected
+TEST_F(SpcastV3HandlerTest, RejectOldTimestamp) {
+    const uint16_t msg_size = sizeof(spcast::SpcastVersion3Traits::MessageHeader) + 8;
+    std::vector<uint8_t> packet(sizeof(spcast::SpcastVersion3Traits::PacketHeader) + msg_size);
     
-    // Write some data
-    const char* data = "Test data for peeking";
-    buffer.write(reinterpret_cast<const uint8_t*>(data), strlen(data));
+    auto* pktHdr = reinterpret_cast<spcast::SpcastVersion3Traits::PacketHeader*>(packet.data());
+    pktHdr->version = spcast::SpcastVersion3Traits::Version;
+    pktHdr->recv_timestamp_ns = 1000000000000000000; // Year 2001
+    pktHdr->send_timestamp_ns = 1000000000000000000;
     
-    // Peek at data without consuming  
-    auto [peek_ptr, peek_size] = buffer.peek();
-    EXPECT_NE(peek_ptr, nullptr);
-    EXPECT_EQ(peek_size, strlen(data));
+    auto* msgHdr = reinterpret_cast<spcast::SpcastVersion3Traits::MessageHeader*>(
+        packet.data() + sizeof(spcast::SpcastVersion3Traits::PacketHeader));
+    msgHdr->length = msg_size;
+    msgHdr->seq_num = 7777;
     
-    // Verify buffer size hasn't changed
-    EXPECT_EQ(buffer.available_data(), strlen(data));
+    Flow flow{"TestFlow", "Set1", Protocol{}, "", "", 0, 0, FlowDirection::INGRESS};
+    auto timestamp = std::chrono::high_resolution_clock::now();
     
-    // Read normally and verify peek didn't consume
-    std::vector<uint8_t> read_data(strlen(data));
-    EXPECT_EQ(buffer.read(read_data.data(), strlen(data)), strlen(data));
-    EXPECT_EQ(memcmp(data, read_data.data(), strlen(data)), 0);
+    auto messages = handler->getMessages(&flow, packet.data(), packet.size(), timestamp);
+    EXPECT_TRUE(messages.empty());
 }
 
-// Test buffer full condition
-TEST_F(RingBufferTest, BufferFull) {
-    RingBuffer buffer(64);
-    
-    // Fill the buffer completely
-    std::vector<uint8_t> data(64, 0xFF);
-    EXPECT_EQ(buffer.write(data.data(), data.size()), 64);
-    
-    // Try to write more - should fail
-    uint8_t extra = 0xEE;
-    EXPECT_EQ(buffer.write(&extra, 1), 0);
-    
-    // Consume one byte and try again
-    buffer.consume(1);
-    EXPECT_EQ(buffer.write(&extra, 1), 1);
-}
-
-} // namespace pme 
+} // namespace pme
