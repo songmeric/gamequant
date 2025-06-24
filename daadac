@@ -1,148 +1,3 @@
-#include "RazeHandler.h"
-#include <cstring>
-#include "Log.h"
-#include "Protocols.h"
-#include "Hash.h"
-
-namespace pme {
-
-size_t RazeHandler::getTcpMessageLength(const RingBuffer::Reader& reader) const {
-    size_t total_parsable_bytes = 0;
-    size_t offset = 0;
-    size_t total_available = reader.size();
-
-    while (offset < total_available) {
-        // Need at least sizeof(uint16_t) bytes to read packet length
-        if (offset + sizeof(uint16_t) > total_available) {
-            break;
-        }
-
-        // Read packet length using wrap-aware reader
-        uint16_t packet_length = reader.read<uint16_t>(offset);
-
-        // Sanity check: zero length or suspiciously small
-        if (packet_length == 0 || packet_length < sizeof(RazeFormatter::Header)) {
-            PME_LOG_DEBUG(log_, "Invalid packet length " << packet_length << " at offset " << offset);
-            break;
-        }
-
-        // Check if we have the complete message
-        if (offset + packet_length > total_available) {
-            // Not enough data for this message, stop here
-            break;
-        }
-
-        // This message is complete, add it to parsable bytes
-        total_parsable_bytes = offset + packet_length;
-        offset += packet_length;
-    }
-
-    return total_parsable_bytes;
-}
-
-std::vector<ParsedMessage> RazeHandler::getMessages(const Flow* flow, const uint8_t* payload,
-                                                    size_t payload_size,
-                                                    const std::chrono::time_point<std::chrono::high_resolution_clock>& packet_timestamp) {
-    std::vector<ParsedMessage> messages;
-
-    if (payload_size < sizeof(RazeFormatter::Header)) {
-        return messages;
-    }
-
-    const auto* cursor = payload;
-    const auto* end = cursor + payload_size;
-    size_t messages_processed = 0;
-    const size_t MAX_MESSAGES = 10000; // Prevent infinite loops
-    
-    while (cursor < end && messages_processed < MAX_MESSAGES) {
-        // Need at least the basic header
-        if (static_cast<size_t>(end - cursor) < sizeof(RazeFormatter::Header)) {
-            break;
-        }
-
-        const auto* next_message = reinterpret_cast<const RazeFormatter::Header*>(cursor);
-        
-        // CRITICAL SANITY CHECKS for packet_length
-        uint16_t packet_length = next_message->packet_length;
-        
-        // Check 1: Minimum size (must at least contain header)
-        if (packet_length < sizeof(RazeFormatter::Header)) {
-            PME_LOG_WARN(log_, "Invalid Raze packet_length " << packet_length 
-                         << " (too small) at offset " << (cursor - payload));
-            break; // Can't trust any data after this
-        }
-        
-        // Check 2: Maximum reasonable size (e.g., 64KB)
-        constexpr uint16_t MAX_REASONABLE_PACKET_SIZE = 65535; // Adjust based on your protocol
-        if (packet_length > MAX_REASONABLE_PACKET_SIZE) {
-            PME_LOG_WARN(log_, "Suspicious Raze packet_length " << packet_length 
-                         << " (too large) at offset " << (cursor - payload));
-            break; // Likely corrupted data
-        }
-        
-        // Check 3: Don't read beyond our buffer
-        if (static_cast<size_t>(cursor - payload) + packet_length > payload_size) {
-            // Not enough data for complete message
-            break;
-        }
-
-        messages_processed++;
-
-        if (next_message->packet_type != RazeFormatter::PacketType::unsequenced_data) {
-            cursor += packet_length;
-            continue;
-        }
-
-        // Additional check before casting to UnsequencedHeader
-        if (packet_length < sizeof(RazeFormatter::UnsequencedHeader)) {
-            PME_LOG_WARN(log_, "Raze packet too small for UnsequencedHeader");
-            cursor += packet_length;
-            continue;
-        }
-
-        const auto* unseq_data = reinterpret_cast<const RazeFormatter::UnsequencedHeader*>(next_message);
-
-        if (unseq_data->message_type != RazeFormatter::MessageType::new_order) {
-            cursor += packet_length;
-            continue;
-        }
-        
-        // Additional check before casting to NewOrder
-        if (packet_length < sizeof(RazeFormatter::NewOrder)) {
-            PME_LOG_WARN(log_, "Raze packet too small for NewOrder");
-            cursor += packet_length;
-            continue;
-        }
-
-        const auto* new_order = reinterpret_cast<const RazeFormatter::NewOrder*>(unseq_data);
-        // Look up in dropcopy map using order_token
-        auto it = dropcopy_map_ref.find(static_cast<uint64_t>(new_order->data.order_token));
-        if (it != dropcopy_map_ref.end()) {
-            const auto& stat = it->second;
-            PME_LOG_DEBUG(log_, "ORDER_TOKEN: " << static_cast<int>(new_order->data.order_token) << " MD_SEQ_NUM: " << stat.md_seq_num << " MD_RECV_TIME: " << stat.md_recv_time << " MD_SEND_TIME: " << stat.md_send_time);
-            auto key = generateHash(stat.md_seq_num, stat.md_recv_time, stat.md_send_time);
-            PME_LOG_DEBUG(log_, "Key: " << key);
-            ParsedMessage msg(key, packet_timestamp);
-            messages.push_back(msg);
-        } else {
-            PME_LOG_WARN(log_, "Order token " << new_order->data.order_token << " not found in dropcopy map");
-        }
-        cursor += packet_length;
-    }
-
-    if (messages_processed >= MAX_MESSAGES) {
-        PME_LOG_ERROR(log_, "Reached maximum message limit - possible corrupted data or infinite loop");
-    }
-
-    return messages;
-}
-
-} // namespace pme
-
-
-
-
-
 #include <gtest/gtest.h>
 #include <razeapi/messages/raze.hpp>
 #include <razeapi/messages/xraze.hpp>
@@ -167,7 +22,7 @@ class RazeHandlerTest : public ::testing::Test {
 protected:
     std::unordered_map<uint64_t, LatencyStats> dropcopy_map;
     std::unique_ptr<RazeHandler> handler;
-    Flow test_flow{"TestFlow", "TestSet", Protocol{}, FlowDirection::INGRESS};
+    Flow test_flow{"TestFlow", "TestSet", Protocol{}, "", "", 0, 0, FlowDirection::INGRESS};
     
     void SetUp() override {
         handler = std::make_unique<RazeHandler>(dropcopy_map);
@@ -260,9 +115,9 @@ TEST_F(RazeHandlerTest, SkipNonNewOrderMessages) {
     addDropcopyEntry(1, 100);
     
     // Create mixed message stream
-    auto msg1 = createOtherMessage(RazeFormatter::MessageType::order_cancel);
+    auto msg1 = createOtherMessage(static_cast<RazeFormatter::MessageType>(0x01));  // Any value that's not new_order
     auto msg2 = createNewOrderMessage(1);  // This should be processed
-    auto msg3 = createOtherMessage(RazeFormatter::MessageType::trade);
+    auto msg3 = createOtherMessage(static_cast<RazeFormatter::MessageType>(0x02));  // Any value that's not new_order
     
     std::vector<uint8_t> combined;
     combined.insert(combined.end(), msg1.begin(), msg1.end());
