@@ -1,178 +1,139 @@
 #include <gtest/gtest.h>
-#include <razeapi/messages/raze.hpp>
-#include <razeapi/messages/xraze.hpp>
+#include "SpcastV3Handler.h"
+#include "Types.h"//for LatencyStats header
+#include "Hash.h"
+#include <md_api/proto/spcast_v3.h>
 #include <unordered_map>
 #include <vector>
 #include <chrono>
-#include <functional>
-
-#include "Config.h"
-#include "RazeHandler.h"
-#include "Types.h"
-#include "Hash.h"
 #include "Protocols.h"
-#include "DropcopyHandler.h"
 #include "Log.h"
-#include "RingBuffer.h"
+#include "Config.h"
 
 namespace pme {
 
 // Test fixture for common setup
-class RazeHandlerTest : public ::testing::Test {
+class SpcastV3HandlerTest : public ::testing::Test {
 protected:
-    std::unordered_map<uint64_t, LatencyStats> dropcopy_map;
-    std::unique_ptr<RazeHandler> handler;
+    AppConfig config;
+    std::unique_ptr<SpcastV3Handler> handler;
     Flow test_flow{"TestFlow", "TestSet", Protocol{}, "", "", 0, 0, FlowDirection::INGRESS};
     
     void SetUp() override {
-        handler = std::make_unique<RazeHandler>(dropcopy_map);
+        config.oldest_spcast_date = parseDateToHighResolutionClock("01/01/2024");
+        handler = std::make_unique<SpcastV3Handler>(config);
     }
     
-    // Helper to add dropcopy entries
-    void addDropcopyEntry(uint64_t order_token, uint64_t seq_num, 
-                         uint64_t recv_time = 1750000000000000000,
-                         uint64_t send_time = 1750000000000000000) {
-        LatencyStats stat;
-        stat.md_seq_num = seq_num;
-        stat.md_recv_time = recv_time;
-        stat.md_send_time = send_time;
-        dropcopy_map[order_token] = stat;
-    }
-    
-    // Helper to create a valid new order message
-    std::vector<uint8_t> createNewOrderMessage(uint64_t order_token, 
-                                              uint16_t packet_length = sizeof(RazeFormatter::NewOrder)) {
-        std::vector<uint8_t> buffer(packet_length, 0);
-        auto* order = reinterpret_cast<RazeFormatter::NewOrder*>(buffer.data());
-        order->packet_length = packet_length;
-        order->packet_type = RazeFormatter::PacketType::unsequenced_data;
-        order->message_type = RazeFormatter::MessageType::new_order;
-        order->data.order_token = static_cast<decltype(order->data.order_token)>(order_token);
+    // Helper to create a valid SpcastV3 packet header
+    std::vector<uint8_t> createPacketHeader(uint64_t recv_timestamp = 1750000000000000000,
+                                           uint64_t send_timestamp = 1750000000000000000) {
+        std::vector<uint8_t> buffer(sizeof(spcast::SpcastVersion3Traits::PacketHeader));
+        auto* pktHdr = reinterpret_cast<spcast::SpcastVersion3Traits::PacketHeader*>(buffer.data());
+        pktHdr->version = spcast::SpcastVersion3Traits::Version;
+        pktHdr->recv_timestamp_ns = recv_timestamp;
+        pktHdr->send_timestamp_ns = send_timestamp;
         return buffer;
     }
     
-    // Helper to create non-new-order message
-    std::vector<uint8_t> createOtherMessage(RazeFormatter::MessageType msg_type, uint16_t length = 64) {
-        std::vector<uint8_t> buffer(length, 0);
-        auto* header = reinterpret_cast<RazeFormatter::UnsequencedHeader*>(buffer.data());
-        header->packet_length = length;
-        header->packet_type = RazeFormatter::PacketType::unsequenced_data;
-        header->message_type = msg_type;
+    // Helper to create a message header
+    std::vector<uint8_t> createMessageHeader(uint64_t seq_num, 
+                                           uint16_t length = sizeof(spcast::SpcastVersion3Traits::MessageHeader),
+                                           uint64_t exch_timestamp = 1750000000000000000) {
+        std::vector<uint8_t> buffer(length, 0);  // Allocate full message length
+        auto* msgHdr = reinterpret_cast<spcast::SpcastVersion3Traits::MessageHeader*>(buffer.data());
+        msgHdr->length = length;
+        msgHdr->symbol_offset = 0;
+        msgHdr->symbol_size = 4;
+        msgHdr->seq_num = seq_num;
+        msgHdr->exch_timestamp_ns = exch_timestamp;
         return buffer;
+    }
+    
+    // Helper to create complete packet with messages
+    std::vector<uint8_t> createPacketWithMessages(const std::vector<uint64_t>& seq_nums,
+                                                 uint64_t recv_ts = 1750000000000000000,
+                                                 uint64_t send_ts = 1750000000000000000) {
+        auto packet = createPacketHeader(recv_ts, send_ts);
+        
+        for (uint64_t seq : seq_nums) {
+            auto msg = createMessageHeader(seq);
+            packet.insert(packet.end(), msg.begin(), msg.end());
+        }
+        
+        return packet;
     }
 };
 
 // ===== Basic Functionality Tests =====
 
-TEST_F(RazeHandlerTest, ParseSingleValidMessage) {
-    addDropcopyEntry(1, 100);
-    
-    auto msg = createNewOrderMessage(1);
+TEST_F(SpcastV3HandlerTest, ParseSingleValidMessage) {
+    auto packet = createPacketWithMessages({100});
     auto timestamp = std::chrono::high_resolution_clock::now();
     
-    auto messages = handler->getMessages(&test_flow, msg.data(), msg.size(), timestamp);
+    auto messages = handler->getMessages(&test_flow, packet.data(), packet.size(), timestamp);
     
     ASSERT_EQ(messages.size(), 1);
     EXPECT_EQ(messages[0].join_key, generateHash(100, 1750000000000000000, 1750000000000000000));
 }
 
-TEST_F(RazeHandlerTest, ParseMultipleValidMessages) {
-    addDropcopyEntry(1, 100);
-    addDropcopyEntry(2, 200);
-    addDropcopyEntry(3, 300);
-    
-    // Create buffer with 3 messages
-    auto msg1 = createNewOrderMessage(1);
-    auto msg2 = createNewOrderMessage(2);
-    auto msg3 = createNewOrderMessage(3);
-    
-    std::vector<uint8_t> combined;
-    combined.insert(combined.end(), msg1.begin(), msg1.end());
-    combined.insert(combined.end(), msg2.begin(), msg2.end());
-    combined.insert(combined.end(), msg3.begin(), msg3.end());
-    
+TEST_F(SpcastV3HandlerTest, ParseMultipleMessages) {
+    auto packet = createPacketWithMessages({100, 101, 102});
     auto timestamp = std::chrono::high_resolution_clock::now();
-    auto messages = handler->getMessages(&test_flow, combined.data(), combined.size(), timestamp);
+    
+    auto messages = handler->getMessages(&test_flow, packet.data(), packet.size(), timestamp);
     
     ASSERT_EQ(messages.size(), 3);
     EXPECT_EQ(messages[0].join_key, generateHash(100, 1750000000000000000, 1750000000000000000));
-    EXPECT_EQ(messages[1].join_key, generateHash(200, 1750000000000000000, 1750000000000000000));
-    EXPECT_EQ(messages[2].join_key, generateHash(300, 1750000000000000000, 1750000000000000000));
+    EXPECT_EQ(messages[1].join_key, generateHash(101, 1750000000000000000, 1750000000000000000));
+    EXPECT_EQ(messages[2].join_key, generateHash(102, 1750000000000000000, 1750000000000000000));
 }
 
-TEST_F(RazeHandlerTest, NoMessagesWhenDropcopyEntryMissing) {
-    addDropcopyEntry(1, 100);  // Only add entry for token 1
-    
-    auto msg = createNewOrderMessage(2);  // Use token 2 which isn't in map
+TEST_F(SpcastV3HandlerTest, DuplicateSequenceNumbers) {
+    // First call with seq 100
+    auto packet1 = createPacketWithMessages({100});
     auto timestamp = std::chrono::high_resolution_clock::now();
     
-    auto messages = handler->getMessages(&test_flow, msg.data(), msg.size(), timestamp);
+    auto messages1 = handler->getMessages(&test_flow, packet1.data(), packet1.size(), timestamp);
+    ASSERT_EQ(messages1.size(), 1);
     
-    EXPECT_TRUE(messages.empty());
+    // Second call with same seq 100 - should be skipped
+    auto packet2 = createPacketWithMessages({100});
+    auto messages2 = handler->getMessages(&test_flow, packet2.data(), packet2.size(), timestamp);
+    EXPECT_EQ(messages2.size(), 0);  // Duplicate should be skipped
+    
+    // Different seq should work
+    auto packet3 = createPacketWithMessages({101});
+    auto messages3 = handler->getMessages(&test_flow, packet3.data(), packet3.size(), timestamp);
+    EXPECT_EQ(messages3.size(), 1);
 }
 
-TEST_F(RazeHandlerTest, SkipNonNewOrderMessages) {
-    addDropcopyEntry(1, 100);
+TEST_F(SpcastV3HandlerTest, MultipleFlows) {
+    Flow flow1{"Flow1", "Set1", Protocol{}, "", "", 0, 0, FlowDirection::INGRESS};
+    Flow flow2{"Flow2", "Set1", Protocol{}, "", "", 0, 0, FlowDirection::INGRESS};
     
-    // Create mixed message stream
-    auto msg1 = createOtherMessage(static_cast<RazeFormatter::MessageType>(0x01));  // Any value that's not new_order
-    auto msg2 = createNewOrderMessage(1);  // This should be processed
-    auto msg3 = createOtherMessage(static_cast<RazeFormatter::MessageType>(0x02));  // Any value that's not new_order
-    
-    std::vector<uint8_t> combined;
-    combined.insert(combined.end(), msg1.begin(), msg1.end());
-    combined.insert(combined.end(), msg2.begin(), msg2.end());
-    combined.insert(combined.end(), msg3.begin(), msg3.end());
-    
+    auto packet = createPacketWithMessages({100});
     auto timestamp = std::chrono::high_resolution_clock::now();
-    auto messages = handler->getMessages(&test_flow, combined.data(), combined.size(), timestamp);
     
-    ASSERT_EQ(messages.size(), 1);  // Only the new order should be processed
-    EXPECT_EQ(messages[0].join_key, generateHash(100, 1750000000000000000, 1750000000000000000));
+    // Same sequence number but different flows
+    auto messages1 = handler->getMessages(&flow1, packet.data(), packet.size(), timestamp);
+    auto messages2 = handler->getMessages(&flow2, packet.data(), packet.size(), timestamp);
+    
+    EXPECT_EQ(messages1.size(), 1);
+    EXPECT_EQ(messages2.size(), 1);
+    
+    // Same flow, same seq - should be duplicate
+    auto messages3 = handler->getMessages(&flow1, packet.data(), packet.size(), timestamp);
+    EXPECT_EQ(messages3.size(), 0);
 }
 
-TEST_F(RazeHandlerTest, HandleSequencedPackets) {
-    addDropcopyEntry(1, 100);
-    
-    // Create sequenced packet (should be skipped)
-    std::vector<uint8_t> buffer(sizeof(RazeFormatter::NewOrder), 0);
-    auto* order = reinterpret_cast<RazeFormatter::NewOrder*>(buffer.data());
-    order->packet_length = sizeof(RazeFormatter::NewOrder);
-    order->packet_type = RazeFormatter::PacketType::sequenced_data;  // Not unsequenced
-    order->message_type = RazeFormatter::MessageType::new_order;
-    order->data.order_token = static_cast<decltype(order->data.order_token)>(1);
-    
-    auto timestamp = std::chrono::high_resolution_clock::now();
-    auto messages = handler->getMessages(&test_flow, buffer.data(), buffer.size(), timestamp);
-    
-    EXPECT_TRUE(messages.empty());
-}
+// ===== Validation Tests =====
 
-// ===== Edge Cases and Error Handling =====
-
-TEST_F(RazeHandlerTest, EmptyPayload) {
-    auto timestamp = std::chrono::high_resolution_clock::now();
-    auto messages = handler->getMessages(&test_flow, nullptr, 0, timestamp);
-    EXPECT_TRUE(messages.empty());
-}
-
-TEST_F(RazeHandlerTest, PayloadTooSmallForHeader) {
-    std::vector<uint8_t> buffer(sizeof(RazeFormatter::Header) - 1, 0);
-    auto timestamp = std::chrono::high_resolution_clock::now();
-    auto messages = handler->getMessages(&test_flow, buffer.data(), buffer.size(), timestamp);
-    EXPECT_TRUE(messages.empty());
-}
-
-TEST_F(RazeHandlerTest, InvalidPacketLength) {
-    addDropcopyEntry(1, 100);
-    
-    // Create message with invalid packet length
-    std::vector<uint8_t> buffer(sizeof(RazeFormatter::NewOrder), 0);
-    auto* order = reinterpret_cast<RazeFormatter::NewOrder*>(buffer.data());
-    order->packet_length = sizeof(RazeFormatter::Header) - 1;  // Too small
-    order->packet_type = RazeFormatter::PacketType::unsequenced_data;
-    order->message_type = RazeFormatter::MessageType::new_order;
-    order->data.order_token = static_cast<decltype(order->data.order_token)>(1);
+TEST_F(SpcastV3HandlerTest, InvalidVersion) {
+    std::vector<uint8_t> buffer(sizeof(spcast::SpcastVersion3Traits::PacketHeader));
+    auto* pktHdr = reinterpret_cast<spcast::SpcastVersion3Traits::PacketHeader*>(buffer.data());
+    pktHdr->version = static_cast<md_api::proto::spcast_v3::version_enum>(99);  // Invalid
+    pktHdr->recv_timestamp_ns = 1750000000000000000;
+    pktHdr->send_timestamp_ns = 1750000000000000000;
     
     auto timestamp = std::chrono::high_resolution_clock::now();
     auto messages = handler->getMessages(&test_flow, buffer.data(), buffer.size(), timestamp);
@@ -180,209 +141,252 @@ TEST_F(RazeHandlerTest, InvalidPacketLength) {
     EXPECT_TRUE(messages.empty());
 }
 
-TEST_F(RazeHandlerTest, TruncatedMessage) {
-    addDropcopyEntry(1, 100);
+TEST_F(SpcastV3HandlerTest, PacketTooSmall) {
+    std::vector<uint8_t> buffer(sizeof(spcast::SpcastVersion3Traits::PacketHeader) - 1);
     
-    // Create message that claims to be longer than buffer
-    auto msg = createNewOrderMessage(1, 100);  // Claims 100 bytes
+    auto timestamp = std::chrono::high_resolution_clock::now();
+    auto messages = handler->getMessages(&test_flow, buffer.data(), buffer.size(), timestamp);
+    
+    EXPECT_TRUE(messages.empty());
+}
+
+TEST_F(SpcastV3HandlerTest, TimestampOlderThanConfig) {
+    // Set config date to future
+    config.oldest_spcast_date = parseDateToHighResolutionClock("01/01/2030");
+    handler = std::make_unique<SpcastV3Handler>(config);
+    
+    // Create packet with old timestamp
+    auto packet = createPacketWithMessages({100}, 1000000000000000000, 1000000000000000000);
+    auto timestamp = std::chrono::high_resolution_clock::now();
+    
+    auto messages = handler->getMessages(&test_flow, packet.data(), packet.size(), timestamp);
+    
+    EXPECT_TRUE(messages.empty());  // Should reject old timestamps
+}
+
+// ===== Message Parsing Tests =====
+
+TEST_F(SpcastV3HandlerTest, ZeroLengthMessage) {
+    auto packet = createPacketHeader();
+    
+    // Add message with zero length
+    std::vector<uint8_t> msg(sizeof(spcast::SpcastVersion3Traits::MessageHeader));
+    auto* msgHdr = reinterpret_cast<spcast::SpcastVersion3Traits::MessageHeader*>(msg.data());
+    msgHdr->length = 0;  // Invalid
+    msgHdr->seq_num = 100;
+    
+    packet.insert(packet.end(), msg.begin(), msg.end());
+    
+    auto timestamp = std::chrono::high_resolution_clock::now();
+    auto messages = handler->getMessages(&test_flow, packet.data(), packet.size(), timestamp);
+    
+    EXPECT_TRUE(messages.empty());
+}
+
+TEST_F(SpcastV3HandlerTest, TruncatedMessage) {
+    auto packet = createPacketHeader();
+    
+    // Add message that claims to be longer than available data
+    auto msg = createMessageHeader(100, 100);  // Claims 100 bytes
     msg.resize(50);  // But only provide 50
     
-    auto timestamp = std::chrono::high_resolution_clock::now();
-    auto messages = handler->getMessages(&test_flow, msg.data(), msg.size(), timestamp);
-    
-    EXPECT_TRUE(messages.empty());  // Should not process truncated message
-}
-
-TEST_F(RazeHandlerTest, MessageProtectionAgainstOverflow) {
-    addDropcopyEntry(1, 100);
-    
-    // Test protection against excessive message processing
-    std::vector<uint8_t> buffer;
-    for (int i = 0; i < 10001; ++i) {  // More than MAX_MESSAGES (10000)
-        auto msg = createNewOrderMessage(1);
-        buffer.insert(buffer.end(), msg.begin(), msg.end());
-    }
+    packet.insert(packet.end(), msg.begin(), msg.end());
     
     auto timestamp = std::chrono::high_resolution_clock::now();
-    auto messages = handler->getMessages(&test_flow, buffer.data(), buffer.size(), timestamp);
+    auto messages = handler->getMessages(&test_flow, packet.data(), packet.size(), timestamp);
     
-    // Should process up to MAX_MESSAGES
-    EXPECT_LE(messages.size(), 10000);
+    EXPECT_TRUE(messages.empty());
 }
 
-// ===== TCP Message Length Calculation Tests =====
-
-struct TcpLengthTestCase {
-    const char* name;
-    std::function<void(RingBuffer&)> setup_buffer;
-    size_t expected_length;
-};
-
-class RazeTcpLengthTest : public RazeHandlerTest,
-                         public ::testing::WithParamInterface<TcpLengthTestCase> {};
-
-TEST_P(RazeTcpLengthTest, CalculatesCorrectTcpMessageLength) {
-    const auto& test_case = GetParam();
+TEST_F(SpcastV3HandlerTest, MessagesWithDifferentLengths) {
+    auto packet = createPacketHeader();
     
-    RingBuffer buffer(1024);
-    test_case.setup_buffer(buffer);
+    // Add messages of different sizes
+    auto msg1 = createMessageHeader(100, 64);   // 64 bytes
+    auto msg2 = createMessageHeader(101, 128);  // 128 bytes
+    auto msg3 = createMessageHeader(102, 32);   // 32 bytes
     
-    auto reader = buffer.getReader();
-    EXPECT_EQ(handler->getTcpMessageLength(reader), test_case.expected_length);
-}
-
-INSTANTIATE_TEST_SUITE_P(
-    TcpMessageLengthScenarios,
-    RazeTcpLengthTest,
-    ::testing::Values(
-        TcpLengthTestCase{
-            "empty_buffer",
-            [](RingBuffer& buf) { /* empty */ },
-            0
-        },
-        TcpLengthTestCase{
-            "single_complete_message",
-            [](RingBuffer& buf) {
-                uint16_t len = 50;
-                buf.write(reinterpret_cast<uint8_t*>(&len), sizeof(len));
-                std::vector<uint8_t> data(48, 0);
-                buf.write(data.data(), data.size());
-            },
-            50
-        },
-        TcpLengthTestCase{
-            "multiple_complete_messages",
-            [](RingBuffer& buf) {
-                // First message: 30 bytes
-                uint16_t len1 = 30;
-                buf.write(reinterpret_cast<uint8_t*>(&len1), sizeof(len1));
-                std::vector<uint8_t> data1(28, 1);
-                buf.write(data1.data(), data1.size());
-                
-                // Second message: 40 bytes
-                uint16_t len2 = 40;
-                buf.write(reinterpret_cast<uint8_t*>(&len2), sizeof(len2));
-                std::vector<uint8_t> data2(38, 2);
-                buf.write(data2.data(), data2.size());
-            },
-            70  // 30 + 40
-        },
-        TcpLengthTestCase{
-            "partial_message",
-            [](RingBuffer& buf) {
-                uint16_t len = 100;
-                buf.write(reinterpret_cast<uint8_t*>(&len), sizeof(len));
-                std::vector<uint8_t> data(48, 0);  // Only 48 of 98 needed
-                buf.write(data.data(), data.size());
-            },
-            0  // No complete messages
-        },
-        TcpLengthTestCase{
-            "first_complete_second_partial",
-            [](RingBuffer& buf) {
-                // First message: 30 bytes (complete)
-                uint16_t len1 = 30;
-                buf.write(reinterpret_cast<uint8_t*>(&len1), sizeof(len1));
-                std::vector<uint8_t> data1(28, 1);
-                buf.write(data1.data(), data1.size());
-                
-                // Second message: 40 bytes (incomplete)
-                uint16_t len2 = 40;
-                buf.write(reinterpret_cast<uint8_t*>(&len2), sizeof(len2));
-                std::vector<uint8_t> data2(20, 2);  // Only 20 of 38 needed
-                buf.write(data2.data(), data2.size());
-            },
-            30  // Only first message is complete
-        },
-        TcpLengthTestCase{
-            "insufficient_for_header",
-            [](RingBuffer& buf) {
-                uint8_t single_byte = 0xFF;
-                buf.write(&single_byte, 1);
-            },
-            0
-        },
-        TcpLengthTestCase{
-            "invalid_length_too_small",
-            [](RingBuffer& buf) {
-                uint16_t len = sizeof(RazeFormatter::Header) - 1;  // Too small
-                buf.write(reinterpret_cast<uint8_t*>(&len), sizeof(len));
-            },
-            0
-        },
-        TcpLengthTestCase{
-            "zero_length",
-            [](RingBuffer& buf) {
-                uint16_t len = 0;
-                buf.write(reinterpret_cast<uint8_t*>(&len), sizeof(len));
-            },
-            0
-        }
-    ),
-    [](const ::testing::TestParamInfo<TcpLengthTestCase>& info) {
-        return info.param.name;
-    }
-);
-
-TEST_F(RazeHandlerTest, GetTcpMessageLengthWrapAround) {
-    RingBuffer buffer(16);  // Small buffer to force wrap
+    packet.insert(packet.end(), msg1.begin(), msg1.end());
+    packet.insert(packet.end(), msg2.begin(), msg2.end());
+    packet.insert(packet.end(), msg3.begin(), msg3.end());
     
-    // Fill buffer to near end
-    std::vector<uint8_t> filler(14, 0xFF);
-    buffer.write(filler.data(), filler.size());
-    buffer.consume(14);
+    auto timestamp = std::chrono::high_resolution_clock::now();
+    auto messages = handler->getMessages(&test_flow, packet.data(), packet.size(), timestamp);
     
-    // Write message where header spans wrap point
-    uint16_t msg_length = 10;
-    buffer.write(reinterpret_cast<uint8_t*>(&msg_length), sizeof(msg_length));
-    std::vector<uint8_t> data(8, 0xAA);
-    buffer.write(data.data(), data.size());
-    
-    auto reader = buffer.getReader();
-    EXPECT_EQ(handler->getTcpMessageLength(reader), 10);
+    ASSERT_EQ(messages.size(), 3);
+    EXPECT_EQ(messages[0].join_key, generateHash(100, 1750000000000000000, 1750000000000000000));
+    EXPECT_EQ(messages[1].join_key, generateHash(101, 1750000000000000000, 1750000000000000000));
+    EXPECT_EQ(messages[2].join_key, generateHash(102, 1750000000000000000, 1750000000000000000));
 }
 
 // ===== Hash Generation Tests =====
 
-TEST_F(RazeHandlerTest, CorrectHashGeneration) {
-    // Test that same inputs generate same hash
-    uint64_t seq = 12345;
-    uint64_t recv_time = 1750000000000000000;
-    uint64_t send_time = 1750000000000000001;
+TEST_F(SpcastV3HandlerTest, ConsistentHashGeneration) {
+    uint64_t recv_ts = 1234567890000000000;
+    uint64_t send_ts = 1234567890000000001;
     
-    addDropcopyEntry(1, seq, recv_time, send_time);
-    addDropcopyEntry(2, seq, recv_time, send_time);  // Same values, different token
-    
-    auto msg1 = createNewOrderMessage(1);
-    auto msg2 = createNewOrderMessage(2);
-    
-    std::vector<uint8_t> combined;
-    combined.insert(combined.end(), msg1.begin(), msg1.end());
-    combined.insert(combined.end(), msg2.begin(), msg2.end());
+    auto packet1 = createPacketWithMessages({100}, recv_ts, send_ts);
+    auto packet2 = createPacketWithMessages({200}, recv_ts, send_ts);
     
     auto timestamp = std::chrono::high_resolution_clock::now();
-    auto messages = handler->getMessages(&test_flow, combined.data(), combined.size(), timestamp);
     
-    ASSERT_EQ(messages.size(), 2);
-    EXPECT_EQ(messages[0].join_key, messages[1].join_key);  // Same hash for same inputs
+    auto messages1 = handler->getMessages(&test_flow, packet1.data(), packet1.size(), timestamp);
+    auto messages2 = handler->getMessages(&test_flow, packet2.data(), packet2.size(), timestamp);
+    
+    ASSERT_EQ(messages1.size(), 1);
+    ASSERT_EQ(messages2.size(), 1);
+    
+    // Different seq nums should generate different hashes
+    EXPECT_NE(messages1[0].join_key, messages2[0].join_key);
+    
+    // Verify hash matches expected value
+    EXPECT_EQ(messages1[0].join_key, generateHash(100, recv_ts, send_ts));
+    EXPECT_EQ(messages2[0].join_key, generateHash(200, recv_ts, send_ts));
 }
 
-TEST_F(RazeHandlerTest, DifferentHashForDifferentInputs) {
-    addDropcopyEntry(1, 100, 1750000000000000000, 1750000000000000000);
-    addDropcopyEntry(2, 200, 1750000000000000000, 1750000000000000000);  // Different seq
+TEST_F(SpcastV3HandlerTest, DifferentTimestampsGenerateDifferentHashes) {
+    auto packet1 = createPacketWithMessages({100}, 1000000000000000000, 2000000000000000000);
+    auto packet2 = createPacketWithMessages({100}, 3000000000000000000, 4000000000000000000);
     
-    auto msg1 = createNewOrderMessage(1);
-    auto msg2 = createNewOrderMessage(2);
-    
-    std::vector<uint8_t> combined;
-    combined.insert(combined.end(), msg1.begin(), msg1.end());
-    combined.insert(combined.end(), msg2.begin(), msg2.end());
+    // Reset handler to allow same seq num
+    handler = std::make_unique<SpcastV3Handler>(config);
     
     auto timestamp = std::chrono::high_resolution_clock::now();
-    auto messages = handler->getMessages(&test_flow, combined.data(), combined.size(), timestamp);
     
-    ASSERT_EQ(messages.size(), 2);
-    EXPECT_NE(messages[0].join_key, messages[1].join_key);  // Different hash for different seq
+    Flow flow1{"Flow1", "Set1", Protocol{}, "", "", 0, 0, FlowDirection::INGRESS};
+    Flow flow2{"Flow2", "Set1", Protocol{}, "", "", 0, 0, FlowDirection::INGRESS};
+    
+    auto messages1 = handler->getMessages(&flow1, packet1.data(), packet1.size(), timestamp);
+    auto messages2 = handler->getMessages(&flow2, packet2.data(), packet2.size(), timestamp);
+    
+    ASSERT_EQ(messages1.size(), 1);
+    ASSERT_EQ(messages2.size(), 1);
+    
+    // Same seq but different timestamps should generate different hashes
+    EXPECT_NE(messages1[0].join_key, messages2[0].join_key);
+}
+
+// ===== Edge Cases =====
+
+TEST_F(SpcastV3HandlerTest, EmptyPacketAfterHeader) {
+    auto packet = createPacketHeader();
+    // No messages after header
+    
+    auto timestamp = std::chrono::high_resolution_clock::now();
+    auto messages = handler->getMessages(&test_flow, packet.data(), packet.size(), timestamp);
+    
+    EXPECT_TRUE(messages.empty());  // Valid but no messages
+}
+
+TEST_F(SpcastV3HandlerTest, MaxSequenceNumber) {
+    auto packet = createPacketWithMessages({UINT64_MAX});
+    auto timestamp = std::chrono::high_resolution_clock::now();
+    
+    auto messages = handler->getMessages(&test_flow, packet.data(), packet.size(), timestamp);
+    
+    ASSERT_EQ(messages.size(), 1);
+    EXPECT_EQ(messages[0].join_key, generateHash(UINT64_MAX, 1750000000000000000, 1750000000000000000));
+}
+
+// ===== Parameterized Tests for Various Scenarios =====
+
+struct SpcastTestCase {
+    const char* name;
+    std::function<std::vector<uint8_t>()> create_packet;
+    size_t expected_messages;
+    bool should_warn;
+};
+
+class SpcastParameterizedTest : public SpcastV3HandlerTest,
+                               public ::testing::WithParamInterface<SpcastTestCase> {};
+
+TEST_P(SpcastParameterizedTest, ProcessesCorrectly) {
+    const auto& test_case = GetParam();
+    
+    auto packet = test_case.create_packet();
+    auto timestamp = std::chrono::high_resolution_clock::now();
+    
+    auto messages = handler->getMessages(&test_flow, packet.data(), packet.size(), timestamp);
+    
+    EXPECT_EQ(messages.size(), test_case.expected_messages) 
+        << "Test case: " << test_case.name;
+}
+
+INSTANTIATE_TEST_SUITE_P(
+    SpcastScenarios,
+    SpcastParameterizedTest,
+    ::testing::Values(
+        SpcastTestCase{
+            "valid_single_message",
+            []() {
+                SpcastV3HandlerTest test;
+                return test.createPacketWithMessages({100});
+            },
+            1,
+            false
+        },
+        SpcastTestCase{
+            "valid_multiple_messages",
+            []() {
+                SpcastV3HandlerTest test;
+                return test.createPacketWithMessages({100, 101, 102, 103, 104});
+            },
+            5,
+            false
+        },
+        SpcastTestCase{
+            "partial_last_message",
+            []() {
+                SpcastV3HandlerTest test;
+                auto packet = test.createPacketWithMessages({100, 101});
+                // Add partial message
+                auto partial = test.createMessageHeader(102, 100);
+                partial.resize(50);  // Truncate
+                packet.insert(packet.end(), partial.begin(), partial.end());
+                return packet;
+            },
+            2,  // Only complete messages
+            true
+        },
+        SpcastTestCase{
+            "message_with_min_header_size",
+            []() {
+                SpcastV3HandlerTest test;
+                auto packet = test.createPacketHeader();
+                auto msg = test.createMessageHeader(100, sizeof(spcast::SpcastVersion3Traits::MessageHeader));
+                packet.insert(packet.end(), msg.begin(), msg.end());
+                return packet;
+            },
+            1,
+            false
+        }
+    ),
+    [](const ::testing::TestParamInfo<SpcastTestCase>& info) {
+        return info.param.name;
+    }
+);
+
+// ===== Performance Test =====
+
+TEST_F(SpcastV3HandlerTest, LargePacketProcessing) {
+    // Create packet with many messages
+    std::vector<uint64_t> sequences;
+    for (uint64_t i = 0; i < 1000; ++i) {
+        sequences.push_back(i);
+    }
+    
+    auto packet = createPacketWithMessages(sequences);
+    auto timestamp = std::chrono::high_resolution_clock::now();
+    
+    auto start = std::chrono::high_resolution_clock::now();
+    auto messages = handler->getMessages(&test_flow, packet.data(), packet.size(), timestamp);
+    auto end = std::chrono::high_resolution_clock::now();
+    
+    EXPECT_EQ(messages.size(), 1000);
+    
+    auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
+    // Log performance info (not a hard requirement)
+    std::cout << "Processed 1000 messages in " << duration.count() << " microseconds" << std::endl;
 }
 
 } // namespace pme
