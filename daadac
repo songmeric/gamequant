@@ -25,7 +25,7 @@ protected:
     }
     
     // Helper to create a valid SpcastV3 packet header
-    std::vector<uint8_t> createPacketHeader(uint64_t recv_timestamp = 1750000000000000000,
+    static std::vector<uint8_t> createPacketHeader(uint64_t recv_timestamp = 1750000000000000000,
                                            uint64_t send_timestamp = 1750000000000000000) {
         std::vector<uint8_t> buffer(sizeof(spcast::SpcastVersion3Traits::PacketHeader));
         auto* pktHdr = reinterpret_cast<spcast::SpcastVersion3Traits::PacketHeader*>(buffer.data());
@@ -36,7 +36,7 @@ protected:
     }
     
     // Helper to create a message header
-    std::vector<uint8_t> createMessageHeader(uint64_t seq_num, 
+    static std::vector<uint8_t> createMessageHeader(uint64_t seq_num, 
                                            uint16_t length = sizeof(spcast::SpcastVersion3Traits::MessageHeader),
                                            uint64_t exch_timestamp = 1750000000000000000) {
         std::vector<uint8_t> buffer(length, 0);  // Allocate full message length
@@ -50,7 +50,7 @@ protected:
     }
     
     // Helper to create complete packet with messages
-    std::vector<uint8_t> createPacketWithMessages(const std::vector<uint64_t>& seq_nums,
+    static std::vector<uint8_t> createPacketWithMessages(const std::vector<uint64_t>& seq_nums,
                                                  uint64_t recv_ts = 1750000000000000000,
                                                  uint64_t send_ts = 1750000000000000000) {
         auto packet = createPacketHeader(recv_ts, send_ts);
@@ -319,8 +319,7 @@ INSTANTIATE_TEST_SUITE_P(
         SpcastTestCase{
             "valid_single_message",
             []() {
-                SpcastV3HandlerTest test;
-                return test.createPacketWithMessages({100});
+                return SpcastV3HandlerTest::createPacketWithMessages({100});
             },
             1,
             false
@@ -328,8 +327,7 @@ INSTANTIATE_TEST_SUITE_P(
         SpcastTestCase{
             "valid_multiple_messages",
             []() {
-                SpcastV3HandlerTest test;
-                return test.createPacketWithMessages({100, 101, 102, 103, 104});
+                return SpcastV3HandlerTest::createPacketWithMessages({100, 101, 102, 103, 104});
             },
             5,
             false
@@ -337,10 +335,9 @@ INSTANTIATE_TEST_SUITE_P(
         SpcastTestCase{
             "partial_last_message",
             []() {
-                SpcastV3HandlerTest test;
-                auto packet = test.createPacketWithMessages({100, 101});
+                auto packet = SpcastV3HandlerTest::createPacketWithMessages({100, 101});
                 // Add partial message
-                auto partial = test.createMessageHeader(102, 100);
+                auto partial = SpcastV3HandlerTest::createMessageHeader(102, 100);
                 partial.resize(50);  // Truncate
                 packet.insert(packet.end(), partial.begin(), partial.end());
                 return packet;
@@ -351,9 +348,8 @@ INSTANTIATE_TEST_SUITE_P(
         SpcastTestCase{
             "message_with_min_header_size",
             []() {
-                SpcastV3HandlerTest test;
-                auto packet = test.createPacketHeader();
-                auto msg = test.createMessageHeader(100, sizeof(spcast::SpcastVersion3Traits::MessageHeader));
+                auto packet = SpcastV3HandlerTest::createPacketHeader();
+                auto msg = SpcastV3HandlerTest::createMessageHeader(100, sizeof(spcast::SpcastVersion3Traits::MessageHeader));
                 packet.insert(packet.end(), msg.begin(), msg.end());
                 return packet;
             },
