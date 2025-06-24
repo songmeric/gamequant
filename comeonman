@@ -1,0 +1,277 @@
+#include "SpcastV3Handler.h"
+#include <cstring>
+#include "Log.h"
+#include "Protocols.h"
+#include "Hash.h"
+namespace pme {
+
+// No need to define our own structs use the ones from Protocols.h
+// spcast::SpcastVersion3Traits::PacketHeader
+// spcast::SpcastVersion3Traits::MessageHeader
+
+std::vector<ParsedMessage> SpcastV3Handler::getMessages(const Flow* flow, const uint8_t* payload,
+                                                        size_t payload_size,
+                                                        const std::chrono::time_point<std::chrono::high_resolution_clock>& packet_timestamp) {
+    std::vector<ParsedMessage> messages;
+
+    // Need at least packet header
+    if (payload_size < sizeof(spcast::SpcastVersion3Traits::PacketHeader)) {
+        PME_LOG_WARN(log_, "SPCASTV3: Datagram too small (" << payload_size << " bytes)");
+        return messages;
+    }
+
+    const auto* pktHdr = reinterpret_cast<const spcast::SpcastVersion3Traits::PacketHeader*>(payload);
+
+    // SPCast V3 first byte is version (should be 3)
+    if (pktHdr->version != spcast::SpcastVersion3Traits::Version) {
+        PME_LOG_WARN(log_, "Packet version NOT Spcast V3. pktHdr->version = " << static_cast<int>(pktHdr->version));
+        return messages; // Not SPCast V3
+    }
+
+    const uint64_t recv_timestamp_ns = pktHdr->recv_timestamp_ns;
+    const uint64_t send_timestamp_ns = pktHdr->send_timestamp_ns;
+    if (recv_timestamp_ns < static_cast<uint64_t>(config_.oldest_spcast_date.time_since_epoch().count())
+        || send_timestamp_ns < static_cast<uint64_t>(config_.oldest_spcast_date.time_since_epoch().count())) {
+        PME_LOG_WARN(log_, "Sanity check: This market data is older than config.oldest_spcast_date, your config might be incorrect. Check if config is correct and also check if the packet in that flow actually is spcastv3 packet");
+        return messages;
+    }
+
+    // Process messages in packet
+    const uint8_t* cursor = payload + sizeof(spcast::SpcastVersion3Traits::PacketHeader);
+    const uint8_t* end = payload + payload_size;
+
+    while (cursor + sizeof(spcast::SpcastVersion3Traits::MessageHeader) <= end) {
+        const auto* msgHdr = reinterpret_cast<const spcast::SpcastVersion3Traits::MessageHeader*>(cursor);
+        uint16_t msg_len = msgHdr->length;
+        if (msg_len == 0) {
+            PME_LOG_WARN(log_, "SPCASTV3: Message length 0");
+            break;
+        }
+
+        if (cursor + msg_len > end) {
+            PME_LOG_WARN(log_, "SPCASTV3: Truncated message");
+            break;
+        }
+
+        uint64_t seq = msgHdr->seq_num;
+
+        if(seq_map_[flow->name].find(seq) == seq_map_[flow->name].end()) {
+
+            auto key = generateHash(seq, recv_timestamp_ns, send_timestamp_ns);
+            ParsedMessage msg(key, packet_timestamp);
+            messages.push_back(msg);
+            seq_map_[flow->name].insert(seq);
+        } else {
+            PME_LOG_DEBUG(log_, "Skipping duplicate SPCASTV3 Message");
+        }
+        cursor += msg_len;
+    }
+
+    return messages; // Parsing completed (even if no messages)
+}
+
+} // namespace pme
+
+#pragma once
+
+#include "IProtocolHandler.h"
+#include <cstdint>
+#include <unordered_set>
+#include "Log.h"
+#include "Types.h"
+
+namespace pme {
+
+class SpcastV3Handler : public IProtocolHandler {
+public:
+    SpcastV3Handler(const AppConfig& config): log_(PME_GET_LOGGER("SpcastV3Handler")), config_(config) {}
+    virtual ~SpcastV3Handler() = default;
+
+    std::vector<ParsedMessage> getMessages(const Flow* flow, const uint8_t* payload,
+                                          size_t payload_size,
+                                          const std::chrono::time_point<std::chrono::high_resolution_clock>& packet_timestamp) override;
+
+    const char* getProtocolName() const override {
+        return "SPCastV3";
+    }
+
+private:
+    px::Log* log_;
+    const AppConfig& config_;
+    std::unordered_map<std::string, std::unordered_set<uint64_t>> seq_map_;
+};
+
+} // namespace pme
+
+
+#include <gtest/gtest.h>
+#include "SpcastV3Handler.h"
+#include "Types.h"
+#include "Hash.h"
+#include <md_api/proto/spcast_v3.h>
+#include <unordered_map>
+#include <vector>
+#include <chrono>
+#include <cstring>
+#include "Protocols.h"
+#include "Log.h"
+#include "Config.h"
+
+namespace pme {
+
+// Simple test fixture
+class SpcastV3HandlerTest : public ::testing::Test {
+protected:
+    AppConfig config;
+    std::unique_ptr<SpcastV3Handler> handler;
+    Flow test_flow{"TestFlow", "TestSet", Protocol{}, "", "", 0, 0, FlowDirection::INGRESS};
+    
+    void SetUp() override {
+        config.oldest_spcast_date = parseDateToHighResolutionClock("01/01/2024");
+        handler = std::make_unique<SpcastV3Handler>(config);
+    }
+    
+    // Helper to create a realistic packet with proper message payload
+    std::vector<uint8_t> createValidPacket(const std::vector<uint64_t>& seq_nums,
+                                          uint64_t recv_ts = 1750000000000000000,
+                                          uint64_t send_ts = 1750000000000000000) {
+        // Create packet header
+        std::vector<uint8_t> packet(sizeof(spcast::SpcastVersion3Traits::PacketHeader));
+        auto* pktHdr = reinterpret_cast<spcast::SpcastVersion3Traits::PacketHeader*>(packet.data());
+        pktHdr->version = spcast::SpcastVersion3Traits::Version;
+        pktHdr->recv_timestamp_ns = recv_ts;
+        pktHdr->send_timestamp_ns = send_ts;
+        
+        // Add messages with realistic structure
+        for (uint64_t seq : seq_nums) {
+            // Message size includes header + symbol data
+            const uint16_t symbol_size = 8; // Realistic symbol size
+            const uint16_t message_size = sizeof(spcast::SpcastVersion3Traits::MessageHeader) + symbol_size;
+            
+            size_t msg_start = packet.size();
+            packet.resize(packet.size() + message_size);
+            
+            auto* msgHdr = reinterpret_cast<spcast::SpcastVersion3Traits::MessageHeader*>(packet.data() + msg_start);
+            msgHdr->length = message_size;
+            msgHdr->symbol_offset = sizeof(spcast::SpcastVersion3Traits::MessageHeader);
+            msgHdr->symbol_size = symbol_size;
+            msgHdr->seq_num = seq;
+            msgHdr->exch_timestamp_ns = 1750000000000000000;
+            
+            // Add symbol data
+            std::string symbol = "TEST1234";
+            std::memcpy(packet.data() + msg_start + sizeof(spcast::SpcastVersion3Traits::MessageHeader), 
+                       symbol.data(), symbol_size);
+        }
+        
+        return packet;
+    }
+};
+
+// Basic functionality tests - these cover 99.9% of real usage
+
+TEST_F(SpcastV3HandlerTest, ParseSingleMessage) {
+    auto packet = createValidPacket({100});
+    auto timestamp = std::chrono::high_resolution_clock::now();
+    
+    auto messages = handler->getMessages(&test_flow, packet.data(), packet.size(), timestamp);
+    
+    ASSERT_EQ(messages.size(), 1);
+    EXPECT_EQ(messages[0].join_key, generateHash(100, 1750000000000000000, 1750000000000000000));
+}
+
+TEST_F(SpcastV3HandlerTest, ParseMultipleMessages) {
+    auto packet = createValidPacket({100, 101, 102});
+    auto timestamp = std::chrono::high_resolution_clock::now();
+    
+    auto messages = handler->getMessages(&test_flow, packet.data(), packet.size(), timestamp);
+    
+    ASSERT_EQ(messages.size(), 3);
+    EXPECT_EQ(messages[0].join_key, generateHash(100, 1750000000000000000, 1750000000000000000));
+    EXPECT_EQ(messages[1].join_key, generateHash(101, 1750000000000000000, 1750000000000000000));
+    EXPECT_EQ(messages[2].join_key, generateHash(102, 1750000000000000000, 1750000000000000000));
+}
+
+TEST_F(SpcastV3HandlerTest, SkipDuplicateSequenceNumbers) {
+    // Send same sequence twice
+    auto packet1 = createValidPacket({100});
+    auto packet2 = createValidPacket({100, 101}); // 100 is duplicate, 101 is new
+    auto timestamp = std::chrono::high_resolution_clock::now();
+    
+    auto messages1 = handler->getMessages(&test_flow, packet1.data(), packet1.size(), timestamp);
+    ASSERT_EQ(messages1.size(), 1);
+    
+    auto messages2 = handler->getMessages(&test_flow, packet2.data(), packet2.size(), timestamp);
+    ASSERT_EQ(messages2.size(), 1); // Only seq 101 should be processed
+    EXPECT_EQ(messages2[0].join_key, generateHash(101, 1750000000000000000, 1750000000000000000));
+}
+
+TEST_F(SpcastV3HandlerTest, DifferentFlowsIndependent) {
+    Flow flow1{"Flow1", "Set1", Protocol{}, "", "", 0, 0, FlowDirection::INGRESS};
+    Flow flow2{"Flow2", "Set1", Protocol{}, "", "", 0, 0, FlowDirection::INGRESS};
+    
+    auto packet = createValidPacket({100});
+    auto timestamp = std::chrono::high_resolution_clock::now();
+    
+    // Same sequence number on different flows should both process
+    auto messages1 = handler->getMessages(&flow1, packet.data(), packet.size(), timestamp);
+    auto messages2 = handler->getMessages(&flow2, packet.data(), packet.size(), timestamp);
+    
+    EXPECT_EQ(messages1.size(), 1);
+    EXPECT_EQ(messages2.size(), 1);
+}
+
+// Basic validation tests - only the most likely error cases
+
+TEST_F(SpcastV3HandlerTest, RejectInvalidVersion) {
+    std::vector<uint8_t> packet(sizeof(spcast::SpcastVersion3Traits::PacketHeader));
+    auto* pktHdr = reinterpret_cast<spcast::SpcastVersion3Traits::PacketHeader*>(packet.data());
+    pktHdr->version = static_cast<md_api::proto::spcast_v3::version_enum>(99); // Wrong version
+    pktHdr->recv_timestamp_ns = 1750000000000000000;
+    pktHdr->send_timestamp_ns = 1750000000000000000;
+    
+    auto timestamp = std::chrono::high_resolution_clock::now();
+    auto messages = handler->getMessages(&test_flow, packet.data(), packet.size(), timestamp);
+    
+    EXPECT_TRUE(messages.empty());
+}
+
+TEST_F(SpcastV3HandlerTest, RejectTooSmallPacket) {
+    std::vector<uint8_t> packet(10); // Too small for header
+    
+    auto timestamp = std::chrono::high_resolution_clock::now();
+    auto messages = handler->getMessages(&test_flow, packet.data(), packet.size(), timestamp);
+    
+    EXPECT_TRUE(messages.empty());
+}
+
+TEST_F(SpcastV3HandlerTest, RejectOldTimestamp) {
+    config.oldest_spcast_date = parseDateToHighResolutionClock("01/01/2025");
+    handler = std::make_unique<SpcastV3Handler>(config);
+    
+    // Create packet with timestamp from 2024
+    auto packet = createValidPacket({100}, 1700000000000000000, 1700000000000000000);
+    auto timestamp = std::chrono::high_resolution_clock::now();
+    
+    auto messages = handler->getMessages(&test_flow, packet.data(), packet.size(), timestamp);
+    
+    EXPECT_TRUE(messages.empty());
+}
+
+// Hash generation test
+TEST_F(SpcastV3HandlerTest, ConsistentHashGeneration) {
+    uint64_t recv_ts = 1234567890000000000;
+    uint64_t send_ts = 1234567890000000001;
+    
+    auto packet = createValidPacket({100, 200}, recv_ts, send_ts);
+    auto timestamp = std::chrono::high_resolution_clock::now();
+    
+    auto messages = handler->getMessages(&test_flow, packet.data(), packet.size(), timestamp);
+    
+    ASSERT_EQ(messages.size(), 2);
+    EXPECT_EQ(messages[0].join_key, generateHash(100, recv_ts, send_ts));
+    EXPECT_EQ(messages[1].join_key, generateHash(200, recv_ts, send_ts));
+    EXPECT_NE(messages[0].join_key, messages[1].join_key); // Different sequences = different hashes
+}
+
+} // namespace pme
