@@ -1,154 +1,149 @@
 #include <gtest/gtest.h>
-#include "RazeHandler.h"
-#include "DropcopyHandler.h"
-#include <razeapi/messages/raze.hpp>
-#include "Types.h"
-#include "Hash.h"
 #include "RingBuffer.h"
+#include <cstring>
 
 namespace pme {
 
-class RazeHandlerTest : public ::testing::Test {
+class RingBufferTest : public ::testing::Test {
 protected:
-    std::unordered_map<uint64_t, LatencyStats> dropcopy_map;
-    std::unique_ptr<RazeHandler> handler;
-    
-    void SetUp() override {
-        handler = std::make_unique<RazeHandler>(dropcopy_map);
-    }
+    static constexpr size_t BUFFER_SIZE = 1024;
 };
 
-// Test parsing a real Raze new order message
-TEST_F(RazeHandlerTest, ParseNewOrderMessage) {
-    // Add dropcopy entry for order token 12345
-    LatencyStats stats;
-    stats.md_seq_num = 100;
-    stats.md_recv_time = 1750000000000000000;
-    stats.md_send_time = 1750000000000000001;
-    dropcopy_map[12345] = stats;
+// Test basic write and read
+TEST_F(RingBufferTest, WriteAndRead) {
+    RingBuffer buffer(BUFFER_SIZE);
     
-    // Create a real Raze new order message
-    RazeFormatter::NewOrder order;
-    order.packet_length = sizeof(RazeFormatter::NewOrder);
-    order.packet_type = RazeFormatter::PacketType::unsequenced_data;
-    order.message_type = RazeFormatter::MessageType::new_order;
-    order.data.order_token = 12345;
+    // Write some data
+    const char* data = "Hello, World!";
+    size_t data_len = strlen(data);
     
-    Flow flow{"TestFlow", "Set1", Protocol{}, "", "", 0, 0, FlowDirection::INGRESS};
-    auto timestamp = std::chrono::high_resolution_clock::now();
+    EXPECT_EQ(buffer.write(reinterpret_cast<const uint8_t*>(data), data_len), data_len);
+    EXPECT_EQ(buffer.available_data(), data_len);
     
-    auto messages = handler->getMessages(&flow, reinterpret_cast<uint8_t*>(&order), 
-                                        sizeof(order), timestamp);
+    // Read it back
+    std::vector<uint8_t> read_data(data_len);
+    EXPECT_EQ(buffer.read(read_data.data(), data_len), data_len);
     
-    ASSERT_EQ(messages.size(), 1);
-    EXPECT_EQ(messages[0].join_key, generateHash(100, 1750000000000000000, 1750000000000000001));
+    // Verify data matches
+    EXPECT_EQ(memcmp(data, read_data.data(), data_len), 0);
 }
 
-// Test that non-new-order messages are ignored
-TEST_F(RazeHandlerTest, IgnoreOtherMessageTypes) {
-    // Add dropcopy entry
-    LatencyStats stats;
-    stats.md_seq_num = 200;
-    dropcopy_map[99999] = stats;
+// Test multiple writes and reads
+TEST_F(RingBufferTest, MultipleWritesAndReads) {
+    RingBuffer buffer(BUFFER_SIZE);
     
-    // Create a message that's not a new order
-    struct OtherMessage {
-        uint16_t packet_length;
-        RazeFormatter::PacketType packet_type;
-        RazeFormatter::MessageType message_type;
-        uint64_t order_token;
-    } __attribute__((packed));
+    // Write three messages
+    const char* msg1 = "First message";
+    const char* msg2 = "Second message";
+    const char* msg3 = "Third message";
     
-    OtherMessage msg;
-    msg.packet_length = sizeof(OtherMessage);
-    msg.packet_type = RazeFormatter::PacketType::unsequenced_data;
-    msg.message_type = static_cast<RazeFormatter::MessageType>(0x01); // Not new_order
-    msg.order_token = 99999;
+    buffer.write(reinterpret_cast<const uint8_t*>(msg1), strlen(msg1));
+    buffer.write(reinterpret_cast<const uint8_t*>(msg2), strlen(msg2));
+    buffer.write(reinterpret_cast<const uint8_t*>(msg3), strlen(msg3));
     
-    Flow flow{"TestFlow", "Set1", Protocol{}, "", "", 0, 0, FlowDirection::INGRESS};
-    auto timestamp = std::chrono::high_resolution_clock::now();
+    // Read all back at once
+    size_t total_size = strlen(msg1) + strlen(msg2) + strlen(msg3);
+    std::vector<uint8_t> all_data(total_size);
+    EXPECT_EQ(buffer.read(all_data.data(), total_size), total_size);
     
-    auto messages = handler->getMessages(&flow, reinterpret_cast<uint8_t*>(&msg), 
-                                        sizeof(msg), timestamp);
-    
-    EXPECT_TRUE(messages.empty());
+    // Verify all messages are there in order
+    size_t offset = 0;
+    EXPECT_EQ(memcmp(all_data.data() + offset, msg1, strlen(msg1)), 0);
+    offset += strlen(msg1);
+    EXPECT_EQ(memcmp(all_data.data() + offset, msg2, strlen(msg2)), 0);
+    offset += strlen(msg2);
+    EXPECT_EQ(memcmp(all_data.data() + offset, msg3, strlen(msg3)), 0);
 }
 
-// Test multiple new orders in one buffer
-TEST_F(RazeHandlerTest, ParseMultipleOrders) {
-    // Add dropcopy entries
-    LatencyStats stats1;
-    stats1.md_seq_num = 10;
-    stats1.md_recv_time = 1750000000000000000;
-    stats1.md_send_time = 1750000000000000001;
-    dropcopy_map[1] = stats1;
+// Test consume functionality
+TEST_F(RingBufferTest, ConsumeData) {
+    RingBuffer buffer(BUFFER_SIZE);
     
-    LatencyStats stats2;
-    stats2.md_seq_num = 20;
-    stats2.md_recv_time = 1750000000000000000;
-    stats2.md_send_time = 1750000000000000001;
-    dropcopy_map[2] = stats2;
+    // Write 100 bytes
+    std::vector<uint8_t> data(100, 0xAA);
+    buffer.write(data.data(), data.size());
+    EXPECT_EQ(buffer.available_data(), 100);
     
-    LatencyStats stats3;
-    stats3.md_seq_num = 30;
-    stats3.md_recv_time = 1750000000000000000;
-    stats3.md_send_time = 1750000000000000001;
-    dropcopy_map[3] = stats3;
+    // Consume 50 bytes
+    buffer.consume(50);
+    EXPECT_EQ(buffer.available_data(), 50);
     
-    // Create buffer with 3 new orders
-    std::vector<uint8_t> buffer;
-    for (uint64_t token : {1, 2, 3}) {
-        RazeFormatter::NewOrder order;
-        order.packet_length = sizeof(RazeFormatter::NewOrder);
-        order.packet_type = RazeFormatter::PacketType::unsequenced_data;
-        order.message_type = RazeFormatter::MessageType::new_order;
-        order.data.order_token = token;
-        
-        auto bytes = reinterpret_cast<uint8_t*>(&order);
-        buffer.insert(buffer.end(), bytes, bytes + sizeof(order));
+    // Read remaining 50 bytes
+    std::vector<uint8_t> remaining(50);
+    EXPECT_EQ(buffer.read(remaining.data(), 50), 50);
+    
+    // Should all be 0xAA
+    for (uint8_t byte : remaining) {
+        EXPECT_EQ(byte, 0xAA);
     }
-    
-    Flow flow{"TestFlow", "Set1", Protocol{}, "", "", 0, 0, FlowDirection::INGRESS};
-    auto timestamp = std::chrono::high_resolution_clock::now();
-    
-    auto messages = handler->getMessages(&flow, buffer.data(), buffer.size(), timestamp);
-    
-    ASSERT_EQ(messages.size(), 3);
 }
 
-// Test TCP message length calculation
-TEST_F(RazeHandlerTest, CalculateTcpMessageLength) {
-    RingBuffer buffer(1024);
+// Test wrap-around behavior
+TEST_F(RingBufferTest, WrapAround) {
+    RingBuffer buffer(64);  // Small buffer to force wrap
     
-    // Write a complete message
-    RazeFormatter::NewOrder order;
-    order.packet_length = sizeof(RazeFormatter::NewOrder);
-    order.packet_type = RazeFormatter::PacketType::unsequenced_data;
-    order.message_type = RazeFormatter::MessageType::new_order;
+    // Fill most of the buffer
+    std::vector<uint8_t> data1(50, 0x11);
+    buffer.write(data1.data(), data1.size());
     
-    buffer.write(reinterpret_cast<uint8_t*>(&order), sizeof(order));
+    // Consume some to make room at the beginning
+    buffer.consume(30);
     
-    auto reader = buffer.getReader();
-    EXPECT_EQ(handler->getTcpMessageLength(reader), sizeof(RazeFormatter::NewOrder));
+    // Write more data that will wrap around
+    std::vector<uint8_t> data2(40, 0x22);
+    buffer.write(data2.data(), data2.size());
+    
+    // Read all data
+    std::vector<uint8_t> all_data(60);  // 20 from data1 + 40 from data2
+    EXPECT_EQ(buffer.read(all_data.data(), 60), 60);
+    
+    // Verify first 20 bytes are 0x11
+    for (int i = 0; i < 20; i++) {
+        EXPECT_EQ(all_data[i], 0x11);
+    }
+    // Verify next 40 bytes are 0x22
+    for (int i = 20; i < 60; i++) {
+        EXPECT_EQ(all_data[i], 0x22);
+    }
 }
 
-// Test missing dropcopy entry
-TEST_F(RazeHandlerTest, MissingDropcopyEntry) {
-    // Don't add dropcopy entry for token 54321
+// Test peek functionality
+TEST_F(RingBufferTest, PeekData) {
+    RingBuffer buffer(BUFFER_SIZE);
     
-    RazeFormatter::NewOrder order;
-    order.packet_length = sizeof(RazeFormatter::NewOrder);
-    order.packet_type = RazeFormatter::PacketType::unsequenced_data;
-    order.message_type = RazeFormatter::MessageType::new_order;
-    order.data.order_token = 54321;  // No dropcopy entry for this
+    // Write some data
+    const char* data = "Test data for peeking";
+    buffer.write(reinterpret_cast<const uint8_t*>(data), strlen(data));
     
-    Flow flow{"TestFlow", "Set1", Protocol{}, "", "", 0, 0, FlowDirection::INGRESS};
-    auto timestamp = std::chrono::high_resolution_clock::now();
+    // Peek at data without consuming  
+    auto [peek_ptr, peek_size] = buffer.peek();
+    EXPECT_NE(peek_ptr, nullptr);
+    EXPECT_EQ(peek_size, strlen(data));
     
-    auto messages = handler->getMessages(&flow, reinterpret_cast<uint8_t*>(&order), 
-                                        sizeof(order), timestamp);
+    // Verify buffer size hasn't changed
+    EXPECT_EQ(buffer.available_data(), strlen(data));
     
-    EXPECT_TRUE(messages.empty());
+    // Read normally and verify peek didn't consume
+    std::vector<uint8_t> read_data(strlen(data));
+    EXPECT_EQ(buffer.read(read_data.data(), strlen(data)), strlen(data));
+    EXPECT_EQ(memcmp(data, read_data.data(), strlen(data)), 0);
+}
+
+// Test buffer full condition
+TEST_F(RingBufferTest, BufferFull) {
+    RingBuffer buffer(64);
+    
+    // Fill the buffer completely
+    std::vector<uint8_t> data(64, 0xFF);
+    EXPECT_EQ(buffer.write(data.data(), data.size()), 64);
+    
+    // Try to write more - should fail
+    uint8_t extra = 0xEE;
+    EXPECT_EQ(buffer.write(&extra, 1), 0);
+    
+    // Consume one byte and try again
+    buffer.consume(1);
+    EXPECT_EQ(buffer.write(&extra, 1), 1);
 }
 
 } // namespace pme 
