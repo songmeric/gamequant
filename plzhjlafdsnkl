@@ -1,188 +1,256 @@
-#include "Config.h"
-
-#include <filesystem>
-#include <iostream>
-#include <stdexcept>
-#include <string>
-
-#include <yaml-cpp/yaml.h>
-
-#include "Protocols.h"
+#include <gtest/gtest.h>
+#include "RingBuffer.h"
+#include <cstring>
+#include <vector>
 
 namespace pme {
 
-Protocol parseProtocol(const YAML::Node& protocol_node) {
-    if(!protocol_node["communication"] || !protocol_node["message"]) {
-        throw std::runtime_error("Protocol definition must include 'communication' and 'message' fields");
+class RingBufferTest : public ::testing::Test {
+protected:
+    static constexpr size_t BUFFER_SIZE = 1024;
+};
+
+TEST_F(RingBufferTest, WriteAndReadWithReader) {
+    RingBuffer buffer(BUFFER_SIZE);
+    
+    const char* data = "Hello, World!";
+    size_t data_len = strlen(data);
+    
+    EXPECT_EQ(buffer.write(reinterpret_cast<const uint8_t*>(data), data_len), data_len);
+    EXPECT_EQ(buffer.available_data(), data_len);
+    
+    auto reader = buffer.getReader();
+    EXPECT_EQ(reader.size(), data_len);
+    
+    for (size_t i = 0; i < data_len; ++i) {
+        EXPECT_EQ(reader[i], static_cast<uint8_t>(data[i]));
     }
-
-    Protocol protocol;
-    std::string comm_str = protocol_node["communication"].as<std::string>();
-    std::string msg_str = protocol_node["message"].as<std::string>();
-
-    protocol.communication = stringToCommunicationProtocol(comm_str);
-    protocol.message = stringToMessageProtocol(msg_str);
-
-    if(!protocol.is_valid()) {
-        throw std::runtime_error("Invalid protocol specified: " + comm_str + "/" + msg_str);
-    }
-
-    return protocol;
+    
+    std::vector<uint8_t> read_data(data_len);
+    reader.read(read_data.data(), 0, data_len);
+    EXPECT_EQ(memcmp(data, read_data.data(), data_len), 0);
+    
+    buffer.consume(data_len);
+    EXPECT_EQ(buffer.available_data(), 0);
 }
 
-Flow parseFlow(const YAML::Node& node, FlowDirection direction, const std::string& parent_set) {
-    Flow flow;
-    flow.parent_set = parent_set;
-    flow.direction = direction;
-    if(!node["name"]) {
-        throw std::runtime_error("Each flow must have a 'name' field");
-    }
-
-    if(node["name"]) {
-        flow.name = node["name"].as<std::string>();
-    }
-
-    // Parse protocol
-    if (!node["protocol"]) {
-        throw std::runtime_error("Flow must have a 'protocol' field");
-    }
-    flow.protocol = parseProtocol(node["protocol"]);
-
-    // Parse IP addresses
-    if (node["src_ip"]) {
-        flow.src_ip = node["src_ip"].as<std::string>();
-    }
-    if (node["dst_ip"]) {
-        flow.dst_ip = node["dst_ip"].as<std::string>();
-    }
-
-    // Parse ports
-    if (node["src_port"]) {
-        flow.src_port = node["src_port"].as<uint16_t>();
-    }
-    if (node["dst_port"]) {
-        flow.dst_port = node["dst_port"].as<uint16_t>();
-    }
-
-    return flow;
+TEST_F(RingBufferTest, MultipleWritesAndReads) {
+    RingBuffer buffer(BUFFER_SIZE);
+    
+    const char* msg1 = "First message";
+    const char* msg2 = "Second message";
+    const char* msg3 = "Third message";
+    
+    buffer.write(reinterpret_cast<const uint8_t*>(msg1), strlen(msg1));
+    buffer.write(reinterpret_cast<const uint8_t*>(msg2), strlen(msg2));
+    buffer.write(reinterpret_cast<const uint8_t*>(msg3), strlen(msg3));
+    
+    size_t total_size = strlen(msg1) + strlen(msg2) + strlen(msg3);
+    auto reader = buffer.getReader();
+    EXPECT_EQ(reader.size(), total_size);
+    
+    std::vector<uint8_t> all_data(total_size);
+    reader.read(all_data.data(), 0, total_size);
+    
+    size_t offset = 0;
+    EXPECT_EQ(memcmp(all_data.data() + offset, msg1, strlen(msg1)), 0);
+    offset += strlen(msg1);
+    EXPECT_EQ(memcmp(all_data.data() + offset, msg2, strlen(msg2)), 0);
+    offset += strlen(msg2);
+    EXPECT_EQ(memcmp(all_data.data() + offset, msg3, strlen(msg3)), 0);
 }
 
-FlowSet parseFlowSet(const YAML::Node& node) {
-    FlowSet flow_set;
-
-    // Parse set name
-    if (!node["set_name"]) {
-        throw std::runtime_error("Flow set must have a 'set_name' field");
-    }
-    flow_set.set_name = node["set_name"].as<std::string>();
-
-    // Parse ingress flows
-    if (node["ingress_flows"]) {
-        for (const auto& flow_node : node["ingress_flows"]) {
-            flow_set.ingress_flows.push_back(
-                parseFlow(flow_node, FlowDirection::INGRESS, flow_set.set_name)
-            );
-        }
-    }
-
-    // Parse egress flows
-    if (node["egress_flows"]) {
-        for (const auto& flow_node : node["egress_flows"]) {
-            flow_set.egress_flows.push_back(
-                parseFlow(flow_node, FlowDirection::EGRESS, flow_set.set_name)
-            );
-        }
-    }
-
-    // Parse directories
-    if (node["watch_directory"]) {
-        flow_set.watch_directory = node["watch_directory"].as<std::string>();
-    }
-    if (node["output_directory"]) {
-        flow_set.output_directory = node["output_directory"].as<std::string>();
-    }
-
-    return flow_set;
-}
-
-AppConfig AppConfig::load(const std::string& config_path) {
-    AppConfig config;
-
-    try {
-        // Check if file exists
-        if (!std::filesystem::exists(config_path)) {
-            throw std::runtime_error("Configuration file not found: " + config_path);
-        }
-
-        // Load YAML file
-        YAML::Node root = YAML::LoadFile(config_path);
-
-        // Parse flow sets
-        if (root["flow_sets"]) {
-            for (const auto& flow_set_node : root["flow_sets"]) {
-                config.flow_sets.push_back(parseFlowSet(flow_set_node));
-            }
-        }
-
-        // Parse other configs
-        if (root["other_configs"]) {
-            const auto& other = root["other_configs"];
-            if (other["debug_mode"]) {
-                config.debug_mode = other["debug_mode"].as<bool>();
-            }
-            if (other["dropcopy_path"]) {
-                config.dropcopy_path = other["dropcopy_path"].as<std::string>();
-            }
-            if (other["oldest_spcast_date"]) {
-                config.oldest_spcast_date = parseDateToHighResolutionClock(other["oldest_spcast_date"].as<std::string>());
-            }
-        }
-
-        // Validate the loaded configuration
-        config.validate();
-
-    } catch (const YAML::Exception& e) {
-        throw std::runtime_error("Failed to parse YAML configuration: " + std::string(e.what()));
-    } catch (const std::exception& e) {
-        throw std::runtime_error("Failed to load configuration: " + std::string(e.what()));
-    }
-
-    return config;
-}
-
-void AppConfig::validate() const {
-    // Validate that we have at least one flow set
-    if (flow_sets.empty()) {
-        throw std::runtime_error("Configuration must define at least one flow set");
-    }
-
-    // Validate each flow set
-    for (const auto& flow_set : flow_sets) {
-        if (flow_set.set_name.empty()) {
-            throw std::runtime_error("Flow set must have a non-empty name");
-        }
-
-        // Check that flow set has at least one flow
-        if (flow_set.ingress_flows.empty() || flow_set.egress_flows.empty()) {
-            throw std::runtime_error("Flow set '" + flow_set.set_name +
-                                   "' must have at least one pair of ingress/egress flows");
-        }
-
-        // Validate each flow
-        auto validate_flow = [&](const Flow& flow) {
-            if (!flow.protocol.is_valid()) {
-                throw std::runtime_error("Invalid protocol in flow for set '" +
-                                       flow_set.set_name + "'");
-            }
-        };
-
-        for (const auto& flow : flow_set.ingress_flows) {
-            validate_flow(flow);
-        }
-        for (const auto& flow : flow_set.egress_flows) {
-            validate_flow(flow);
-        }
+TEST_F(RingBufferTest, ConsumeData) {
+    RingBuffer buffer(BUFFER_SIZE);
+    
+    std::vector<uint8_t> data(100, 0xAA);
+    buffer.write(data.data(), data.size());
+    EXPECT_EQ(buffer.available_data(), 100);
+    
+    buffer.consume(50);
+    EXPECT_EQ(buffer.available_data(), 50);
+    
+    auto reader = buffer.getReader();
+    EXPECT_EQ(reader.size(), 50);
+    
+    for (size_t i = 0; i < 50; ++i) {
+        EXPECT_EQ(reader[i], 0xAA);
     }
 }
 
-} // namespace pme
+TEST_F(RingBufferTest, WrapAroundWithReader) {
+    RingBuffer buffer(64);
+    
+    std::vector<uint8_t> data1(50, 0x11);
+    buffer.write(data1.data(), data1.size());
+    
+    buffer.consume(30);
+    
+    std::vector<uint8_t> data2(40, 0x22);
+    buffer.write(data2.data(), data2.size());
+    
+    auto reader = buffer.getReader();
+    EXPECT_EQ(reader.size(), 60);
+    
+    std::vector<uint8_t> all_data(60);
+    reader.read(all_data.data(), 0, 60);
+    
+    for (int i = 0; i < 20; i++) {
+        EXPECT_EQ(all_data[i], 0x11);
+    }
+    for (int i = 20; i < 60; i++) {
+        EXPECT_EQ(all_data[i], 0x22);
+    }
+}
+
+TEST_F(RingBufferTest, ReaderTypedReads) {
+    RingBuffer buffer(BUFFER_SIZE);
+    
+    struct TestData {
+        uint16_t length;
+        uint32_t id;
+        uint8_t type;
+        uint8_t padding;
+        uint64_t timestamp;
+    } __attribute__((packed));
+    
+    TestData data = {0x1234, 0x56789ABC, 0xDE, 0x00, 0x123456789ABCDEF0};
+    buffer.write(reinterpret_cast<const uint8_t*>(&data), sizeof(data));
+    
+    auto reader = buffer.getReader();
+    EXPECT_EQ(reader.read<uint16_t>(0), 0x1234);
+    EXPECT_EQ(reader.read<uint32_t>(2), 0x56789ABC);
+    EXPECT_EQ(reader.read<uint8_t>(6), 0xDE);
+    EXPECT_EQ(reader.read<uint64_t>(8), 0x123456789ABCDEF0);
+}
+
+TEST_F(RingBufferTest, ReaderContiguousPointer) {
+    RingBuffer buffer(BUFFER_SIZE);
+    
+    const char* data = "Test data for contiguous access";
+    buffer.write(reinterpret_cast<const uint8_t*>(data), strlen(data));
+    
+    auto reader = buffer.getReader();
+    
+    const uint8_t* ptr = reader.ptr_if_contiguous(0, strlen(data));
+    EXPECT_NE(ptr, nullptr);
+    EXPECT_EQ(memcmp(ptr, data, strlen(data)), 0);
+    
+    ptr = reader.ptr_if_contiguous(5, 10);
+    EXPECT_NE(ptr, nullptr);
+    EXPECT_EQ(memcmp(ptr, data + 5, 10), 0);
+}
+
+TEST_F(RingBufferTest, ReaderWrapAroundPointer) {
+    RingBuffer buffer(64);
+    
+    std::vector<uint8_t> data1(50, 0xAA);
+    buffer.write(data1.data(), data1.size());
+    buffer.consume(45);
+    
+    std::vector<uint8_t> data2(20, 0xBB);
+    buffer.write(data2.data(), data2.size());
+    
+    auto reader = buffer.getReader();
+    EXPECT_EQ(reader.size(), 25);
+    
+    const uint8_t* ptr = reader.ptr_if_contiguous(0, 5);
+    EXPECT_NE(ptr, nullptr);
+    
+    ptr = reader.ptr_if_contiguous(0, 25);
+    EXPECT_EQ(ptr, nullptr);
+    
+    std::vector<uint8_t> wrapped_data(25);
+    reader.read(wrapped_data.data(), 0, wrapped_data.size());
+    
+    for (int i = 0; i < 5; i++) {
+        EXPECT_EQ(wrapped_data[i], 0xAA);
+    }
+    for (int i = 5; i < wrapped_data.size(); i++) {
+        EXPECT_EQ(wrapped_data[i], 0xBB);
+    }
+}
+
+TEST_F(RingBufferTest, AutoGrow) {
+    RingBuffer buffer(64);
+
+    std::vector<uint8_t> fill(63, 0xAB);
+    EXPECT_EQ(buffer.write(fill.data(), fill.size()), fill.size());
+
+    std::vector<uint8_t> big(128, 0xCD);
+    EXPECT_EQ(buffer.write(big.data(), big.size()), big.size());
+
+    EXPECT_GE(buffer.getCapacity(), 256u);
+
+    EXPECT_EQ(buffer.available_data(), fill.size() + big.size());
+}
+
+TEST_F(RingBufferTest, BadInputCases) {
+    RingBuffer buffer(128);
+    
+    EXPECT_EQ(buffer.write(nullptr, 10), 0);
+    
+    uint8_t dummy;
+    EXPECT_EQ(buffer.write(&dummy, 0), 0);
+    
+    buffer.write(&dummy, 1);
+    EXPECT_EQ(buffer.available_data(), 1);
+    buffer.consume(100);
+    EXPECT_EQ(buffer.available_data(), 0);
+    
+    auto reader = buffer.getReader();
+    EXPECT_EQ(reader.size(), 0);
+    
+    EXPECT_THROW(reader[0], std::out_of_range);
+    EXPECT_THROW(reader.read<uint8_t>(0), std::out_of_range);
+}
+
+TEST_F(RingBufferTest, ReaderBoundsChecking) {
+    RingBuffer buffer(128);
+    
+    std::vector<uint8_t> data(10, 0xCC);
+    buffer.write(data.data(), data.size());
+    
+    auto reader = buffer.getReader();
+    
+    EXPECT_NO_THROW(reader[9]);
+    
+    EXPECT_THROW(reader[10], std::out_of_range);
+    EXPECT_THROW(reader.read<uint32_t>(7), std::out_of_range);
+    
+    EXPECT_EQ(reader.ptr_if_contiguous(0, 11), nullptr);
+    EXPECT_EQ(reader.ptr_if_contiguous(5, 10), nullptr);
+}
+
+TEST_F(RingBufferTest, ExternalBufferAlignmentAndCapacityValidation) {
+    alignas(64) uint8_t raw[128];
+    EXPECT_NO_THROW({ RingBuffer buf(raw, 128); });
+
+    uint8_t misaligned[130];
+    EXPECT_THROW({ RingBuffer buf(misaligned + 1, 128); }, std::invalid_argument);
+
+    EXPECT_THROW({ RingBuffer buf(raw, 0); }, std::invalid_argument);
+}
+
+TEST_F(RingBufferTest, RepeatedWrapAround) {
+    constexpr size_t CAPACITY = 128;
+    constexpr size_t ITERATIONS = 5000;
+
+    RingBuffer buffer(CAPACITY);
+
+    std::vector<uint8_t> block(CAPACITY - 1, 0x5A);
+
+    uint64_t total_written = 0;
+
+    for (size_t i = 0; i < ITERATIONS; ++i) {
+        ASSERT_EQ(buffer.write(block.data(), block.size()), block.size());
+        total_written += block.size();
+        buffer.consume(block.size());
+        ASSERT_EQ(buffer.available_data(), 0u);
+    }
+
+    EXPECT_EQ(buffer.getBytesWritten(), total_written);
+    EXPECT_EQ(buffer.getBytesDropped(), 0u);
+}
+
+} 
