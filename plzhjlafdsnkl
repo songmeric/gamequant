@@ -1,367 +1,188 @@
-#pragma once
+#include "Config.h"
 
-#include <algorithm>
-#include <atomic>
-#include <cstdint>
-#include <cstring>
-#include <memory>
+#include <filesystem>
+#include <iostream>
 #include <stdexcept>
-#ifndef NDEBUG
-#include <thread>
-#include <cassert>
-#endif
-#include <cstdlib>
-#include <deque>
+#include <string>
+
+#include <yaml-cpp/yaml.h>
+
+#include "Protocols.h"
 
 namespace pme {
 
-// SPSC RING BUFFER
-// IMPORTANT: This implementation is intended for SINGLE-PRODUCER / SINGLE-CONSUMER usage.
-// Simultaneous writes from multiple producers or reads from multiple consumers are undefined behaviour.
-// If the consumer cannot keep up, new data is **silently dropped** (\`write()\` returns 0 and bytes get
-// accounted in bytes_dropped_). The caller is responsible for monitoring \`getBytesDropped()\` and
-// taking remediation (e.g. resize buffer, throttle producer).
-//
-// Memory layout: the backing buffer is allocated with CACHE_LINE_SIZE (64-byte) alignment to guarantee
-// that every cache line belongs exclusively to this buffer and to avoid false sharing.
-
-class RingBuffer {
-private:
-    static constexpr size_t CACHE_LINE_SIZE = 64;
-    static constexpr size_t DEFAULT_SIZE = 1024 * 1024;
-    static constexpr size_t MAX_SIZE = 64 * 1024 * 1024;
-    
-    static size_t nextPowerOf2(size_t n) {
-        if (n == 0) return 1;
-        if (n > MAX_SIZE) return MAX_SIZE;
-
-        n--;
-        n |= n >> 1;
-        n |= n >> 2;
-        n |= n >> 4;
-        n |= n >> 8;
-        n |= n >> 16;
-#if SIZE_MAX > UINT32_MAX
-        n |= n >> 32;
-#endif
-        n++;
-        return n;
+Protocol parseProtocol(const YAML::Node& protocol_node) {
+    if(!protocol_node["communication"] || !protocol_node["message"]) {
+        throw std::runtime_error("Protocol definition must include 'communication' and 'message' fields");
     }
 
-    // Helper RAII deleter for aligned allocations
-    struct AlignedDeleter {
-        void operator()(void* p) const noexcept {
-            std::free(p);
-        }
-    };
+    Protocol protocol;
+    std::string comm_str = protocol_node["communication"].as<std::string>();
+    std::string msg_str = protocol_node["message"].as<std::string>();
 
-    using aligned_unique_ptr = std::unique_ptr<uint8_t, AlignedDeleter>;
+    protocol.communication = stringToCommunicationProtocol(comm_str);
+    protocol.message = stringToMessageProtocol(msg_str);
 
-    struct StaleBuffer {
-        aligned_unique_ptr ptr;
-        size_t safe_after_idx; // reader index after which it can be freed
-    };
-    std::deque<StaleBuffer> stale_;
-
-    alignas(CACHE_LINE_SIZE) std::atomic<size_t> write_pos_{0};
-    alignas(CACHE_LINE_SIZE) std::atomic<size_t> read_pos_{0};
-    alignas(CACHE_LINE_SIZE) std::atomic<uint64_t> bytes_written_{0};
-    alignas(CACHE_LINE_SIZE) std::atomic<uint64_t> bytes_dropped_{0};
-    
-    aligned_unique_ptr owned_buffer_;
-    uint8_t* buffer_;
-    size_t capacity_;
-    size_t mask_;
-#ifndef NDEBUG
-    // Debug-only thread ownership tracking to ensure SPSC discipline.
-    std::thread::id producer_thread_{}, consumer_thread_{};
-#endif
-
-    // Attempt to grow to accommodate at least "extra" additional bytes beyond current capacity.
-    // Returns true on success, false if MAX_SIZE would be exceeded or allocation fails.
-    bool grow(size_t extra) {
-        if (capacity_ == MAX_SIZE) return false;
-
-        size_t new_cap = nextPowerOf2(std::min(capacity_ + extra + 1, MAX_SIZE));
-        if (new_cap <= capacity_) return false; // could not grow (already at max)
-
-        void* ptr = nullptr;
-        if (posix_memalign(&ptr, CACHE_LINE_SIZE, new_cap) != 0) {
-            return false;
-        }
-        uint8_t* new_buf = static_cast<uint8_t*>(ptr);
-
-        // Copy existing readable data from old buffer to new buffer preserving indices
-        const size_t read  = read_pos_.load(std::memory_order_acquire);
-        const size_t write = write_pos_.load(std::memory_order_relaxed);
-        const size_t readable = write - read;
-
-        const size_t old_mask = mask_;
-        size_t read_idx = read & old_mask;
-
-        size_t first_chunk = std::min(readable, capacity_ - read_idx);
-        std::memcpy(new_buf + read_idx, buffer_ + read_idx, first_chunk);
-        if (first_chunk < readable) {
-            std::memcpy(new_buf, buffer_, readable - first_chunk);
-        }
-
-        // Stash old buffer until consumer passes "write"
-        stale_.push_back(StaleBuffer{std::move(owned_buffer_), write});
-
-        // Swap in new buffer
-        buffer_ = new_buf;
-        capacity_ = new_cap;
-        mask_ = new_cap - 1;
-        owned_buffer_.reset(new_buf);
-
-        return true;
+    if(!protocol.is_valid()) {
+        throw std::runtime_error("Invalid protocol specified: " + comm_str + "/" + msg_str);
     }
 
-public:
-    explicit RingBuffer(size_t capacity = DEFAULT_SIZE)
-        : capacity_(nextPowerOf2(std::min(capacity, MAX_SIZE))), mask_(capacity_ - 1) {
-        void* ptr = nullptr;
-        if (posix_memalign(&ptr, CACHE_LINE_SIZE, capacity_) != 0) {
-            throw std::bad_alloc();
-        }
-        buffer_ = static_cast<uint8_t*>(ptr);
-        owned_buffer_.reset(buffer_);
+    return protocol;
+}
+
+Flow parseFlow(const YAML::Node& node, FlowDirection direction, const std::string& parent_set) {
+    Flow flow;
+    flow.parent_set = parent_set;
+    flow.direction = direction;
+    if(!node["name"]) {
+        throw std::runtime_error("Each flow must have a 'name' field");
     }
-    
-    // Construct a RingBuffer around an externally-owned memory region.
-    // The caller MUST provide a power-of-two sized, cache-line aligned buffer.
 
-    RingBuffer(uint8_t* external_buffer, size_t capacity)
-        : buffer_(external_buffer), capacity_(capacity), mask_(capacity_ - 1) {
-        const bool invalid_capacity = (capacity == 0) || (capacity > MAX_SIZE) || ((capacity & (capacity - 1)) != 0);
-        if (!buffer_ || invalid_capacity) {
-            throw std::invalid_argument("External buffer must be non-null, power-of-two sized and <= MAX_SIZE");
-        }
-        if ((reinterpret_cast<uintptr_t>(buffer_) % CACHE_LINE_SIZE) != 0) {
-            throw std::invalid_argument("External buffer must be cache-line aligned");
+    if(node["name"]) {
+        flow.name = node["name"].as<std::string>();
+    }
+
+    // Parse protocol
+    if (!node["protocol"]) {
+        throw std::runtime_error("Flow must have a 'protocol' field");
+    }
+    flow.protocol = parseProtocol(node["protocol"]);
+
+    // Parse IP addresses
+    if (node["src_ip"]) {
+        flow.src_ip = node["src_ip"].as<std::string>();
+    }
+    if (node["dst_ip"]) {
+        flow.dst_ip = node["dst_ip"].as<std::string>();
+    }
+
+    // Parse ports
+    if (node["src_port"]) {
+        flow.src_port = node["src_port"].as<uint16_t>();
+    }
+    if (node["dst_port"]) {
+        flow.dst_port = node["dst_port"].as<uint16_t>();
+    }
+
+    return flow;
+}
+
+FlowSet parseFlowSet(const YAML::Node& node) {
+    FlowSet flow_set;
+
+    // Parse set name
+    if (!node["set_name"]) {
+        throw std::runtime_error("Flow set must have a 'set_name' field");
+    }
+    flow_set.set_name = node["set_name"].as<std::string>();
+
+    // Parse ingress flows
+    if (node["ingress_flows"]) {
+        for (const auto& flow_node : node["ingress_flows"]) {
+            flow_set.ingress_flows.push_back(
+                parseFlow(flow_node, FlowDirection::INGRESS, flow_set.set_name)
+            );
         }
     }
-    
-    RingBuffer(const RingBuffer&) = delete;
-    RingBuffer& operator=(const RingBuffer&) = delete;
-    
-    RingBuffer(RingBuffer&& other) noexcept
-        : write_pos_(other.write_pos_.load()), read_pos_(other.read_pos_.load()),
-          bytes_written_(other.bytes_written_.load()), bytes_dropped_(other.bytes_dropped_.load()),
-          owned_buffer_(std::move(other.owned_buffer_)), buffer_(other.buffer_),
-          capacity_(other.capacity_), mask_(other.mask_) {
-        other.buffer_ = nullptr;
-        other.capacity_ = 0;
-        other.mask_ = 0;
-        other.write_pos_.store(0, std::memory_order_relaxed);
-        other.read_pos_.store(0, std::memory_order_relaxed);
-        other.bytes_written_.store(0, std::memory_order_relaxed);
-        other.bytes_dropped_.store(0, std::memory_order_relaxed);
+
+    // Parse egress flows
+    if (node["egress_flows"]) {
+        for (const auto& flow_node : node["egress_flows"]) {
+            flow_set.egress_flows.push_back(
+                parseFlow(flow_node, FlowDirection::EGRESS, flow_set.set_name)
+            );
+        }
     }
-    
-    // Write up to 'len' bytes. Returns the number of bytes actually written.
-    // Thread-safe for a single producer thread.
-    [[nodiscard]] size_t write(const uint8_t* data, size_t len) noexcept {
-#ifndef NDEBUG
-        // Capture producer thread id on first use and assert consistency afterwards.
-        if (producer_thread_ == std::thread::id()) {
-            producer_thread_ = std::this_thread::get_id();
-        } else {
-            assert(producer_thread_ == std::this_thread::get_id() && "RingBuffer::write called from multiple producer threads");
-        }
-#endif
-        if (!data || len == 0) {
-            return 0;
-        }
 
-        // Load the current indices. For SPSC we need to observe the latest
-        // consumer progress before claiming free space, hence acquire when
-        // reading the consumer owned read_pos_.
-        const size_t write = write_pos_.load(std::memory_order_relaxed);
-        const size_t read  = read_pos_.load(std::memory_order_acquire);
+    // Parse directories
+    if (node["watch_directory"]) {
+        flow_set.watch_directory = node["watch_directory"].as<std::string>();
+    }
+    if (node["output_directory"]) {
+        flow_set.output_directory = node["output_directory"].as<std::string>();
+    }
 
-        // Reclaim stale buffers whose data have been fully consumed
-        while (!stale_.empty() && stale_.front().safe_after_idx <= read) {
-            stale_.pop_front();
-        }
+    return flow_set;
+}
 
-        size_t available = (read + capacity_ - write - 1) & mask_;
-        if (len > available) {
-            if (!grow(len - available)) {
-                // Could not grow – drop and report failure
-                bytes_dropped_.fetch_add(len, std::memory_order_relaxed);
-                return 0;
-            }
-            // After grow(), recalculate available with new capacity
-            available = (read + capacity_ - write - 1) & mask_;
-            assert(len <= available);
-        }
+AppConfig AppConfig::load(const std::string& config_path) {
+    AppConfig config;
 
-        const size_t to_write = len; // now we have enough space
-
-        const size_t write_idx   = write & mask_;
-        const size_t first_chunk = std::min(to_write, capacity_ - write_idx);
-        std::memcpy(buffer_ + write_idx, data, first_chunk);
-
-        if (first_chunk < to_write) {
-            std::memcpy(buffer_, data + first_chunk, to_write - first_chunk);
+    try {
+        // Check if file exists
+        if (!std::filesystem::exists(config_path)) {
+            throw std::runtime_error("Configuration file not found: " + config_path);
         }
 
-        // Publish the new write position – release so that the data is visible
-        // to the consumer before the index update becomes visible.
-        write_pos_.store(write + to_write, std::memory_order_release);
-        bytes_written_.fetch_add(to_write, std::memory_order_relaxed);
+        // Load YAML file
+        YAML::Node root = YAML::LoadFile(config_path);
 
-        if (to_write < len) {
-            bytes_dropped_.fetch_add(len - to_write, std::memory_order_relaxed);
-        }
-
-        return to_write;
-    }
-    
-    // Advance the consumer read pointer by up to 'len' bytes.
-    // Thread-safe for a single consumer thread.
-    void consume(size_t len) noexcept {
-#ifndef NDEBUG
-        // Capture consumer thread id on first use and assert consistency afterwards.
-        if (consumer_thread_ == std::thread::id()) {
-            consumer_thread_ = std::this_thread::get_id();
-        } else {
-            assert(consumer_thread_ == std::this_thread::get_id() && "RingBuffer::consume called from multiple consumer threads");
-        }
-#endif
-        const size_t read  = read_pos_.load(std::memory_order_relaxed);
-        const size_t write = write_pos_.load(std::memory_order_acquire);
-
-        const size_t available  = write - read;
-        const size_t to_consume = std::min(len, available);
-
-        // Release so that prior reads by the consumer happen-before a producer
-        // seeing the new read_pos_.
-        read_pos_.store(read + to_consume, std::memory_order_release);
-    }
-    
-    size_t available_data() const {
-        size_t read  = read_pos_.load(std::memory_order_acquire);
-        size_t write = write_pos_.load(std::memory_order_acquire);
-        return write - read;
-    }
-    
-    size_t available_space() const {
-        const size_t read  = read_pos_.load(std::memory_order_acquire);
-        const size_t write = write_pos_.load(std::memory_order_acquire);
-        return (read + capacity_ - write - 1) & mask_;
-    }
-    
-    // Reset the buffer – NOT thread-safe. Intended for initialisation / tests only.
-    void reset() noexcept {
-#ifndef NDEBUG
-        producer_thread_ = std::thread::id();
-        consumer_thread_ = std::thread::id();
-#endif
-        write_pos_.store(0, std::memory_order_release);
-        read_pos_.store(0, std::memory_order_release);
-        bytes_written_.store(0, std::memory_order_relaxed);
-        bytes_dropped_.store(0, std::memory_order_relaxed);
-    }
-    
-    uint64_t getBytesWritten() const { 
-        return bytes_written_.load(std::memory_order_relaxed); 
-    }
-    
-    uint64_t getBytesDropped() const { 
-        return bytes_dropped_.load(std::memory_order_relaxed); 
-    }
-    
-    size_t getCapacity() const { return capacity_; }
-    
-    bool empty() const noexcept {
-        return read_pos_.load(std::memory_order_acquire) ==
-               write_pos_.load(std::memory_order_acquire);
-    }
-    
-    class Reader {
-    private:
-        const uint8_t* buffer_;
-        size_t mask_;
-        size_t start_pos_;
-        size_t total_size_;
-        
-    public:
-        Reader(const uint8_t* buffer, size_t mask, size_t start_pos, size_t total_size)
-            : buffer_(buffer), mask_(mask), start_pos_(start_pos), total_size_(total_size) {}
-        
-        uint8_t operator[](size_t offset) const {
-            if (offset >= total_size_) {
-                throw std::out_of_range("Offset beyond available data");
-            }
-            return buffer_[(start_pos_ + offset) & mask_];
-        }
-        
-        void read(void* dest, size_t offset, size_t len) const {
-            if (offset + len > total_size_) {
-                throw std::out_of_range("Read beyond available data");
-            }
-            
-            uint8_t* dest_ptr = static_cast<uint8_t*>(dest);
-            size_t pos = (start_pos_ + offset) & mask_;
-            size_t buffer_size = mask_ + 1;
-            
-            size_t first_chunk = std::min(len, buffer_size - pos);
-            std::memcpy(dest_ptr, buffer_ + pos, first_chunk);
-            
-            if (first_chunk < len) {
-                std::memcpy(dest_ptr + first_chunk, buffer_, len - first_chunk);
+        // Parse flow sets
+        if (root["flow_sets"]) {
+            for (const auto& flow_set_node : root["flow_sets"]) {
+                config.flow_sets.push_back(parseFlowSet(flow_set_node));
             }
         }
-        
-        template<typename T>
-        T read(size_t offset) const {
-            T value;
-            read(&value, offset, sizeof(T));
-            return value;
-        }
-        
-        size_t contiguous_from(size_t offset) const {
-            if (offset >= total_size_) return 0;
-            size_t pos = (start_pos_ + offset) & mask_;
-            size_t buffer_size = mask_ + 1;
-            return std::min(buffer_size - pos, total_size_ - offset);
-        }
-        
-        size_t size() const { return total_size_; }
-        
-        const uint8_t* ptr_if_contiguous(size_t offset, size_t len) const {
-            // Quick bounds check first.
-            if (offset + len > total_size_) {
-                return nullptr;
-            }
 
-            // Leverage contiguous_from() to determine how many bytes can be
-            // read in a single, linear span starting at the given offset.
-            // This avoids subtle off-by-one errors when the requested span
-            // straddles the physical end of the circular buffer.
-            if (contiguous_from(offset) < len) {
-                return nullptr; // would wrap
+        // Parse other configs
+        if (root["other_configs"]) {
+            const auto& other = root["other_configs"];
+            if (other["debug_mode"]) {
+                config.debug_mode = other["debug_mode"].as<bool>();
             }
-
-            size_t pos = (start_pos_ + offset) & mask_;
-            return buffer_ + pos;
+            if (other["dropcopy_path"]) {
+                config.dropcopy_path = other["dropcopy_path"].as<std::string>();
+            }
+            if (other["oldest_spcast_date"]) {
+                config.oldest_spcast_date = parseDateToHighResolutionClock(other["oldest_spcast_date"].as<std::string>());
+            }
         }
-    };
-    
-    Reader getReader() const noexcept {
-        const size_t read  = read_pos_.load(std::memory_order_acquire);
-        const size_t write = write_pos_.load(std::memory_order_acquire);
-        const size_t available = write - read;
-        const size_t read_idx  = read & mask_;
-        return Reader(buffer_, mask_, read_idx, available);
+
+        // Validate the loaded configuration
+        config.validate();
+
+    } catch (const YAML::Exception& e) {
+        throw std::runtime_error("Failed to parse YAML configuration: " + std::string(e.what()));
+    } catch (const std::exception& e) {
+        throw std::runtime_error("Failed to load configuration: " + std::string(e.what()));
     }
 
-    // Compile-time checks for platform assumptions
-    static_assert(sizeof(size_t) == sizeof(uintptr_t), "RingBuffer assumes size_t matches pointer width");
-    static_assert((CACHE_LINE_SIZE & (CACHE_LINE_SIZE - 1)) == 0, "CACHE_LINE_SIZE must be power of two");
-    static_assert(DEFAULT_SIZE <= MAX_SIZE, "DEFAULT_SIZE must not exceed MAX_SIZE");
-};
+    return config;
+}
 
-} 
+void AppConfig::validate() const {
+    // Validate that we have at least one flow set
+    if (flow_sets.empty()) {
+        throw std::runtime_error("Configuration must define at least one flow set");
+    }
+
+    // Validate each flow set
+    for (const auto& flow_set : flow_sets) {
+        if (flow_set.set_name.empty()) {
+            throw std::runtime_error("Flow set must have a non-empty name");
+        }
+
+        // Check that flow set has at least one flow
+        if (flow_set.ingress_flows.empty() || flow_set.egress_flows.empty()) {
+            throw std::runtime_error("Flow set '" + flow_set.set_name +
+                                   "' must have at least one pair of ingress/egress flows");
+        }
+
+        // Validate each flow
+        auto validate_flow = [&](const Flow& flow) {
+            if (!flow.protocol.is_valid()) {
+                throw std::runtime_error("Invalid protocol in flow for set '" +
+                                       flow_set.set_name + "'");
+            }
+        };
+
+        for (const auto& flow : flow_set.ingress_flows) {
+            validate_flow(flow);
+        }
+        for (const auto& flow : flow_set.egress_flows) {
+            validate_flow(flow);
+        }
+    }
+}
+
+} // namespace pme
