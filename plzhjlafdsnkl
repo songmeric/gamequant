@@ -1,3 +1,1015 @@
+### FILE: tests/Config_test.cpp ###
+#include <gtest/gtest.h>
+#include "Config.h"
+#include <fstream>
+#include <filesystem>
+
+namespace pme {
+
+class ConfigTest : public ::testing::Test {
+protected:
+    void SetUp() override {
+        test_dir_ = std::filesystem::temp_directory_path() / "config_test";
+        std::filesystem::create_directories(test_dir_);
+    }
+    
+    void TearDown() override {
+        std::filesystem::remove_all(test_dir_);
+    }
+    
+    void WriteConfigFile(const std::string& filename, const std::string& content) {
+        std::ofstream file(test_dir_ / filename);
+        file << content;
+    }
+    
+    std::filesystem::path test_dir_;
+};
+
+TEST_F(ConfigTest, LoadValidConfig) {
+    std::string yaml_content = R"(
+flow_sets:
+  - set_name: "Production"
+    ingress_flows:
+      - name: "MarketDataIn"
+        protocol:
+          communication: "TCP"
+          message: "RAZE"
+        src_ip: "192.168.1.100"
+        dst_ip: "10.0.0.50"
+        dst_port: 8080
+    egress_flows:
+      - name: "MarketDataOut"
+        protocol:
+          communication: "UDP"
+          message: "SPCAST_V3"
+        src_ip: "10.0.0.50"
+        src_port: 9090
+    watch_directory: "/data/pcap"
+    output_directory: "/data/output"
+
+other_configs:
+  debug_mode: true
+  dropcopy_path: "/logs/dropcopy.log"
+  oldest_spcast_date: "01/01/2024"
+)";
+    
+    WriteConfigFile("valid_config.yaml", yaml_content);
+    
+    AppConfig config = AppConfig::load((test_dir_ / "valid_config.yaml").string());
+    
+    ASSERT_EQ(config.flow_sets.size(), 1);
+    EXPECT_EQ(config.flow_sets[0].set_name, "Production");
+    
+    ASSERT_EQ(config.flow_sets[0].ingress_flows.size(), 1);
+    const auto& ingress = config.flow_sets[0].ingress_flows[0];
+    EXPECT_EQ(ingress.name, "MarketDataIn");
+    EXPECT_EQ(ingress.protocol.communication, CommunicationProtocol::TCP);
+    EXPECT_EQ(ingress.protocol.message, MessageProtocol::RAZE);
+    EXPECT_EQ(ingress.src_ip, "192.168.1.100");
+    EXPECT_EQ(ingress.dst_ip, "10.0.0.50");
+    EXPECT_EQ(ingress.dst_port, 8080);
+    
+    ASSERT_EQ(config.flow_sets[0].egress_flows.size(), 1);
+    const auto& egress = config.flow_sets[0].egress_flows[0];
+    EXPECT_EQ(egress.name, "MarketDataOut");
+    EXPECT_EQ(egress.protocol.communication, CommunicationProtocol::UDP);
+    EXPECT_EQ(egress.protocol.message, MessageProtocol::SPCASTV3);
+    EXPECT_EQ(egress.src_ip, "10.0.0.50");
+    EXPECT_EQ(egress.src_port, 9090);
+    
+    EXPECT_TRUE(config.debug_mode);
+    EXPECT_EQ(config.dropcopy_path, "/logs/dropcopy.log");
+}
+
+TEST_F(ConfigTest, MissingRequiredFields) {
+    std::string yaml_content = R"(
+flow_sets:
+  - set_name: "TestSet"
+    ingress_flows:
+      - name: "Flow1"
+    egress_flows:
+      - name: "Flow2"
+        protocol:
+          communication: "UDP"
+          message: "SPCASTV3"
+)";
+    
+    WriteConfigFile("missing_protocol.yaml", yaml_content);
+    
+    EXPECT_THROW(AppConfig::load((test_dir_ / "missing_protocol.yaml").string()), 
+                 std::runtime_error);
+}
+
+TEST_F(ConfigTest, InvalidProtocol) {
+    std::string yaml_content = R"(
+flow_sets:
+  - set_name: "TestSet"
+    ingress_flows:
+      - name: "Flow1"
+        protocol:
+          communication: "INVALID_PROTOCOL"
+          message: "RAZE"
+    egress_flows:
+      - name: "Flow2"
+        protocol:
+          communication: "UDP"
+          message: "SPCASTV3"
+)";
+    
+    WriteConfigFile("invalid_protocol.yaml", yaml_content);
+    
+    EXPECT_THROW(AppConfig::load((test_dir_ / "invalid_protocol.yaml").string()), 
+                 std::runtime_error);
+}
+
+TEST_F(ConfigTest, EmptyFlowSets) {
+    std::string yaml_content = R"(
+flow_sets: []
+other_configs:
+  debug_mode: false
+)";
+    
+    WriteConfigFile("empty_flows.yaml", yaml_content);
+    
+    EXPECT_THROW(AppConfig::load((test_dir_ / "empty_flows.yaml").string()), 
+                 std::runtime_error);
+}
+
+TEST_F(ConfigTest, FlowSetWithoutFlows) {
+    std::string yaml_content = R"(
+flow_sets:
+  - set_name: "EmptySet"
+    ingress_flows: []
+    egress_flows: []
+)";
+    
+    WriteConfigFile("no_flows.yaml", yaml_content);
+    
+    EXPECT_THROW(AppConfig::load((test_dir_ / "no_flows.yaml").string()), 
+                 std::runtime_error);
+}
+
+TEST_F(ConfigTest, ParseDateFunction) {
+    auto time_point = parseDateToHighResolutionClock("15/06/2024");
+    auto time_since_epoch = time_point.time_since_epoch().count();
+    EXPECT_GT(time_since_epoch, 0);
+    
+    EXPECT_THROW(parseDateToHighResolutionClock("2024-06-15"), std::runtime_error);
+    EXPECT_THROW(parseDateToHighResolutionClock("invalid"), std::runtime_error);
+}
+
+TEST_F(ConfigTest, MultipleFlowSets) {
+    std::string yaml_content = R"(
+flow_sets:
+  - set_name: "Production"
+    ingress_flows:
+      - name: "ProdIn"
+        protocol:
+          communication: "TCP"
+          message: "RAZE"
+    egress_flows:
+      - name: "ProdOut"
+        protocol:
+          communication: "UDP"
+          message: "SPCASTV3"
+          
+  - set_name: "Testing"
+    ingress_flows:
+      - name: "TestIn"
+        protocol:
+          communication: "TCP"
+          message: "RAZE"
+    egress_flows:
+      - name: "TestOut"
+        protocol:
+          communication: "UDP"
+          message: "SPCASTV3"
+)";
+    
+    WriteConfigFile("multi_sets.yaml", yaml_content);
+    
+    AppConfig config = AppConfig::load((test_dir_ / "multi_sets.yaml").string());
+    
+    ASSERT_EQ(config.flow_sets.size(), 2);
+    EXPECT_EQ(config.flow_sets[0].set_name, "Production");
+    EXPECT_EQ(config.flow_sets[1].set_name, "Testing");
+}
+
+TEST_F(ConfigTest, MalformedYamlFile) {
+    std::string yaml_content = R"(
+flow_sets:
+  - set_name: BadYaml
+    ingress_flows:
+      - name: "Flow1
+        protocol:   
+          communication: "TCP
+          message: RAZE"
+        src_ip: "10.0.0.1
+)";
+    
+    WriteConfigFile("malformed.yaml", yaml_content);
+    
+    EXPECT_THROW(AppConfig::load((test_dir_ / "malformed.yaml").string()), 
+                 std::runtime_error);
+}
+
+TEST_F(ConfigTest, NonExistentConfigFile) {
+    EXPECT_THROW(AppConfig::load("/non/existent/path/config.yaml"), 
+                 std::runtime_error);
+}
+
+} 
+### END: tests/Config_test.cpp ###
+
+### FILE: tests/FlowClassifier_test.cpp ###
+#include <gtest/gtest.h>
+
+#include <EthLayer.h>
+#include <IPv4Layer.h>
+#include <Packet.h>
+#include <PayloadLayer.h>
+#include <TcpLayer.h>
+#include <UdpLayer.h>
+
+#include "Config.h"
+#include "FlowClassifier.h"
+
+namespace pme {
+
+class FlowClassifierTest : public ::testing::Test {
+protected:
+    void SetUp() override {
+        FlowSet set1;
+        set1.set_name = "TestSet1";
+        
+        Flow ingress1;
+        ingress1.parent_set = "TestSet1";
+        ingress1.name = "IngressFlow1";
+        ingress1.protocol = {CommunicationProtocol::TCP, MessageProtocol::RAZE};
+        ingress1.src_ip = "192.168.1.10";
+        ingress1.dst_ip = "10.0.0.1";
+        ingress1.src_port = 0;
+        ingress1.dst_port = 1234;
+        ingress1.direction = FlowDirection::INGRESS;
+        set1.ingress_flows.push_back(ingress1);
+        
+        Flow egress1;
+        egress1.parent_set = "TestSet1";
+        egress1.name = "EgressFlow1";
+        egress1.protocol = {CommunicationProtocol::UDP, MessageProtocol::SPCASTV3};
+        egress1.src_ip = "10.0.0.1";
+        egress1.dst_ip = "";
+        egress1.src_port = 5678;
+        egress1.dst_port = 0;
+        egress1.direction = FlowDirection::EGRESS;
+        set1.egress_flows.push_back(egress1);
+        
+        config_.flow_sets.push_back(set1);
+        
+        classifier_ = std::make_unique<FlowClassifier>(config_);
+    }
+    
+    pcpp::Packet createTcpPacket(const std::string& src_ip, const std::string& dst_ip,
+                                 uint16_t src_port, uint16_t dst_port) {
+        pcpp::Packet packet(100);
+        
+        pcpp::MacAddress srcMac("aa:bb:cc:dd:ee:ff");
+        pcpp::MacAddress dstMac("ff:ee:dd:cc:bb:aa");
+        auto* ethLayer = new pcpp::EthLayer(srcMac, dstMac, PCPP_ETHERTYPE_IP);
+        packet.addLayer(ethLayer);
+        
+        auto* ipLayer = new pcpp::IPv4Layer(pcpp::IPv4Address(src_ip), pcpp::IPv4Address(dst_ip));
+        packet.addLayer(ipLayer);
+        
+        auto* tcpLayer = new pcpp::TcpLayer(src_port, dst_port);
+        packet.addLayer(tcpLayer);
+        
+        std::string payload = "Test TCP data";
+        auto* payloadLayer = new pcpp::PayloadLayer(
+            reinterpret_cast<const uint8_t*>(payload.data()), payload.length());
+        packet.addLayer(payloadLayer);
+        
+        packet.computeCalculateFields();
+        return packet;
+    }
+    
+    pcpp::Packet createUdpPacket(const std::string& src_ip, const std::string& dst_ip,
+                                 uint16_t src_port, uint16_t dst_port) {
+        pcpp::Packet packet(100);
+        
+        pcpp::MacAddress srcMac("aa:bb:cc:dd:ee:ff");
+        pcpp::MacAddress dstMac("ff:ee:dd:cc:bb:aa");
+        auto* ethLayer = new pcpp::EthLayer(srcMac, dstMac, PCPP_ETHERTYPE_IP);
+        packet.addLayer(ethLayer);
+        
+        auto* ipLayer = new pcpp::IPv4Layer(pcpp::IPv4Address(src_ip), pcpp::IPv4Address(dst_ip));
+        packet.addLayer(ipLayer);
+        
+        auto* udpLayer = new pcpp::UdpLayer(src_port, dst_port);
+        packet.addLayer(udpLayer);
+        
+        std::string payload = "Test UDP data";
+        auto* payloadLayer = new pcpp::PayloadLayer(
+            reinterpret_cast<const uint8_t*>(payload.data()), payload.length());
+        packet.addLayer(payloadLayer);
+        
+        packet.computeCalculateFields();
+        return packet;
+    }
+    
+    AppConfig config_;
+    std::unique_ptr<FlowClassifier> classifier_;
+};
+
+TEST_F(FlowClassifierTest, ClassifyTcpPacketToIngressFlow) {
+    auto packet = createTcpPacket("192.168.1.10", "10.0.0.1", 55555, 1234);
+    
+    const Flow* flow = classifier_->classify(packet);
+    
+    ASSERT_NE(flow, nullptr);
+    EXPECT_EQ(flow->name, "IngressFlow1");
+    EXPECT_EQ(flow->direction, FlowDirection::INGRESS);
+}
+
+TEST_F(FlowClassifierTest, ClassifyUdpPacketToEgressFlow) {
+    auto packet = createUdpPacket("10.0.0.1", "192.168.1.20", 5678, 9999);
+    
+    const Flow* flow = classifier_->classify(packet);
+    
+    ASSERT_NE(flow, nullptr);
+    EXPECT_EQ(flow->name, "EgressFlow1");
+    EXPECT_EQ(flow->direction, FlowDirection::EGRESS);
+}
+
+TEST_F(FlowClassifierTest, ClassifyUnmatchedPacket) {
+    auto packet = createTcpPacket("1.2.3.4", "5.6.7.8", 9999, 8888);
+    
+    const Flow* flow = classifier_->classify(packet);
+    
+    EXPECT_EQ(flow, nullptr);
+}
+
+TEST_F(FlowClassifierTest, ProtocolMismatch) {
+    auto packet = createTcpPacket("10.0.0.1", "192.168.1.20", 5678, 9999);
+    
+    const Flow* flow = classifier_->classify(packet);
+    
+    EXPECT_EQ(flow, nullptr);
+}
+
+TEST_F(FlowClassifierTest, ClassifyTcpConnection) {
+    pcpp::ConnectionData conn;
+    conn.srcIP = pcpp::IPv4Address("192.168.1.10");
+    conn.dstIP = pcpp::IPv4Address("10.0.0.1");
+    conn.srcPort = 45678;
+    conn.dstPort = 1234;
+    
+    const Flow* flow = classifier_->classify(conn);
+    
+    ASSERT_NE(flow, nullptr);
+    EXPECT_EQ(flow->name, "IngressFlow1");
+}
+
+TEST_F(FlowClassifierTest, PartialMatchingIpOnly) {
+    FlowSet set2;
+    set2.set_name = "TestSet2";
+    
+    Flow flow_ip_only;
+    flow_ip_only.parent_set = "TestSet2";
+    flow_ip_only.name = "FlowIpOnly";
+    flow_ip_only.protocol = {CommunicationProtocol::TCP, MessageProtocol::UNKNOWN};
+    flow_ip_only.src_ip = "172.16.0.10";
+    flow_ip_only.dst_ip = "";
+    flow_ip_only.src_port = 0;
+    flow_ip_only.dst_port = 0;
+    flow_ip_only.direction = FlowDirection::INGRESS;
+    set2.ingress_flows.push_back(flow_ip_only);
+    
+    config_.flow_sets.push_back(set2);
+    classifier_ = std::make_unique<FlowClassifier>(config_);
+    
+    auto packet = createTcpPacket("172.16.0.10", "8.8.8.8", 12345, 54321);
+    
+    const Flow* flow = classifier_->classify(packet);
+    
+    ASSERT_NE(flow, nullptr);
+    EXPECT_EQ(flow->name, "FlowIpOnly");
+}
+
+TEST_F(FlowClassifierTest, MalformedPacketNoIpLayer) {
+    pcpp::Packet packet(100);
+    
+    pcpp::MacAddress srcMac("aa:bb:cc:dd:ee:ff");
+    pcpp::MacAddress dstMac("ff:ee:dd:cc:bb:aa");
+    auto* ethLayer = new pcpp::EthLayer(srcMac, dstMac, PCPP_ETHERTYPE_IP);
+    packet.addLayer(ethLayer);
+    
+    const Flow* flow = classifier_->classify(packet);
+    EXPECT_EQ(flow, nullptr);
+}
+
+TEST_F(FlowClassifierTest, FlowMatchingPriority) {
+    Flow specific_flow;
+    specific_flow.parent_set = "TestSet1";
+    specific_flow.name = "SpecificFlow";
+    specific_flow.protocol = {CommunicationProtocol::TCP, MessageProtocol::RAZE};
+    specific_flow.src_ip = "10.0.0.5";
+    specific_flow.dst_ip = "10.0.0.6";
+    specific_flow.src_port = 1111;
+    specific_flow.dst_port = 2222;
+    specific_flow.direction = FlowDirection::INGRESS;
+    
+    Flow general_flow;
+    general_flow.parent_set = "TestSet1";
+    general_flow.name = "GeneralFlow";
+    general_flow.protocol = {CommunicationProtocol::TCP, MessageProtocol::RAZE};
+    general_flow.src_ip = "10.0.0.5";
+    general_flow.dst_ip = "";
+    general_flow.src_port = 0;
+    general_flow.dst_port = 0;
+    general_flow.direction = FlowDirection::INGRESS;
+    
+    config_.flow_sets[0].ingress_flows.push_back(general_flow);
+    config_.flow_sets[0].ingress_flows.push_back(specific_flow);
+    
+    classifier_ = std::make_unique<FlowClassifier>(config_);
+    
+    auto packet = createTcpPacket("10.0.0.5", "10.0.0.6", 1111, 2222);
+    const Flow* flow = classifier_->classify(packet);
+    
+    ASSERT_NE(flow, nullptr);
+    EXPECT_EQ(flow->name, "GeneralFlow");
+}
+
+} 
+### END: tests/FlowClassifier_test.cpp ###
+
+### FILE: tests/Hash_test.cpp ###
+#include <gtest/gtest.h>
+#include "Hash.h"
+#include <unordered_map>
+
+namespace pme {
+
+class HashTest : public ::testing::Test {
+protected:
+};
+
+TEST_F(HashTest, DeterministicHashing) {
+    uint64_t seq = 12345;
+    uint64_t recv = 1750000000000000000;
+    uint64_t send = 1750000000000000001;
+    
+    uint64_t hash1 = generateHash(seq, recv, send);
+    uint64_t hash2 = generateHash(seq, recv, send);
+    
+    EXPECT_EQ(hash1, hash2);
+}
+
+TEST_F(HashTest, DifferentSequencesDifferentHashes) {
+    uint64_t recv = 1750000000000000000;
+    uint64_t send = 1750000000000000001;
+    
+    uint64_t hash1 = generateHash(100, recv, send);
+    uint64_t hash2 = generateHash(200, recv, send);
+    
+    EXPECT_NE(hash1, hash2);
+}
+
+TEST_F(HashTest, DifferentReceiveTimesDifferentHashes) {
+    uint64_t seq = 12345;
+    uint64_t send = 1750000000000000001;
+    
+    uint64_t hash1 = generateHash(seq, 1750000000000000000, send);
+    uint64_t hash2 = generateHash(seq, 1750000000000000100, send);
+    
+    EXPECT_NE(hash1, hash2);
+}
+
+TEST_F(HashTest, DifferentSendTimesDifferentHashes) {
+    uint64_t seq = 12345;
+    uint64_t recv = 1750000000000000000;
+    
+    uint64_t hash1 = generateHash(seq, recv, 1750000000000000001);
+    uint64_t hash2 = generateHash(seq, recv, 1750000000000000101);
+    
+    EXPECT_NE(hash1, hash2);
+}
+
+TEST_F(HashTest, EdgeCaseValues) {
+    uint64_t hash_zeros = generateHash(0, 0, 0);
+    EXPECT_NE(hash_zeros, 0);
+    
+    uint64_t hash_max = generateHash(UINT64_MAX, UINT64_MAX, UINT64_MAX);
+    EXPECT_NE(hash_max, 0);
+    
+    EXPECT_NE(hash_zeros, hash_max);
+}
+
+TEST_F(HashTest, OrderMatters) {
+    uint64_t a = 100;
+    uint64_t b = 200;
+    uint64_t c = 300;
+    
+    uint64_t hash1 = generateHash(a, b, c);
+    uint64_t hash2 = generateHash(a, c, b);
+    uint64_t hash3 = generateHash(b, a, c);
+    
+    EXPECT_NE(hash1, hash2);
+    EXPECT_NE(hash1, hash3);
+    EXPECT_NE(hash2, hash3);
+}
+
+} 
+### END: tests/Hash_test.cpp ###
+
+### FILE: tests/OutputFileWriter_test.cpp ###
+#include <gtest/gtest.h>
+#include "OutputFileWriter.h"
+#include <filesystem>
+#include <fstream>
+#include <sstream>
+
+namespace pme {
+
+class OutputFileWriterTest : public ::testing::Test {
+protected:
+    void SetUp() override {
+        test_dir_ = std::filesystem::temp_directory_path() / "output_writer_test";
+        std::filesystem::create_directories(test_dir_);
+    }
+    
+    void TearDown() override {
+        std::filesystem::remove_all(test_dir_);
+    }
+    
+    std::vector<JoinedMsgs> createTestData() {
+        std::vector<JoinedMsgs> data;
+        
+        auto base_time = std::chrono::high_resolution_clock::now();
+        
+        std::string flowSetName = "TestSet";
+        
+        ParsedMsgInfo ingress1(base_time);
+        ParsedMsgInfo egress1(base_time + std::chrono::nanoseconds(100));
+        data.emplace_back(ingress1, egress1, flowSetName);
+        
+        ParsedMsgInfo ingress2(base_time + std::chrono::microseconds(1));
+        ParsedMsgInfo egress2(base_time + std::chrono::microseconds(1) + std::chrono::nanoseconds(250));
+        data.emplace_back(ingress2, egress2, flowSetName);
+        
+        ParsedMsgInfo ingress3(base_time + std::chrono::microseconds(2));
+        ParsedMsgInfo egress3(base_time + std::chrono::microseconds(2) + std::chrono::nanoseconds(50));
+        data.emplace_back(ingress3, egress3, flowSetName);
+        
+        return data;
+    }
+    
+    std::vector<std::string> readCsvLines(const std::string& filepath) {
+        std::vector<std::string> lines;
+        std::ifstream file(filepath);
+        std::string line;
+        while (std::getline(file, line)) {
+            lines.push_back(line);
+        }
+        return lines;
+    }
+    
+    std::filesystem::path test_dir_;
+};
+
+TEST_F(OutputFileWriterTest, WriteValidData) {
+    auto testData = createTestData();
+    
+    bool result = OutputFileWriter::writeFlowSet(
+        testData, 
+        "TestFlow", 
+        test_dir_.string() + "/"
+    );
+    
+    EXPECT_TRUE(result);
+    
+    auto expected_file = test_dir_ / "TestFlow_results.csv";
+    EXPECT_TRUE(std::filesystem::exists(expected_file));
+    
+    auto lines = readCsvLines(expected_file.string());
+    ASSERT_GE(lines.size(), 4);
+    
+    EXPECT_EQ(lines[0], "entry_index,ingress_timestamp_ns,egress_timestamp_ns,latency_ns");
+    
+    EXPECT_EQ(lines.size() - 1, testData.size());
+}
+
+TEST_F(OutputFileWriterTest, WriteEmptyData) {
+    std::vector<JoinedMsgs> emptyData;
+    
+    bool result = OutputFileWriter::writeFlowSet(
+        emptyData, 
+        "EmptyFlow", 
+        test_dir_.string() + "/"
+    );
+    
+    EXPECT_TRUE(result);
+    
+    auto expected_file = test_dir_ / "EmptyFlow_results.csv";
+    EXPECT_TRUE(std::filesystem::exists(expected_file));
+    
+    auto lines = readCsvLines(expected_file.string());
+    ASSERT_EQ(lines.size(), 1);
+    EXPECT_EQ(lines[0], "entry_index,ingress_timestamp_ns,egress_timestamp_ns,latency_ns");
+}
+
+TEST_F(OutputFileWriterTest, InvalidOutputDirectory) {
+    auto testData = createTestData();
+    
+    bool result = OutputFileWriter::writeFlowSet(
+        testData, 
+        "TestFlow", 
+        "/invalid/path/that/does/not/exist/"
+    );
+    
+    EXPECT_FALSE(result);
+}
+
+TEST_F(OutputFileWriterTest, VerifyLatencyCalculation) {
+    std::vector<JoinedMsgs> data;
+    
+    auto ingress_time = std::chrono::high_resolution_clock::time_point(std::chrono::nanoseconds(1000000));
+    auto egress_time = std::chrono::high_resolution_clock::time_point(std::chrono::nanoseconds(1000500));
+    
+    ParsedMsgInfo ingress(ingress_time);
+    ParsedMsgInfo egress(egress_time);
+    std::string flowSetName = "TestSet";
+    data.emplace_back(ingress, egress, flowSetName);
+    
+    bool result = OutputFileWriter::writeFlowSet(
+        data, 
+        "LatencyTest", 
+        test_dir_.string() + "/"
+    );
+    
+    EXPECT_TRUE(result);
+    
+    auto lines = readCsvLines((test_dir_ / "LatencyTest_results.csv").string());
+    ASSERT_EQ(lines.size(), 2);
+    
+    std::stringstream ss(lines[1]);
+    std::string index, ingress_ns, egress_ns, latency_ns;
+    std::getline(ss, index, ',');
+    std::getline(ss, ingress_ns, ',');
+    std::getline(ss, egress_ns, ',');
+    std::getline(ss, latency_ns, ',');
+    
+    EXPECT_EQ(index, "0");
+    EXPECT_EQ(ingress_ns, "1000000");
+    EXPECT_EQ(egress_ns, "1000500");
+    EXPECT_EQ(latency_ns, "500");
+}
+
+TEST_F(OutputFileWriterTest, MultipleFlowSets) {
+    auto testData1 = createTestData();
+    auto testData2 = createTestData();
+    
+    bool result1 = OutputFileWriter::writeFlowSet(
+        testData1, 
+        "FlowSet1", 
+        test_dir_.string() + "/"
+    );
+    
+    bool result2 = OutputFileWriter::writeFlowSet(
+        testData2, 
+        "FlowSet2", 
+        test_dir_.string() + "/"
+    );
+    
+    EXPECT_TRUE(result1);
+    EXPECT_TRUE(result2);
+    
+    EXPECT_TRUE(std::filesystem::exists(test_dir_ / "FlowSet1_results.csv"));
+    EXPECT_TRUE(std::filesystem::exists(test_dir_ / "FlowSet2_results.csv"));
+}
+
+
+} 
+### END: tests/OutputFileWriter_test.cpp ###
+
+### FILE: tests/ProtocolHandlerFactory_test.cpp ###
+#include <gtest/gtest.h>
+#include "IProtocolHandler.h"
+#include "Config.h"
+#include "SpcastV3Handler.h"
+#include "RazeHandler.h"
+
+namespace pme {
+
+class ProtocolHandlerFactoryTest : public ::testing::Test {
+protected:
+    void SetUp() override {
+        config_.oldest_spcast_date = parseDateToHighResolutionClock("01/01/2020");
+        config_.dropcopy_path = "test_dropcopy.log";
+        
+        dropcopy_map_[12345] = LatencyStats{};
+    }
+    
+    AppConfig config_;
+    std::unordered_map<uint64_t, LatencyStats> dropcopy_map_;
+};
+
+TEST_F(ProtocolHandlerFactoryTest, CreateSpcastV3Handler) {
+    auto handler = createProtocolHandler(MessageProtocol::SPCASTV3, config_, dropcopy_map_);
+    
+    ASSERT_NE(handler, nullptr);
+    EXPECT_EQ(handler->getProtocolName(), "SPCASTV3");
+    
+    auto* spcast_handler = dynamic_cast<SpcastV3Handler*>(handler.get());
+    EXPECT_NE(spcast_handler, nullptr);
+}
+
+TEST_F(ProtocolHandlerFactoryTest, CreateRazeHandler) {
+    auto handler = createProtocolHandler(MessageProtocol::RAZE, config_, dropcopy_map_);
+    
+    ASSERT_NE(handler, nullptr);
+    EXPECT_EQ(handler->getProtocolName(), "RAZE");
+    
+    auto* raze_handler = dynamic_cast<RazeHandler*>(handler.get());
+    EXPECT_NE(raze_handler, nullptr);
+}
+
+TEST_F(ProtocolHandlerFactoryTest, UnknownProtocolThrows) {
+    EXPECT_THROW(
+        createProtocolHandler(MessageProtocol::UNKNOWN, config_, dropcopy_map_),
+        std::runtime_error
+    );
+}
+
+} 
+### END: tests/ProtocolHandlerFactory_test.cpp ###
+
+### FILE: tests/Protocols_test.cpp ###
+#include <gtest/gtest.h>
+#include "Protocols.h"
+
+namespace pme {
+
+class ProtocolsTest : public ::testing::Test {
+protected:
+};
+
+TEST_F(ProtocolsTest, StringToCommunicationProtocol) {
+    EXPECT_EQ(stringToCommunicationProtocol("TCP"), CommunicationProtocol::TCP);
+    EXPECT_EQ(stringToCommunicationProtocol("tcp"), CommunicationProtocol::TCP);
+    EXPECT_EQ(stringToCommunicationProtocol("Tcp"), CommunicationProtocol::TCP);
+    EXPECT_EQ(stringToCommunicationProtocol("UDP"), CommunicationProtocol::UDP);
+    EXPECT_EQ(stringToCommunicationProtocol("udp"), CommunicationProtocol::UDP);
+    EXPECT_EQ(stringToCommunicationProtocol("uDp"), CommunicationProtocol::UDP);
+    
+    EXPECT_EQ(stringToCommunicationProtocol(""), CommunicationProtocol::UNKNOWN);
+    EXPECT_EQ(stringToCommunicationProtocol("HTTP"), CommunicationProtocol::UNKNOWN);
+    EXPECT_EQ(stringToCommunicationProtocol("invalid"), CommunicationProtocol::UNKNOWN);
+}
+
+TEST_F(ProtocolsTest, StringToMessageProtocol) {
+    EXPECT_EQ(stringToMessageProtocol("SPCASTV3"), MessageProtocol::SPCASTV3);
+    EXPECT_EQ(stringToMessageProtocol("spcastv3"), MessageProtocol::SPCASTV3);
+    EXPECT_EQ(stringToMessageProtocol("SpCastV3"), MessageProtocol::SPCASTV3);
+    EXPECT_EQ(stringToMessageProtocol("RAZE"), MessageProtocol::RAZE);
+    EXPECT_EQ(stringToMessageProtocol("raze"), MessageProtocol::RAZE);
+    EXPECT_EQ(stringToMessageProtocol("Raze"), MessageProtocol::RAZE);
+    
+    EXPECT_EQ(stringToMessageProtocol(""), MessageProtocol::UNKNOWN);
+    EXPECT_EQ(stringToMessageProtocol("SPCASTV4"), MessageProtocol::UNKNOWN);
+    EXPECT_EQ(stringToMessageProtocol("invalid"), MessageProtocol::UNKNOWN);
+}
+
+TEST_F(ProtocolsTest, CommunicationProtocolToString) {
+    EXPECT_EQ(communicationProtocolToString(CommunicationProtocol::TCP), "TCP");
+    EXPECT_EQ(communicationProtocolToString(CommunicationProtocol::UDP), "UDP");
+    EXPECT_EQ(communicationProtocolToString(CommunicationProtocol::UNKNOWN), "UNKNOWN");
+}
+
+TEST_F(ProtocolsTest, MessageProtocolToString) {
+    EXPECT_EQ(messageProtocolToString(MessageProtocol::SPCASTV3), "SPCASTV3");
+    EXPECT_EQ(messageProtocolToString(MessageProtocol::RAZE), "RAZE");
+    EXPECT_EQ(messageProtocolToString(MessageProtocol::UNKNOWN), "UNKNOWN");
+}
+
+TEST_F(ProtocolsTest, ProtocolStruct) {
+    Protocol valid_proto;
+    valid_proto.communication = CommunicationProtocol::TCP;
+    valid_proto.message = MessageProtocol::RAZE;
+    EXPECT_TRUE(valid_proto.is_valid());
+    EXPECT_EQ(valid_proto.toString(), "TCP/RAZE");
+    
+    Protocol invalid1;
+    EXPECT_FALSE(invalid1.is_valid());
+    EXPECT_EQ(invalid1.toString(), "UNKNOWN/UNKNOWN");
+    
+    Protocol invalid2;
+    invalid2.communication = CommunicationProtocol::UDP;
+    invalid2.message = MessageProtocol::UNKNOWN;
+    EXPECT_FALSE(invalid2.is_valid());
+    EXPECT_EQ(invalid2.toString(), "UDP/UNKNOWN");
+    
+    Protocol invalid3;
+    invalid3.communication = CommunicationProtocol::UNKNOWN;
+    invalid3.message = MessageProtocol::SPCASTV3;
+    EXPECT_FALSE(invalid3.is_valid());
+    EXPECT_EQ(invalid3.toString(), "UNKNOWN/SPCASTV3");
+}
+
+} 
+### END: tests/Protocols_test.cpp ###
+
+### FILE: tests/RazeHandler_test.cpp ###
+#include <gtest/gtest.h>
+#include "RazeHandler.h"
+#include "DropcopyHandler.h"
+#include <razeapi/messages/raze.hpp>
+#include "Types.h"
+#include "Hash.h"
+#include "RingBuffer.h"
+
+namespace pme {
+
+class RazeHandlerTest : public ::testing::Test {
+protected:
+    std::unordered_map<uint64_t, LatencyStats> dropcopy_map;
+    std::unique_ptr<RazeHandler> handler;
+    
+    void SetUp() override {
+        handler = std::make_unique<RazeHandler>(dropcopy_map);
+    }
+};
+
+TEST_F(RazeHandlerTest, ParseNewOrderMessage) {
+    LatencyStats stats;
+    stats.md_seq_num = 100;
+    stats.md_recv_time = 1750000000000000000;
+    stats.md_send_time = 1750000000000000001;
+    dropcopy_map[12345] = stats;
+    
+    RazeFormatter::NewOrder order;
+    order.packet_length = sizeof(RazeFormatter::NewOrder);
+    order.packet_type = RazeFormatter::PacketType::unsequenced_data;
+    order.message_type = RazeFormatter::MessageType::new_order;
+    order.data.order_token = 12345;
+    
+    Flow flow{"TestFlow", "Set1", Protocol{}, "", "", 0, 0, FlowDirection::INGRESS};
+    auto timestamp = std::chrono::high_resolution_clock::now();
+    
+    auto messages = handler->getMessages(&flow, reinterpret_cast<uint8_t*>(&order), 
+                                        sizeof(order), timestamp);
+    
+    ASSERT_EQ(messages.size(), 1);
+    EXPECT_EQ(messages[0].join_key, generateHash(100, 1750000000000000000, 1750000000000000001));
+}
+
+TEST_F(RazeHandlerTest, IgnoreOtherMessageTypes) {
+    LatencyStats stats;
+    stats.md_seq_num = 200;
+    dropcopy_map[99999] = stats;
+    
+    struct OtherMessage {
+        uint16_t packet_length;
+        RazeFormatter::PacketType packet_type;
+        RazeFormatter::MessageType message_type;
+        uint64_t order_token;
+    } __attribute__((packed));
+    
+    OtherMessage msg;
+    msg.packet_length = sizeof(OtherMessage);
+    msg.packet_type = RazeFormatter::PacketType::unsequenced_data;
+    msg.message_type = static_cast<RazeFormatter::MessageType>(0x01);
+    msg.order_token = 99999;
+    
+    Flow flow{"TestFlow", "Set1", Protocol{}, "", "", 0, 0, FlowDirection::INGRESS};
+    auto timestamp = std::chrono::high_resolution_clock::now();
+    
+    auto messages = handler->getMessages(&flow, reinterpret_cast<uint8_t*>(&msg), 
+                                        sizeof(msg), timestamp);
+    
+    EXPECT_TRUE(messages.empty());
+}
+
+TEST_F(RazeHandlerTest, ParseMultipleOrders) {
+    LatencyStats stats1;
+    stats1.md_seq_num = 10;
+    stats1.md_recv_time = 1750000000000000000;
+    stats1.md_send_time = 1750000000000000001;
+    dropcopy_map[1] = stats1;
+    
+    LatencyStats stats2;
+    stats2.md_seq_num = 20;
+    stats2.md_recv_time = 1750000000000000000;
+    stats2.md_send_time = 1750000000000000001;
+    dropcopy_map[2] = stats2;
+    
+    LatencyStats stats3;
+    stats3.md_seq_num = 30;
+    stats3.md_recv_time = 1750000000000000000;
+    stats3.md_send_time = 1750000000000000001;
+    dropcopy_map[3] = stats3;
+    
+    std::vector<uint8_t> buffer;
+    for (uint64_t token : {1, 2, 3}) {
+        RazeFormatter::NewOrder order;
+        order.packet_length = sizeof(RazeFormatter::NewOrder);
+        order.packet_type = RazeFormatter::PacketType::unsequenced_data;
+        order.message_type = RazeFormatter::MessageType::new_order;
+        order.data.order_token = static_cast<decltype(order.data.order_token)>(token);
+        
+        auto bytes = reinterpret_cast<uint8_t*>(&order);
+        buffer.insert(buffer.end(), bytes, bytes + sizeof(order));
+    }
+    
+    Flow flow{"TestFlow", "Set1", Protocol{}, "", "", 0, 0, FlowDirection::INGRESS};
+    auto timestamp = std::chrono::high_resolution_clock::now();
+    
+    auto messages = handler->getMessages(&flow, buffer.data(), buffer.size(), timestamp);
+    
+    ASSERT_EQ(messages.size(), 3);
+}
+
+TEST_F(RazeHandlerTest, CalculateTcpMessageLength) {
+    RingBuffer buffer(1024);
+    
+    RazeFormatter::NewOrder order;
+    order.packet_length = sizeof(RazeFormatter::NewOrder);
+    order.packet_type = RazeFormatter::PacketType::unsequenced_data;
+    order.message_type = RazeFormatter::MessageType::new_order;
+    
+    buffer.write(reinterpret_cast<uint8_t*>(&order), sizeof(order));
+    
+    auto reader = buffer.getReader();
+    EXPECT_EQ(handler->getTcpMessageLength(reader), sizeof(RazeFormatter::NewOrder));
+}
+
+TEST_F(RazeHandlerTest, MissingDropcopyEntry) {
+    
+    RazeFormatter::NewOrder order;
+    order.packet_length = sizeof(RazeFormatter::NewOrder);
+    order.packet_type = RazeFormatter::PacketType::unsequenced_data;
+    order.message_type = RazeFormatter::MessageType::new_order;
+    order.data.order_token = 54321;
+    
+    Flow flow{"TestFlow", "Set1", Protocol{}, "", "", 0, 0, FlowDirection::INGRESS};
+    auto timestamp = std::chrono::high_resolution_clock::now();
+    
+    auto messages = handler->getMessages(&flow, reinterpret_cast<uint8_t*>(&order), 
+                                        sizeof(order), timestamp);
+    
+    EXPECT_TRUE(messages.empty());
+}
+
+TEST_F(RazeHandlerTest, PartialTcpMessage) {
+    RingBuffer buffer(1024);
+    
+    uint8_t partial_header[1] = {0x10};
+    buffer.write(partial_header, 1);
+    
+    auto reader = buffer.getReader();
+    EXPECT_EQ(handler->getTcpMessageLength(reader), 0);
+    
+    buffer.consume(1);
+    RazeFormatter::NewOrder order;
+    order.packet_length = sizeof(RazeFormatter::NewOrder);
+    order.packet_type = RazeFormatter::PacketType::unsequenced_data;
+    order.message_type = RazeFormatter::MessageType::new_order;
+    
+    buffer.write(reinterpret_cast<uint8_t*>(&order), 10);
+    reader = buffer.getReader();
+    
+    auto detected_length = handler->getTcpMessageLength(reader);
+    EXPECT_EQ(detected_length, sizeof(RazeFormatter::NewOrder));
+}
+
+TEST_F(RazeHandlerTest, InvalidPacketLength) {
+    struct BadMessage {
+        uint16_t packet_length;
+        RazeFormatter::PacketType packet_type;
+        RazeFormatter::MessageType message_type;
+        uint64_t order_token;
+    } __attribute__((packed));
+    
+    BadMessage msg;
+    msg.packet_length = 0;
+    msg.packet_type = RazeFormatter::PacketType::unsequenced_data;
+    msg.message_type = RazeFormatter::MessageType::new_order;
+    msg.order_token = 12345;
+    
+    Flow flow{"TestFlow", "Set1", Protocol{}, "", "", 0, 0, FlowDirection::INGRESS};
+    auto timestamp = std::chrono::high_resolution_clock::now();
+    
+    auto messages = handler->getMessages(&flow, reinterpret_cast<uint8_t*>(&msg), 
+                                        sizeof(msg), timestamp);
+    
+    EXPECT_TRUE(messages.empty());
+}
+
+} 
+### END: tests/RazeHandler_test.cpp ###
+
+### FILE: tests/RingBuffer_test.cpp ###
 #include <gtest/gtest.h>
 #include "RingBuffer.h"
 #include <cstring>
@@ -254,3 +1266,247 @@ TEST_F(RingBufferTest, RepeatedWrapAround) {
 }
 
 } 
+### END: tests/RingBuffer_test.cpp ###
+
+### FILE: tests/SpcastV3Handler_test.cpp ###
+#include <gtest/gtest.h>
+#include "SpcastV3Handler.h"
+#include <md_api/proto/spcast_v3.h>
+#include "Types.h"
+#include "Hash.h"
+#include "Config.h"
+
+namespace pme {
+
+class SpcastV3HandlerTest : public ::testing::Test {
+protected:
+    AppConfig config;
+    std::unique_ptr<SpcastV3Handler> handler;
+    
+    void SetUp() override {
+        config.oldest_spcast_date = parseDateToHighResolutionClock("01/01/2020");
+        handler = std::make_unique<SpcastV3Handler>(config);
+    }
+};
+
+TEST_F(SpcastV3HandlerTest, ParseSingleMessage) {
+    const uint16_t msg_size = sizeof(spcast::SpcastVersion3Traits::MessageHeader) + 8;
+    std::vector<uint8_t> packet(sizeof(spcast::SpcastVersion3Traits::PacketHeader) + msg_size);
+    
+    auto* pktHdr = reinterpret_cast<spcast::SpcastVersion3Traits::PacketHeader*>(packet.data());
+    pktHdr->version = spcast::SpcastVersion3Traits::Version;
+    pktHdr->recv_timestamp_ns = 1750000000000000000;
+    pktHdr->send_timestamp_ns = 1750000000000000001;
+    
+    auto* msgHdr = reinterpret_cast<spcast::SpcastVersion3Traits::MessageHeader*>(
+        packet.data() + sizeof(spcast::SpcastVersion3Traits::PacketHeader));
+    msgHdr->length = msg_size;
+    msgHdr->symbol_offset = sizeof(spcast::SpcastVersion3Traits::MessageHeader);
+    msgHdr->symbol_size = 8;
+    msgHdr->seq_num = 12345;
+    msgHdr->exch_timestamp_ns = 1750000000000000000;
+    
+    Flow flow{"TestFlow", "Set1", Protocol{}, "", "", 0, 0, FlowDirection::INGRESS};
+    auto timestamp = std::chrono::high_resolution_clock::now();
+    
+    auto messages = handler->getMessages(&flow, packet.data(), packet.size(), timestamp);
+    
+    ASSERT_EQ(messages.size(), 1);
+    EXPECT_EQ(messages[0].join_key, generateHash(12345, 1750000000000000000, 1750000000000000001));
+}
+
+TEST_F(SpcastV3HandlerTest, SkipDuplicateSequence) {
+    const uint16_t msg_size = sizeof(spcast::SpcastVersion3Traits::MessageHeader) + 8;
+    std::vector<uint8_t> packet(sizeof(spcast::SpcastVersion3Traits::PacketHeader) + msg_size);
+    
+    auto* pktHdr = reinterpret_cast<spcast::SpcastVersion3Traits::PacketHeader*>(packet.data());
+    pktHdr->version = spcast::SpcastVersion3Traits::Version;
+    pktHdr->recv_timestamp_ns = 1750000000000000000;
+    pktHdr->send_timestamp_ns = 1750000000000000001;
+    
+    auto* msgHdr = reinterpret_cast<spcast::SpcastVersion3Traits::MessageHeader*>(
+        packet.data() + sizeof(spcast::SpcastVersion3Traits::PacketHeader));
+    msgHdr->length = msg_size;
+    msgHdr->symbol_offset = sizeof(spcast::SpcastVersion3Traits::MessageHeader);
+    msgHdr->symbol_size = 8;
+    msgHdr->seq_num = 99999;
+    msgHdr->exch_timestamp_ns = 1750000000000000000;
+    
+    Flow flow{"TestFlow", "Set1", Protocol{}, "", "", 0, 0, FlowDirection::INGRESS};
+    auto timestamp = std::chrono::high_resolution_clock::now();
+    
+    auto messages1 = handler->getMessages(&flow, packet.data(), packet.size(), timestamp);
+    ASSERT_EQ(messages1.size(), 1);
+    
+    auto messages2 = handler->getMessages(&flow, packet.data(), packet.size(), timestamp);
+    EXPECT_EQ(messages2.size(), 0);
+}
+
+TEST_F(SpcastV3HandlerTest, FlowsAreIndependent) {
+    AppConfig fresh_config;
+    fresh_config.oldest_spcast_date = parseDateToHighResolutionClock("01/01/2020");
+    auto fresh_handler = std::make_unique<SpcastV3Handler>(fresh_config);
+    
+    const uint16_t msg_size = sizeof(spcast::SpcastVersion3Traits::MessageHeader) + 8;
+    std::vector<uint8_t> packet(sizeof(spcast::SpcastVersion3Traits::PacketHeader) + msg_size);
+    
+    auto* pktHdr = reinterpret_cast<spcast::SpcastVersion3Traits::PacketHeader*>(packet.data());
+    pktHdr->version = spcast::SpcastVersion3Traits::Version;
+    pktHdr->recv_timestamp_ns = 1750000000000000000;
+    pktHdr->send_timestamp_ns = 1750000000000000001;
+    
+    auto* msgHdr = reinterpret_cast<spcast::SpcastVersion3Traits::MessageHeader*>(
+        packet.data() + sizeof(spcast::SpcastVersion3Traits::PacketHeader));
+    msgHdr->length = msg_size;
+    msgHdr->symbol_offset = sizeof(spcast::SpcastVersion3Traits::MessageHeader);
+    msgHdr->symbol_size = 8;
+    msgHdr->seq_num = 5000;
+    msgHdr->exch_timestamp_ns = 1750000000000000000;
+    
+    Flow flow1{"Set1", "Flow1", Protocol{}, "", "", 0, 0, FlowDirection::INGRESS};
+    Flow flow2{"Set1", "Flow2", Protocol{}, "", "", 0, 0, FlowDirection::INGRESS};
+    auto timestamp = std::chrono::high_resolution_clock::now();
+    
+    auto messages1 = fresh_handler->getMessages(&flow1, packet.data(), packet.size(), timestamp);
+    auto messages2 = fresh_handler->getMessages(&flow2, packet.data(), packet.size(), timestamp);
+    
+    EXPECT_EQ(messages1.size(), 1);
+    EXPECT_EQ(messages2.size(), 1);
+}
+
+TEST_F(SpcastV3HandlerTest, RejectWrongVersion) {
+    std::vector<uint8_t> packet(sizeof(spcast::SpcastVersion3Traits::PacketHeader));
+    auto* pktHdr = reinterpret_cast<spcast::SpcastVersion3Traits::PacketHeader*>(packet.data());
+    pktHdr->version = static_cast<md_api::proto::spcast_v3::version_enum>(1);
+    
+    Flow flow{"TestFlow", "Set1", Protocol{}, "", "", 0, 0, FlowDirection::INGRESS};
+    auto timestamp = std::chrono::high_resolution_clock::now();
+    
+    auto messages = handler->getMessages(&flow, packet.data(), packet.size(), timestamp);
+    EXPECT_TRUE(messages.empty());
+}
+
+TEST_F(SpcastV3HandlerTest, RejectOldTimestamp) {
+    const uint16_t msg_size = sizeof(spcast::SpcastVersion3Traits::MessageHeader) + 8;
+    std::vector<uint8_t> packet(sizeof(spcast::SpcastVersion3Traits::PacketHeader) + msg_size);
+    
+    auto* pktHdr = reinterpret_cast<spcast::SpcastVersion3Traits::PacketHeader*>(packet.data());
+    pktHdr->version = spcast::SpcastVersion3Traits::Version;
+    pktHdr->recv_timestamp_ns = 1000000000000000000;
+    pktHdr->send_timestamp_ns = 1000000000000000000;
+    
+    auto* msgHdr = reinterpret_cast<spcast::SpcastVersion3Traits::MessageHeader*>(
+        packet.data() + sizeof(spcast::SpcastVersion3Traits::PacketHeader));
+    msgHdr->length = msg_size;
+    msgHdr->seq_num = 7777;
+    
+    Flow flow{"TestFlow", "Set1", Protocol{}, "", "", 0, 0, FlowDirection::INGRESS};
+    auto timestamp = std::chrono::high_resolution_clock::now();
+    
+    auto messages = handler->getMessages(&flow, packet.data(), packet.size(), timestamp);
+    EXPECT_TRUE(messages.empty());
+}
+
+TEST_F(SpcastV3HandlerTest, BufferTooSmall) {
+    std::vector<uint8_t> packet(10);
+    
+    Flow flow{"TestFlow", "Set1", Protocol{}, "", "", 0, 0, FlowDirection::INGRESS};
+    auto timestamp = std::chrono::high_resolution_clock::now();
+    
+    auto messages = handler->getMessages(&flow, packet.data(), packet.size(), timestamp);
+    EXPECT_TRUE(messages.empty());
+}
+
+TEST_F(SpcastV3HandlerTest, InvalidMessageLength) {
+    const uint16_t msg_size = sizeof(spcast::SpcastVersion3Traits::MessageHeader) + 8;
+    std::vector<uint8_t> packet(sizeof(spcast::SpcastVersion3Traits::PacketHeader) + msg_size);
+    
+    auto* pktHdr = reinterpret_cast<spcast::SpcastVersion3Traits::PacketHeader*>(packet.data());
+    pktHdr->version = spcast::SpcastVersion3Traits::Version;
+    pktHdr->recv_timestamp_ns = 1750000000000000000;
+    pktHdr->send_timestamp_ns = 1750000000000000001;
+    
+    auto* msgHdr = reinterpret_cast<spcast::SpcastVersion3Traits::MessageHeader*>(
+        packet.data() + sizeof(spcast::SpcastVersion3Traits::PacketHeader));
+    msgHdr->length = 0;
+    msgHdr->seq_num = 8888;
+    
+    Flow flow{"TestFlow", "Set1", Protocol{}, "", "", 0, 0, FlowDirection::INGRESS};
+    auto timestamp = std::chrono::high_resolution_clock::now();
+    
+    auto messages = handler->getMessages(&flow, packet.data(), packet.size(), timestamp);
+    EXPECT_TRUE(messages.empty());
+}
+
+}
+
+### END: tests/SpcastV3Handler_test.cpp ###
+
+### FILE: tests/TestHelpers.h ###
+#pragma once
+
+#include <chrono>
+#include <cstring>
+#include <vector>
+
+#include <gtest/gtest.h>
+
+namespace pme::test {
+
+class TestTimer {
+    using Clock = std::chrono::high_resolution_clock;
+    Clock::time_point start_;
+    
+public:
+    TestTimer() : start_(Clock::now()) {}
+    
+    double elapsedMs() const {
+        auto elapsed = Clock::now() - start_;
+        return std::chrono::duration<double, std::milli>(elapsed).count();
+    }
+    
+    void reset() { start_ = Clock::now(); }
+};
+
+inline std::vector<uint8_t> makeTestData(size_t size, uint8_t fill_value = 0) {
+    return std::vector<uint8_t>(size, fill_value);
+}
+
+inline std::vector<uint8_t> makePatternData(size_t size) {
+    std::vector<uint8_t> data(size);
+    for (size_t i = 0; i < size; ++i) {
+        data[i] = static_cast<uint8_t>(i & 0xFF);
+    }
+    return data;
+}
+
+inline auto testTimestamp() {
+    return std::chrono::high_resolution_clock::now();
+}
+
+inline std::vector<uint8_t> stringToBytes(const std::string& str) {
+    return std::vector<uint8_t>(str.begin(), str.end());
+}
+
+inline bool compareMemory(const void* ptr1, const void* ptr2, size_t size) {
+    return std::memcmp(ptr1, ptr2, size) == 0;
+}
+
+template<typename Cleanup>
+class ScopedCleanup {
+    Cleanup cleanup_;
+public:
+    explicit ScopedCleanup(Cleanup cleanup) : cleanup_(std::move(cleanup)) {}
+    ~ScopedCleanup() { cleanup_(); }
+    
+    ScopedCleanup(const ScopedCleanup&) = delete;
+    ScopedCleanup& operator=(const ScopedCleanup&) = delete;
+};
+
+template<typename Cleanup>
+auto makeCleanup(Cleanup cleanup) {
+    return ScopedCleanup<Cleanup>(std::move(cleanup));
+}
+
+} 
+### END: tests/TestHelpers.h ###
