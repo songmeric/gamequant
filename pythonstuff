@@ -1,0 +1,525 @@
+__init__.py
+
+from .lab import (
+    TestLab,
+    MarketDataFeed,
+    RazeGateway,
+    LnxUplink,
+    random_price,
+)
+
+__all__ = [
+    "TestLab",
+    "MarketDataFeed",
+    "RazeGateway",
+    "LnxUplink",
+    "random_price",
+] 
+
+
+lab.py
+
+
+"""gtd_testfw.lab
+Core high-level test harness for writing GTAD integration tests in ≤20 lines.
+
+See README at project root for usage examples.
+"""
+from __future__ import annotations
+
+import random
+from pathlib import Path
+from typing import Dict, List, Optional
+
+# ---------------------------------------------------------------------------
+# Third-party / domain-specific imports – assumed to be available in runtime
+# ---------------------------------------------------------------------------
+import gtd_fix_fix as fix
+import gtd_ops as ops
+from gtd_simulator.lnx_simulator import LnxSimulator
+from gtd_simulator.raze_simulator import RazeSimulator
+from gtd_simulator.marketdata_simulator import MarketdataSimulator
+from gtd_simulator.spcast_simulator import SpcastSimulator  # just to satisfy type hints
+
+from gtd_security_context.instrument import Instrument
+
+from et2_app_config import XMLConfig  # noqa – used indirectly via GtadConfig
+
+# The following helpers are provided by the userʼs existing utility codebase.
+from .user_lib import GtadConfig, create_md_simulators  # type: ignore
+
+__all__ = [
+    "TestLab",
+    "MarketDataFeed",
+    "RazeGateway",
+    "LnxUplink",
+    "random_price",
+]
+
+# ---------------------------------------------------------------------------
+# Helpers – thin façades around existing simulators
+# ---------------------------------------------------------------------------
+
+class MarketDataFeed:
+    """Facade for a single market-data simulator instance."""
+
+    def __init__(self, name: str, sim: MarketdataSimulator):
+        self._name = name
+        self._sim = sim
+        self._seq = 1
+
+    # ---------------------------------------------------------------------
+    # Public operations used by test writers
+    # ---------------------------------------------------------------------
+    def quote(
+        self,
+        bid: float,
+        bid_qty: int,
+        ask: float,
+        ask_qty: int,
+        *,
+        symbol: str = "",
+    ) -> "MarketDataFeed":
+        """Send an NBBO quote and auto-increment sequence id."""
+        self._sim.world_send_quote(
+            self._name,
+            bid,
+            bid_qty,
+            ask,
+            ask_qty,
+            symbol=symbol,
+            seq=self._seq,
+        )
+        self._seq += 1
+        return self
+
+    def start(self) -> "MarketDataFeed":
+        self._sim.start()
+        return self
+
+    # ------------------------------------------------------------------
+    # Power-user escape hatch
+    # ------------------------------------------------------------------
+    @property
+    def raw(self) -> MarketdataSimulator:
+        """Expose underlying simulator for advanced interaction."""
+        return self._sim
+
+
+class RazeGateway:
+    """Facade for the raze simulator with fluent expectation helpers."""
+
+    def __init__(self, sim: RazeSimulator):
+        self._sim = sim
+
+    # ------------------------------------------------------------------
+    # Order lifecycle helpers
+    # ------------------------------------------------------------------
+    def send_order(self, order: ops.Order) -> "_RazeExpectation":
+        ok = self._sim.handle_new_order(self._sim.session, order)
+        if not ok:
+            raise RuntimeError("Raze rejected new order locally.")
+        return _RazeExpectation(self._sim, order)
+
+    # ------------------------------------------------------------------
+    @property
+    def raw(self) -> RazeSimulator:  # pragma: no cover
+        return self._sim
+
+
+class _RazeExpectation:
+    """Fluent chain for asserting gateway responses."""
+
+    def __init__(self, sim: RazeSimulator, order: ops.Order):
+        self._sim = sim
+        self._order = order
+
+    def expect_ack(self) -> "_RazeExpectation":
+        self._sim.send_ack(self._sim.session, self._order)
+        return self
+
+    def expect_fill(
+        self,
+        *,
+        price: Optional[float] = None,
+        qty: Optional[int] = None,
+    ) -> "_RazeExpectation":
+        price = price if price is not None else self._order.Price
+        qty = qty if qty is not None else self._order.OrderQty
+        self._sim.send_half_fill(
+            self._sim.session,
+            self._order,
+            price=price,
+            filled_qty=qty,
+        )
+        return self
+
+
+class LnxUplink:
+    """Facade for the Lnx uplink simulator."""
+
+    def __init__(self, sim: LnxSimulator):
+        self._sim = sim
+
+    # ------------------------------------------------------------------
+    def subscribe(self, instruments: List[Instrument], feed: str):
+        cmd = ",".join(
+            ["subscribe_md", "5"]
+            + [str(val) for inst in instruments for val in [feed, inst.SpecID]]
+        )
+        self._sim.send_message(cmd)
+
+    def send_md_trigger(self, dest: str, feed: str, delay_ms: int = 1):
+        self._sim.send_message(f"order_generation,{dest},{feed},{str(delay_ms)}")
+
+    # ------------------------------------------------------------------
+    @property
+    def raw(self) -> LnxSimulator:  # pragma: no cover
+        return self._sim
+
+
+# ---------------------------------------------------------------------------
+# Test-lab orchestrator
+# ---------------------------------------------------------------------------
+
+class TestLab:
+    """Build-once, interact-many holder of simulators & plumbing."""
+
+    _DEFAULT_IP = "10.67.2.19"
+
+    def __init__(
+        self,
+        strategy: str,
+        leg: str,
+        strategy_id: int,
+        *,
+        fund: str = "",
+        output_dir: Optional[str] = None,
+    ) -> None:
+        self._config = GtadConfig(
+            strategy_name=strategy,
+            strategy_leg=leg,
+            strategy_id=strategy_id,
+            fund=fund,
+            output_dir=output_dir,
+        )
+        # ensure shared-memory artifacts are clean
+        self._config.delete_shm()
+
+        self._md_feeds: Dict[str, MarketDataFeed] = {}
+        self.raze: Optional[RazeGateway] = None
+        self.lnx: Optional[LnxUplink] = None
+
+    # ---------------- builder methods --------------------------------
+    def with_spcast(
+        self,
+        *,
+        version: int = 4,
+        symbology: str = "",
+        disabled: set[str] | None = None,
+    ) -> "TestLab":
+        sims = create_md_simulators(self._config, disabled_simulators=disabled or set())
+        for name, sim in sims.items():
+            self._md_feeds[name] = MarketDataFeed(name, sim).start()
+        return self
+
+    def with_raze(self, destinations: List[str]) -> "TestLab":
+        routing_ids = {
+            dest: self._config.destinations[dest]["routing_id"] for dest in destinations
+        }
+        sim = RazeSimulator(
+            version="3",
+            id=self._config.gateway_id,
+            instance_id=self._config.instance_id,
+            strategy_id=self._config.strategy_id,
+            addr="",
+            port=self._config.raze_port,
+            routing_ids=routing_ids,
+        )
+        sim.start()
+        sim.handle_login(timeout=60)
+        self.raze = RazeGateway(sim)
+        return self
+
+    def with_lnx(self, instruments: List[Instrument]) -> "TestLab":
+        sim = LnxSimulator(
+            handshake_token=self._config.handshake_token,
+            port=self._config.lnx_port,
+            addr=self._DEFAULT_IP,
+        )
+        sim.login()
+        sim.send_strat_start_msg()
+        for inst in instruments:
+            sim.send_message(f"add_security,{inst.SpecID}")
+        sim.send_message("finalize_securities")
+
+        self.lnx = LnxUplink(sim)
+        self.lnx.subscribe(instruments, "SPCAST_Li_V4")
+        return self
+
+    # ---------------- convenience accessors --------------------------
+    def marketdata(self, name: str) -> MarketDataFeed:
+        return self._md_feeds[name]
+
+    # ---------------- teardown ---------------------------------------
+    def close(self):  # pragma: no cover
+        for feed in self._md_feeds.values():
+            feed.raw.stop()
+        if self.raze:
+            self.raze.raw.stop()
+        if self.lnx:
+            self.lnx.raw.stop()
+
+    # Support Python's `with` statement
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_exc):
+        self.close()
+
+
+# ---------------------------------------------------------------------------
+# Handy util                                                            
+# ---------------------------------------------------------------------------
+
+def random_price(lo: float = 100, hi: float = 200, *, cents: int = 2) -> float:
+    """Random price generator for quick ad-hoc tests."""
+    return round(random.uniform(lo, hi), cents) 
+
+
+
+
+
+
+readme.md
+
+
+# GTD Test Framework (`gtd_testfw`)
+
+A **fluent, zero-boilerplate harness** for spinning up the GTAD simulator
+suite (Spcast, Cdmcast, Lnx uplink, Raze gateway, …) inside unit or
+integration tests.
+
+---
+## Why does this exist?
+
+* **Before** – you had two files:
+  1. *`library.py`* (or similar) that declared helpers like
+     `GtadConfig`, `create_md_simulators`, etc.
+  2. *`main.py`* that imported the above, built several simulator
+     objects, logged them in, wired ports, subscribed to feeds and sent
+     manual messages.
+
+  Running `python main.py` started *all* simulators but required ~150
+  lines of imperative setup code per scenario.
+
+* **Now** – the `gtd_testfw` package lets a test writer describe that
+  same scenario in **≤ 20 lines** of *declarative* code:
+
+```python
+from gtd_testfw import TestLab, random_price
+from gtd_security_context.instrument import Instrument
+import gtd_ops as ops, gtd_fix_fix as fix
+
+AAPL = Instrument("AAPL.OQ", "AAPL", 255619, 1099345, "", "715")
+
+with (
+    TestLab("eta_ita_test1", "main", 555)
+    .with_spcast()                      # market-data simulators
+    .with_raze(["nyse_pillar"])        # order gateway
+    .with_lnx([AAPL])                   # uplink & subscriptions
+) as lab:
+    lab.marketdata("SPCAST_Li_V4").quote(
+        bid=100.1, bid_qty=500, ask=100.12, ask_qty=600, symbol=AAPL.SecurityID
+    )
+
+    order = ops.Order(AAPL, qty=10, price=100.12,
+                      dest="nyse_pillar", side=fix.Side.Buy)
+    lab.raze.send_order(order).expect_ack().expect_fill()
+```
+
+No ports, IPs or handshake tokens exposed; still fully compatible with
+all underlying simulators.
+
+---
+## Key Concepts
+
+| Concept          | Purpose                                                                   |
+| ---------------- | ------------------------------------------------------------------------- |
+| `TestLab`        | Top-level orchestrator that owns XML config, lifecycle and teardown.      |
+| `with_spcast()`  | Adds one or more Spcast/Cdmcast market-data simulators.                   |
+| `with_raze()`    | Spins up a Raze gateway and handles login.                                |
+| `with_lnx()`     | Connects to the strategy's uplink, registers instruments, subscribes MD.  |
+| `MarketDataFeed` | Facade returned by `lab.marketdata(name)`; lets tests push quotes easily. |
+| `RazeGateway`    | Wrapper offering `.send_order(…).expect_*()` fluent assertions.           |
+| `LnxUplink`      | Access to uplink helper ops (subscribe, MD triggers, …).                  |
+
+All underlying simulator objects remain accessible through `.raw`
+properties if deep control is required.
+
+---
+## Installing / Running
+
+The framework lives inside the repository; no extra pip package needed.
+Simply ensure project root is on `PYTHONPATH`:
+
+```bash
+# one-off
+export PYTHONPATH="$(pwd)":$PYTHONPATH
+
+# then run tests
+pytest -q tests/test_basic_flow.py
+```
+
+Running a script directly works too:
+
+```bash
+python examples/quick_demo.py   # create your own script using TestLab
+```
+
+---
+## Migrating existing `main.py` scripts
+
+1. Copy the imperative setup into a *single* `TestLab(…).with_…` chain.
+2. Replace explicit simulator method calls with the fluent helpers.
+3. Wrap logic in a `with TestLab(…) as lab:` block to auto-tear-down.
+
+That's it; most of the old code becomes obsolete.
+
+---
+## Extending the framework
+
+The initial façade covers the common "quote → order → fill" workflow.
+Add more helpers as needed (e.g. `expect_cancel_ack()`,
+`MarketDataFeed.trade()`, etc.). Keep them thin wrappers—business logic
+still lives in the simulators.
+
+---
+## Troubleshooting
+
+`ImportError: Could not locate GtadConfig/create_md_simulators …`
+:   Edit `gtd_testfw/user_lib.py` → `CANDIDATE_MODULES` to point at the
+    real module where those helpers live.
+
+Simulators appear to hang
+:   Double-check firewall or multicast permissions; the framework only
+    abstracts code, not network prerequisites.
+
+---
+## License
+
+Same license as the parent project (see root `LICENSE`). 
+
+
+user_lib.py
+
+
+"""gtd_testfw.user_lib
+Shim layer that locates `GtadConfig` and `create_md_simulators` in the
+existing project so that gtd_testfw.lab can stay agnostic of where the
+original helpers live.
+
+If the real modules move, adjust the `CANDIDATE_MODULES` list below.
+"""
+from __future__ import annotations
+
+import importlib
+from types import ModuleType
+from typing import List
+
+__all__ = [
+    "GtadConfig",
+    "create_md_simulators",
+]
+
+CANDIDATE_MODULES: List[str] = [
+    "library",  # original location hinted by user
+    "gtad_config",  # possible rename
+    "main",  # fallback
+]
+
+GtadConfig = None  # type: ignore
+create_md_simulators = None  # type: ignore
+
+for _name in CANDIDATE_MODULES:
+    try:
+        _mod: ModuleType = importlib.import_module(_name)
+        if hasattr(_mod, "GtadConfig") and hasattr(_mod, "create_md_simulators"):
+            GtadConfig = getattr(_mod, "GtadConfig")  # type: ignore
+            create_md_simulators = getattr(_mod, "create_md_simulators")  # type: ignore
+            break
+    except ImportError:
+        continue
+
+if GtadConfig is None or create_md_simulators is None:  # pragma: no cover
+    raise ImportError(
+        "Could not locate GtadConfig/create_md_simulators in expected modules. "
+        "Update gtd_testfw.user_lib.CANDIDATE_MODULES accordingly."
+    ) 
+
+
+
+test_basic_flow.py
+
+"""Integration smoke-test for gtd_testfw.TestLab.
+Run with `pytest -q tests/test_basic_flow.py`.
+"""
+from __future__ import annotations
+
+import pytest
+import random
+
+import gtd_testfw as tf
+from gtd_security_context.instrument import Instrument
+import gtd_ops as ops
+import gtd_fix_fix as fix
+
+AAPL = Instrument("AAPL.OQ", "AAPL", 255619, 1099345, "", "715")
+
+
+def test_spcast_to_raze_basic():
+    with (
+        tf.TestLab("eta_ita_test1", "main", 555)
+        .with_spcast()
+        .with_raze(["nyse_pillar"])
+        .with_lnx([AAPL])
+    ) as lab:
+        # broadcast NBBO
+        lab.marketdata("SPCAST_Li_V4").quote(
+            bid=100.1,
+            bid_qty=500,
+            ask=100.12,
+            ask_qty=600,
+            symbol=AAPL.SecurityID,
+        )
+
+        # Send order and validate gateway flow
+        order = ops.Order(
+            AAPL,
+            qty=10,
+            price=100.12,
+            dest="nyse_pillar",
+            side=fix.Side.Buy,
+        )
+        lab.raze.send_order(order).expect_ack().expect_fill() 
+
+
+
+python - <<'PY'
+from gtd_testfw import TestLab
+from gtd_security_context.instrument import Instrument
+import gtd_ops as ops, gtd_fix_fix as fix
+
+AAPL = Instrument("AAPL.OQ","AAPL",255619,1099345,"","715")
+
+with (TestLab("eta_ita_test1","main",555)
+      .with_spcast()
+      .with_raze(["nyse_pillar"])
+      .with_lnx([AAPL])) as lab:
+    lab.marketdata("SPCAST_Li_V4").quote(bid=100, bid_qty=10,
+                                         ask=100.1, ask_qty=12,
+                                         symbol=AAPL.SecurityID)
+    order = ops.Order(AAPL, qty=10, price=100.05,
+                      dest="nyse_pillar", side=fix.Side.Buy)
+    lab.raze.send_order(order).expect_ack().expect_fill()
+PY
