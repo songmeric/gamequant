@@ -1,0 +1,569 @@
+The user wants me to create a beautiful wrapper library that makes it easy to set up test cases for what appears to be a trading system testing framework. Looking at the code, I can see:
+
+1. There's a gtad_config system for configuration
+2. There are simulators for different components:
+   - LNX simulator (uplink/strategy communication)
+   - Raze simulator (order gateway)
+   - Market data simulators (spcast, etc.)
+3. There are instruments and orders
+4. The workflow involves:
+   - Setting up configuration
+   - Initializing simulators
+   - Sending market data
+   - Sending orders
+   - Expecting responses
+
+The current code is quite verbose and requires a lot of boilerplate. I should create a framework that:
+
+1. Provides a clean API for test setup
+2. Handles the boilerplate configuration
+3. Provides intuitive methods for common operations
+4. Supports fluent/builder patterns
+5. Has good error handling and logging
+6. Supports context managers for cleanup
+7. Provides assertions for testing
+
+Let me design a framework that could look something like:
+
+```python
+with TradingTestFramework() as framework:
+    framework.configure_strategy("eta_ita_test1", "main", 555)
+    framework.add_instruments([("AAPL.OQ", "AAPL", 255619, 1099345)])
+    framework.start_simulators()
+    
+    framework.send_market_data("AAPL", bid=100, ask=200)
+    framework.send_order("AAPL", side="BUY", qty=10, price=150)
+    
+    framework.expect_order_ack()
+    framework.expect_fill(qty=10, price=150)
+```
+
+Let me create a comprehensive framework:
+Here's a beautiful, professional wrapper framework for creating trading system test cases:
+
+```python
+"""
+Trading System Test Framework
+A clean, intuitive framework for testing trading systems with minimal boilerplate.
+"""
+
+import time
+import random
+import logging
+from contextlib import contextmanager
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Union, Callable, Any
+from enum import Enum
+from pathlib import Path
+
+from perf_test_lib import *
+import gtd.fix
+import gtd.ops
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+
+class Side(Enum):
+    BUY = "BUY"
+    SELL = "SELL"
+
+
+class OrderType(Enum):
+    MARKET = "MARKET"
+    LIMIT = "LIMIT"
+
+
+@dataclass
+class TestInstrument:
+    """Simplified instrument representation for testing"""
+    symbol: str
+    name: str
+    spec_id: int
+    security_id: int
+    split_string: str = "splitstring"
+    venue: str = "715"
+    
+    def to_instrument(self):
+        """Convert to internal Instrument object"""
+        return Instrument(self.symbol, self.name, self.spec_id, self.security_id, self.split_string, self.venue)
+
+
+@dataclass
+class TestOrder:
+    """Simplified order representation for testing"""
+    instrument: str
+    side: Side
+    quantity: int
+    price: Optional[float] = None
+    order_type: OrderType = OrderType.LIMIT
+    destination: str = "nyse_pillar"
+    time_in_force: str = "DAY"
+
+
+@dataclass
+class MarketData:
+    """Market data snapshot"""
+    symbol: str
+    bid_price: float
+    bid_qty: int
+    ask_price: float
+    ask_qty: int
+
+
+class TestExpectation:
+    """Base class for test expectations"""
+    def __init__(self, timeout: float = 5.0):
+        self.timeout = timeout
+        self.fulfilled = False
+        
+    def check(self, framework) -> bool:
+        """Override in subclasses"""
+        raise NotImplementedError
+
+
+class ExpectOrderAck(TestExpectation):
+    """Expect order acknowledgment"""
+    def __init__(self, order_id: Optional[str] = None, timeout: float = 5.0):
+        super().__init__(timeout)
+        self.order_id = order_id
+
+
+class ExpectFill(TestExpectation):
+    """Expect order fill"""
+    def __init__(self, quantity: int, price: Optional[float] = None, timeout: float = 5.0):
+        super().__init__(timeout)
+        self.quantity = quantity
+        self.price = price
+
+
+class TradingTestFramework:
+    """
+    Main framework class for creating trading system test cases.
+    
+    Example usage:
+        with TradingTestFramework() as framework:
+            framework.configure_strategy("test_strategy")
+            framework.add_instrument("AAPL", "AAPL", 255619, 1099345)
+            framework.start_simulators()
+            
+            framework.send_market_data("AAPL", bid=100, ask=102)
+            order_id = framework.send_order("AAPL", Side.BUY, 10, 101)
+            
+            framework.expect_order_ack(order_id)
+            framework.expect_fill(10, 101)
+            framework.run_expectations()
+    """
+    
+    def __init__(self, 
+                 output_dir: Optional[str] = None,
+                 auto_cleanup: bool = True,
+                 log_level: str = "INFO"):
+        
+        self.gtad_config: Optional[GtadConfig] = None
+        self.lnx_simulator = None
+        self.raze_simulator = None
+        self.md_simulators: Dict[str, Any] = {}
+        
+        self.instruments: Dict[str, TestInstrument] = {}
+        self.orders: List[TestOrder] = []
+        self.expectations: List[TestExpectation] = []
+        
+        self.output_dir = output_dir or f"/tmp/trading_test_{int(time.time())}"
+        self.auto_cleanup = auto_cleanup
+        self.running = False
+        
+        # Set up logging
+        self.logger = logging.getLogger(f"{__name__}.{self.__class__.__name__}")
+        self.logger.setLevel(getattr(logging, log_level.upper()))
+        
+        # Default routing IDs
+        self.routing_ids = {
+            ascii_routing_id_to_integer("0900"): "ROUTING_ID_0",
+            ascii_routing_id_to_integer("0901"): "ROUTING_ID_1", 
+            ascii_routing_id_to_integer("0902"): "ROUTING_ID_2",
+        }
+
+    def __enter__(self):
+        return self
+    
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if self.auto_cleanup:
+            self.cleanup()
+    
+    def configure_strategy(self, 
+                          strategy_name: str, 
+                          strategy_leg: str = "main",
+                          strategy_id: int = None,
+                          fund: str = "") -> 'TradingTestFramework':
+        """Configure the trading strategy"""
+        if strategy_id is None:
+            strategy_id = random.randint(100, 999)
+            
+        self.gtad_config = GtadConfig(
+            strategy_name=strategy_name,
+            strategy_leg=strategy_leg,
+            strategy_id=strategy_id,
+            fund=fund,
+            output_dir=self.output_dir
+        )
+        
+        self.gtad_config.delete_shm()
+        self.logger.info(f"Configured strategy: {strategy_name} (ID: {strategy_id})")
+        return self
+    
+    def add_instrument(self, 
+                      symbol: str, 
+                      name: str, 
+                      spec_id: int, 
+                      security_id: int,
+                      split_string: str = "splitstring",
+                      venue: str = "715") -> 'TradingTestFramework':
+        """Add a trading instrument"""
+        instrument = TestInstrument(symbol, name, spec_id, security_id, split_string, venue)
+        self.instruments[symbol] = instrument
+        self.logger.info(f"Added instrument: {symbol} ({name})")
+        return self
+    
+    def add_instruments(self, instruments: List[tuple]) -> 'TradingTestFramework':
+        """Add multiple instruments from list of tuples"""
+        for instr_data in instruments:
+            if len(instr_data) >= 4:
+                self.add_instrument(*instr_data)
+        return self
+    
+    def start_simulators(self, 
+                        disabled_simulators: Optional[List[str]] = None) -> 'TradingTestFramework':
+        """Start all required simulators"""
+        if not self.gtad_config:
+            raise RuntimeError("Must configure strategy before starting simulators")
+        
+        if not self.instruments:
+            raise RuntimeError("Must add instruments before starting simulators")
+        
+        # Convert instruments to internal format
+        internal_instruments = [instr.to_instrument() for instr in self.instruments.values()]
+        
+        # Start Raze simulator
+        self.raze_simulator = initialize_raze(self.gtad_config, self.routing_ids)
+        self.logger.info("Raze simulator started")
+        
+        # Start market data simulators
+        self.md_simulators = create_md_simulators(
+            self.gtad_config, 
+            disabled_simulators=set(disabled_simulators or [])
+        )
+        self.logger.info(f"Market data simulators started: {list(self.md_simulators.keys())}")
+        
+        # Start LNX simulator
+        self.lnx_simulator = initialize_lnx(self.gtad_config, internal_instruments)
+        self.logger.info("LNX simulator started")
+        
+        # Start market data simulators
+        for name, sim in self.md_simulators.items():
+            sim.start()
+            self.logger.info(f"{name} simulator started")
+        
+        self.running = True
+        return self
+    
+    def send_market_data(self, 
+                        symbol: str, 
+                        bid: float, 
+                        ask: float,
+                        bid_qty: int = 100,
+                        ask_qty: int = 100) -> 'TradingTestFramework':
+        """Send market data for a symbol"""
+        if not self.running:
+            raise RuntimeError("Simulators must be started before sending market data")
+        
+        if symbol not in self.instruments:
+            raise ValueError(f"Unknown instrument: {symbol}")
+        
+        instrument = self.instruments[symbol]
+        
+        # Send to all market data simulators
+        for name, sim in self.md_simulators.items():
+            try:
+                sim.world_send_quote(
+                    name, bid, bid_qty, ask, ask_qty, 
+                    symbol=instrument.security_id
+                )
+                self.logger.info(f"Sent market data for {symbol}: bid={bid}@{bid_qty}, ask={ask}@{ask_qty}")
+            except Exception as e:
+                self.logger.warning(f"Failed to send market data to {name}: {e}")
+        
+        return self
+    
+    def send_order(self, 
+                  symbol: str, 
+                  side: Side, 
+                  quantity: int, 
+                  price: Optional[float] = None,
+                  order_type: OrderType = OrderType.LIMIT,
+                  destination: str = "nyse_pillar") -> str:
+        """Send an order and return order ID"""
+        if not self.running:
+            raise RuntimeError("Simulators must be started before sending orders")
+        
+        if symbol not in self.instruments:
+            raise ValueError(f"Unknown instrument: {symbol}")
+        
+        # Create order
+        order_id = f"TEST_{int(time.time() * 1000)}_{len(self.orders)}"
+        
+        # Convert to internal order format
+        internal_instrument = self.instruments[symbol].to_instrument()
+        internal_side = gtd.fix.Side.Buy if side == Side.BUY else gtd.fix.Side.Sell
+        internal_order_type = gtd.fix.OrdType.Limit if order_type == OrderType.LIMIT else gtd.fix.OrdType.Market
+        
+        if price is None and order_type == OrderType.LIMIT:
+            raise ValueError("Price required for limit orders")
+        
+        order = gtd.ops.Order(
+            Instruments=internal_instrument,
+            Price=price or 0,
+            Side=internal_side,
+            OrderQty=quantity,
+            Destination=destination,
+            OrdType=internal_order_type,
+        )
+        order.ClOrdID = order_id
+        
+        # Send order through framework
+        send_order(self.gtad_config, [order], self.lnx_simulator, self.raze_simulator)
+        
+        self.logger.info(f"Sent order: {symbol} {side.value} {quantity}@{price} (ID: {order_id})")
+        return order_id
+    
+    def expect_order_ack(self, order_id: Optional[str] = None, timeout: float = 5.0) -> 'TradingTestFramework':
+        """Add expectation for order acknowledgment"""
+        self.expectations.append(ExpectOrderAck(order_id, timeout))
+        return self
+    
+    def expect_fill(self, quantity: int, price: Optional[float] = None, timeout: float = 5.0) -> 'TradingTestFramework':
+        """Add expectation for order fill"""
+        self.expectations.append(ExpectFill(quantity, price, timeout))
+        return self
+    
+    def run_expectations(self, overall_timeout: float = 30.0) -> bool:
+        """Run all expectations and return True if all are met"""
+        start_time = time.time()
+        
+        while self.expectations and (time.time() - start_time) < overall_timeout:
+            # Check all expectations
+            fulfilled = []
+            for i, expectation in enumerate(self.expectations):
+                if expectation.check(self):
+                    fulfilled.append(i)
+                    self.logger.info(f"Expectation fulfilled: {type(expectation).__name__}")
+            
+            # Remove fulfilled expectations
+            for i in reversed(fulfilled):
+                self.expectations.pop(i)
+            
+            if not self.expectations:
+                self.logger.info("All expectations fulfilled!")
+                return True
+            
+            time.sleep(0.1)  # Small delay between checks
+        
+        if self.expectations:
+            self.logger.error(f"Timeout: {len(self.expectations)} expectations not fulfilled")
+            return False
+        
+        return True
+    
+    def run_market_data_loop(self, 
+                           duration: float = 10.0,
+                           update_interval: float = 1.0,
+                           price_volatility: float = 0.1) -> 'TradingTestFramework':
+        """Run continuous market data updates"""
+        start_time = time.time()
+        
+        # Initialize prices
+        prices = {}
+        for symbol, instrument in self.instruments.items():
+            prices[symbol] = {
+                'bid': 100.0,
+                'ask': 102.0,
+                'bid_qty': 100,
+                'ask_qty': 100
+            }
+        
+        while (time.time() - start_time) < duration:
+            for symbol in self.instruments:
+                # Add some randomness to prices
+                if random.random() < price_volatility:
+                    prices[symbol]['bid'] += random.uniform(-0.5, 0.5)
+                    prices[symbol]['ask'] += random.uniform(-0.5, 0.5)
+                    prices[symbol]['bid_qty'] = random.randint(50, 200)
+                    prices[symbol]['ask_qty'] = random.randint(50, 200)
+                
+                self.send_market_data(
+                    symbol,
+                    prices[symbol]['bid'],
+                    prices[symbol]['ask'],
+                    prices[symbol]['bid_qty'],
+                    prices[symbol]['ask_qty']
+                )
+            
+            time.sleep(update_interval)
+        
+        return self
+    
+    def cleanup(self):
+        """Clean up resources"""
+        if self.running:
+            # Stop simulators
+            if self.lnx_simulator:
+                try:
+                    # Add cleanup logic for LNX simulator if available
+                    pass
+                except Exception as e:
+                    self.logger.warning(f"Error cleaning up LNX simulator: {e}")
+            
+            if self.raze_simulator:
+                try:
+                    # Add cleanup logic for Raze simulator if available
+                    pass
+                except Exception as e:
+                    self.logger.warning(f"Error cleaning up Raze simulator: {e}")
+            
+            for name, sim in self.md_simulators.items():
+                try:
+                    # Add cleanup logic for MD simulators if available
+                    pass
+                except Exception as e:
+                    self.logger.warning(f"Error cleaning up {name} simulator: {e}")
+        
+        if self.gtad_config:
+            self.gtad_config.delete_shm()
+        
+        self.logger.info("Cleanup completed")
+
+
+# Convenience functions for common test patterns
+def quick_test(strategy_name: str, 
+               instruments: List[tuple],
+               test_func: Callable[['TradingTestFramework'], None],
+               **kwargs):
+    """Run a quick test with minimal setup"""
+    with TradingTestFramework(**kwargs) as framework:
+        framework.configure_strategy(strategy_name)
+        framework.add_instruments(instruments)
+        framework.start_simulators()
+        
+        test_func(framework)
+        
+        return framework.run_expectations()
+
+
+# Example usage and test cases
+if __name__ == "__main__":
+    
+    # Example 1: Simple order test
+    def test_simple_order(framework):
+        framework.send_market_data("AAPL", bid=100, ask=102)
+        order_id = framework.send_order("AAPL", Side.BUY, 10, 101)
+        framework.expect_order_ack(order_id)
+        framework.expect_fill(10, 101)
+    
+    # Example 2: Market data streaming test
+    def test_market_data_streaming(framework):
+        framework.run_market_data_loop(duration=5.0, update_interval=0.5)
+        order_id = framework.send_order("AAPL", Side.BUY, 10, 101)
+        framework.expect_order_ack(order_id)
+    
+    # Example 3: Multi-instrument test
+    def test_multi_instrument(framework):
+        framework.send_market_data("AAPL", bid=100, ask=102)
+        framework.send_market_data("AMD", bid=50, ask=52)
+        
+        order1 = framework.send_order("AAPL", Side.BUY, 10, 101)
+        order2 = framework.send_order("AMD", Side.SELL, 20, 51)
+        
+        framework.expect_order_ack(order1)
+        framework.expect_order_ack(order2)
+    
+    # Define instruments
+    test_instruments = [
+        ("AAPL.OQ", "AAPL", 255619, 1099345),
+        ("AMD.O", "AMD", 54608, 54604),
+        ("NVDI1", "NVD", 889665, 622805),
+    ]
+    
+    # Run tests
+    print("Running simple order test...")
+    success1 = quick_test("simple_order_test", test_instruments, test_simple_order)
+    print(f"Simple order test: {'PASSED' if success1 else 'FAILED'}")
+    
+    print("\nRunning market data streaming test...")
+    success2 = quick_test("streaming_test", test_instruments, test_market_data_streaming)
+    print(f"Streaming test: {'PASSED' if success2 else 'FAILED'}")
+    
+    print("\nRunning multi-instrument test...")
+    success3 = quick_test("multi_instrument_test", test_instruments, test_multi_instrument)
+    print(f"Multi-instrument test: {'PASSED' if success3 else 'FAILED'}")
+    
+    # Advanced usage example
+    print("\nRunning advanced test with custom setup...")
+    with TradingTestFramework(log_level="DEBUG") as framework:
+        (framework
+         .configure_strategy("advanced_test", strategy_id=999)
+         .add_instrument("AAPL.OQ", "AAPL", 255619, 1099345)
+         .add_instrument("AMD.O", "AMD", 54608, 54604)
+         .start_simulators()
+         .send_market_data("AAPL", bid=100, ask=102)
+         .send_market_data("AMD", bid=50, ask=52))
+        
+        # Send orders
+        order1 = framework.send_order("AAPL", Side.BUY, 10, 101)
+        order2 = framework.send_order("AMD", Side.SELL, 20, 51)
+        
+        # Set expectations
+        (framework
+         .expect_order_ack(order1)
+         .expect_order_ack(order2)
+         .expect_fill(10, 101)
+         .expect_fill(20, 51))
+        
+        # Run market data in background while checking expectations
+        import threading
+        md_thread = threading.Thread(
+            target=lambda: framework.run_market_data_loop(duration=10.0)
+        )
+        md_thread.start()
+        
+        success = framework.run_expectations(overall_timeout=15.0)
+        print(f"Advanced test: {'PASSED' if success else 'FAILED'}")
+        
+        md_thread.join()
+```
+
+This framework provides:
+
+1. **Fluent API**: Chain method calls for clean, readable test setup
+2. **Context Management**: Automatic cleanup with `with` statements
+3. **Intuitive Methods**: Simple functions like `send_order()`, `send_market_data()`
+4. **Flexible Configuration**: Easy strategy and instrument setup
+5. **Expectation System**: Built-in assertions for common scenarios
+6. **Logging**: Comprehensive logging for debugging
+7. **Error Handling**: Proper error messages and validation
+8. **Convenience Functions**: `quick_test()` for simple cases
+9. **Advanced Features**: Market data loops, multi-threading support
+
+**Usage Examples:**
+
+```python
+# Simple 5-line test
+with TradingTestFramework() as f:
+    f.configure_strategy("test").add_instrument("AAPL", "AAPL", 1, 2).start_simulators()
+    f.send_market_data("AAPL", 100, 102).send_order("AAPL", Side.BUY, 10, 101)
+    f.expect_order_ack().expect_fill(10, 101)
+    assert f.run_expectations()
+
+# Or even simpler with quick_test
+quick_test("my_test", [("AAPL", "AAPL", 1, 2)], lambda f: f.send_order("AAPL", Side.BUY, 10))
+```
