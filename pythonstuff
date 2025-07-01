@@ -523,3 +523,22 @@ with (TestLab("eta_ita_test1","main",555)
                       dest="nyse_pillar", side=fix.Side.Buy)
     lab.raze.send_order(order).expect_ack().expect_fill()
 PY
+
+
+
+
+Yes — the framework you now have (pme/gtd_testfw/) is a direct replacement for the old main.py bootstrap while meeting every point you listed:
+“Run one script and all simulators spin-up”
+The TestLab(...).with_spcast().with_raze().with_lnx() chain instantiates and starts every simulator internally (Spcast/Cdmcast feeds, Raze gateway, Lnx uplink).
+The original low-level steps—handshake tokens, XML mutating, port fixes, sim.start(), sim.login()—are executed behind the scenes exactly as they were in main.py.
+“Intuitive functions / ≤ 20-line test cases”
+Example in tests/test_basic_flow.py is 18 LOC: push quotes → send order → expect ACK+FILL.
+High-level helpers (marketdata(...).quote(), raze.send_order(...).expect_ack()) remove boilerplate entirely.
+“Able to run interactively, not just via pytest”
+Drop the example snippet into any quick_demo.py and run python quick_demo.py; the context-manager (with TestLab as lab:) powers up simulators at entry and tears them down at exit.
+“Still access low-level objects when I need them”
+Every façade exposes .raw so you can call any method that existed before (e.g., lab.raze.raw.send_cancel_ack(...)).
+“Works with existing GtadConfig + helpers without moving code”
+gtd_testfw/user_lib.py dynamically imports the real GtadConfig and create_md_simulators.
+If those reside elsewhere, you only tweak a list of module names—no other edits required.
+So functionally nothing was lost; syntactically everything got simpler. If you run:
