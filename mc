@@ -70,3 +70,12 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+python3 -c "
+import socket
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.bind(('192.168.163.2', 0))  # Bind to sfc0 IP
+s.sendto(b'test message from sfc0', ('239.254.64.2', 31103))
+s.close()
+"
