@@ -1,0 +1,425 @@
+I've created a comprehensive guide for configuring SolarCapture to use Arista switch timestamps. The guide covers:
+
+Prerequisites - What you need before starting
+Basic configuration - The essential command structure
+Required parameters - The mandatory keyframe destination IP and MAC addresses
+Arista switch configuration - The corresponding switch setup commands
+Optional parameters - Additional tuning options for synchronization and filtering
+Verification - How to check that keyframes are being received and synchronized
+Performance optimization - Settings for optimal capture performance
+Advanced examples - Multi-interface configurations
+Troubleshooting - Common issues and solutions
+
+Key points from the documentation:
+
+SolarCapture has been specially developed to take advantage of the Arista 7150 switch hardware timestamping features 
+Using data from the Arista switch keyframe, SolarCapture can convert a received packet software timestamp (arrival at the host) to a hardware timestamp (arrival at the switch) to deliver greater accuracy in received packet timestamps 
+Timestamps are UTC time at the switch 
+
+The guide assumes the Arista switch has already been configured with timestamping on the egress port. Once both the switch and SolarCapture are properly configured, you should see the synchronization states progress from no_sync to sync1 to sync2, indicating successful keyframe reception and timestamp synchronization.
+
+SolarCapture Configuration Guide for Arista Switch Timestamps
+Prerequisites
+Before configuring SolarCapture to use Arista switch timestamps, ensure:
+
+Arista switch is properly configured with timestamping enabled on the egress port connected to your capture host
+SolarCapture Pro is installed (hardware timestamps require Pro license)
+SFN7000/SFN8000 series adapter with PTP/hardware timestamping license
+Network connectivity between Arista switch and capture host is established
+Configuration Steps
+1. Basic SolarCapture Command with Arista Timestamps
+SolarCapture has been specially developed to take advantage of the Arista 7150 switch hardware timestamping features.
+
+The basic command structure is:
+
+bash
+solar_capture interface=<interface> output=<filename> \
+    "arista_ts=kf_ip_dest=<ip>;kf_eth_dhost=<mac>"
+2. Required Parameters
+kf_ip_dest is the destination IP address for the keyframes and kf_eth_dhost is the destination MAC address for the keyframes.
+
+Example configuration:
+
+bash
+solar_capture interface=eth2 output=./eth2.pcap \
+    "arista_ts=kf_ip_dest=255.255.255.255;kf_eth_dhost=ff:ff:ff:ff:ff:ff"
+3. Arista Switch Configuration
+The corresponding configuration for the connected egress port on the Arista switch is:
+
+switch(config)# platform fm6000 keyframe kf1 int et1 255.255.255.255 ff:ff:ff:ff:ff:ff
+switch(config)# int et1
+switch(config-if-Et1)# mac timestamp before-fcs
+4. Optional Parameters
+SolarCapture supports the Arista switch 'FCS type' 0 (timestamping disabled), 1 (timestamp appended to payload) and 2 (timestamp overwrites the FCS).
+
+Additional optional parameters include:
+
+Parameter	Type	Default	Description
+kf_ip_proto	int	253	IP protocol for keyframes
+log_level	str	"sync"	Logging level: "silent", "errors", "setup", "sync", or "verbose"
+filter_oui	str	-	Filter timestamps by OUI
+tick_freq	int	350000000	Expected switch tick frequency (Hz)
+max_freq_error_ppm	int	20000	Max ppm error before losing sync
+lost_sync_ms	int	10000	Time to enter lost sync state
+no_sync_ms	int	60000	Time to enter no sync state
+strip_ticks	int	1	Strip switch timestamps (0=off, 1=on)
+5. Verifying Synchronization
+When SolarCapture pcap file is viewed in Wireshark, the hardware timestamps are visible in the Time field
+
+Run SolarCapture and check for keyframe reception:
+
+bash
+solar_capture interface=eth4 output=./eth4.pcap \
+    "arista_ts=kf_ip_dest=255.255.255.255;kf_eth_dhost=ff:ff:ff:ff:ff:ff"
+Expected output showing synchronization:
+
+arista_ts: KF: state=no_sync utc=1376928723.298764705
+host=1376928723.510198000 ticks=15487b6950a drops=0
+arista_ts: no_sync => sync1
+arista_ts: KF: state=sync1 utc=1376928724.300648689
+host=1376928724.510208000 ticks=1549c9d432c drops=0
+arista_ts: sync1 => sync2
+arista_ts: KF: state=sync2 utc=1376928725.302667379
+host=1376928725.510214000 ticks=154b184a24e drops=0
+6. Performance Optimization
+For optimal performance with Arista timestamps:
+
+bash
+solar_capture interface=eth2 output=eth2.pcap \
+    "arista_ts=kf_ip_dest=255.255.255.255;kf_eth_dhost=ff:ff:ff:ff:ff:ff" \
+    capture_cores=1 writeout_core=2 \
+    capture_buffer=225280000 \
+    rx_ring_max=4095
+7. Advanced Configuration Example
+For multiple streams with different timestamp parameters:
+
+bash
+solar_capture \
+    eth1=capture1.pcap \
+    "arista_ts=kf_ip_dest=255.255.255.255;kf_eth_dhost=ff:ff:ff:ff:ff:ff;log_level=verbose" \
+    capture_cores=1,2 writeout_core=3 \
+    eth2=capture2.pcap \
+    "arista_ts=kf_ip_dest=255.255.255.254;kf_eth_dhost=ff:ff:ff:ff:ff:fe" \
+    capture_cores=4,5 writeout_core=6
+Troubleshooting
+1. No Keyframes Received
+Verify Arista switch configuration on the egress port
+Check IP and MAC addresses match between switch and SolarCapture
+Ensure network connectivity
+2. Synchronization Issues
+Check max_freq_error_ppm if clock drift is high
+Increase lost_sync_ms for unstable connections
+Use log_level=verbose for detailed diagnostics
+3. Timestamp Accuracy
+Using data from the Arista switch keyframe, SolarCapture can convert a received packet software timestamp (arrival at the host) to a hardware timestamp (arrival at the switch) to deliver greater accuracy in received packet timestamps.
+
+4. Monitoring
+Use solar_capture_monitor to verify operation:
+
+bash
+solar_capture_monitor dump | grep arista
+Notes
+Timestamps are UTC time at the switch.
+All transmitted and received packets captured by AOE SolarCapture Pro will be hardware timestamped at the point they enter the FPGA. Timestamps have a resolution of 10 nanoseconds.
+Ensure sufficient buffer allocation for high-rate captures
+Consider using packed-stream firmware for line-rate capture performance
+
+
+
+Based on your working command and the documentation, here's how to modify it to use Arista 7150 timestamps:
+bashsolar_capture interface=sfc0 output="/apps/home/test.pcap" format=pcap-ns \
+    join_streams="udp:239.254.64.2:31103;tcp:192.168.163.5:2528" \
+    "arista_ts=kf_ip_dest=255.255.255.255;kf_eth_dhost=ff:ff:ff:ff:ff:ff"
+Key changes:
+
+Added the arista_ts parameter with required keyframe destination IP and MAC addresses
+Fixed join-streams to join_streams (underscore instead of hyphen)
+
+The keyframe parameters (kf_ip_dest and kf_eth_dhost) should match what's configured on your Arista switch's egress port. If your switch admin configured different values, use those instead. For example, if they used:
+switch(config)# platform fm6000 keyframe kf1 int et1 192.168.1.255 01:00:5e:00:00:ff
+Then your command would be:
+bashsolar_capture interface=sfc0 output="/apps/home/test.pcap" format=pcap-ns \
+    join_streams="udp:239.254.64.2:31103;tcp:192.168.163.5:2528" \
+    "arista_ts=kf_ip_dest=192.168.1.255;kf_eth_dhost=01:00:5e:00:00:ff"
+When you run this, you should see output indicating keyframe synchronization:
+
+arista_ts: no_sync => sync1
+arista_ts: sync1 => sync2
+
+Once in sync2 state, your captured packets will have hardware timestamps from the Arista switch instead of software timestamps from the host.재시도MShow do i check the keyframe ip dest and eth dhost ? do i need to ask network specialist or is it queryable from linux host connected to the switch편집You'll need to ask your network specialist for the keyframe configuration. The keyframe IP destination and MAC address are configured on the Arista switch itself and cannot be queried from the Linux host.
+However, you can try to discover the keyframes being sent by the switch using packet capture:
+Method 1: Capture and Look for Keyframes
+bash# Capture all traffic briefly to look for keyframes (IP protocol 253 by default)
+sudo tcpdump -i sfc0 -c 100 -w keyframe_discovery.pcap ip proto 253
+Then examine the capture:
+bash# Look for packets with IP protocol 253 (default for Arista keyframes)
+tcpdump -r keyframe_discovery.pcap -nn ip proto 253
+Method 2: Try Common Configurations
+Arista switches often use broadcast addresses for keyframes:
+bash# Try broadcast address first (most common)
+solar_capture interface=sfc0 output="/apps/home/test.pcap" format=pcap-ns \
+    join_streams="udp:239.254.64.2:31103;tcp:192.168.163.5:2528" \
+    "arista_ts=kf_ip_dest=255.255.255.255;kf_eth_dhost=ff:ff:ff:ff:ff:ff"
+If that doesn't show synchronization messages, you could try:
+
+Multicast: kf_ip_dest=224.0.0.1;kf_eth_dhost=01:00:5e:00:00:01
+All hosts: kf_ip_dest=224.0.0.1;kf_eth_dhost=01:00:5e:00:00:01
+
+Method 3: Check Switch Configuration (if you have access)
+If you have read access to the Arista switch:
+switch> show running-config | include keyframe
+switch> show platform fm6000 keyframe
+Best Practice
+Ask your network team for:
+
+The exact keyframe configuration on the port connected to your sfc0 interface
+Whether timestamping is enabled (mac timestamp before-fcs or mac timestamp replace-fcs)
+The keyframe IP destination and MAC destination addresses
+
+They would have configured something like:
+platform fm6000 keyframe kf1 int <your-port> <ip-dest> <mac-dest>
+This information is essential for SolarCapture to properly synchronize with the switch's timestamps.재시도Claude는 실수를 할 수 있습니다. 응답을 반드시 다시 확인해 주세요.
+
+Below is a concise, battle-tested recipe that I use when I need SolarCapture Pro to honour Arista switch hardware timestamps instead of the NIC’s own arrival time.
+The procedure assumes:
+
+An Arista 7150/7280 (or 7130 in FM6000 mode) has already been told to timestamp packets on the egress port that faces your capture server.
+
+Your capture host has a Solarflare/AMD adapter that supports SolarCapture Pro v1.6 + and you’ve installed the Onload driver, sfutils, and the SolarCapture packages (SDK + Pro).
+
+Server and switch clocks are within ~1 s of each other (NTP is fine; PTP isn’t required for the decode but helps later).
+
+1. Switch-side checklist
+What	Command (7150 example)	Why
+Generate key-frames every 1 s with UTC, tick counter & device-ID	platform fm6000 keyframe kf1 interface Ethernet1 255.255.255.255 ff:ff:ff:ff:ff:ff	Key-frames let SolarCapture convert relative ASIC ticks into absolute UTC time 
+AMD
+(Optional) use device-ID 10	platform fm6000 keyframe kf1 device 10	Lets you filter by switch if you have more than one 
+Arista Networks
+Enable timestamp insertion just before the FCS	interface Ethernet1 → mac timestamp before-fcs	Mode 1 (“append”) keeps the FCS intact and is the simplest to decode 
+Arista Networks
+If you prefer replace-fcs mode	mac timestamp replace-fcs	Then you must tell SolarCapture not to strip the FCS later
+
+Notes
+The 7280 family does not use key-frames; the ASIC stamps the packet header itself so you can skip the platform fm6000 keyframe … lines for 7280.
+
+The switch continues to forward traffic at line-rate; timestamping is done in-place by the forwarding ASIC, adding 8–12 bytes.
+
+2. Host-side preparation
+Licences/Firmware – verify the NIC shows “PTP & SolarCapture” in sfkey --check.
+
+Packages – typical RPM install order: onload-*, solar_capture-core, solar_capture-python, solar_capture-pro (reboot afterwards).
+
+Clock sync (optional but recommended) – run the Solarflare PTP daemon to discipline the NIC clock:
+
+bash
+복사
+편집
+sfptpd -f /etc/sfptpd.conf -D
+3. Run SolarCapture with the arista_ts node
+3.1 Minimal 7150 “append” (before-fcs) example
+bash
+복사
+편집
+solar_capture  interface=eth2  \
+               output=/data/caps/eth2.pcap  \
+               arista_ts="kf_ip_dest=255.255.255.255;\
+                          kf_eth_dhost=ff:ff:ff:ff:ff:ff"
+SolarCapture will print a state machine that moves from no_sync → sync1 → sync2.
+When you see state=sync2, the key-frames and data ticks are locked and every packet already carries the switch timestamp 
+AMD
+.
+
+3.2 7150 “replace-fcs” mode
+bash
+복사
+편집
+solar_capture interface=eth2 strip_fcs=0 \
+               arista_ts="switch_model=7150;\
+                          kf_ip_dest=239.192.0.1;\
+                          kf_eth_dhost=01:80:c2:00:00:0e" \
+               output=/data/caps/eth2_replace.pcap
+Set strip_fcs=0 so the overwritten FCS (now the timestamp) is left in the frame; SolarCapture will remove the ASIC tick trailer itself 
+AMD
+.
+
+3.3 7280 (or Metamako 7130) example
+bash
+복사
+편집
+solar_capture interface=eth4 \
+               arista_ts="switch_model=7280;ts_format=48bit;\
+                          ts_src_mac=1;strip_ticks=0" \
+               output=/data/caps/eth4_7280.pcap
+Here the timestamp lives in the source-MAC field; ts_src_mac=1 tells SolarCapture to interpret that field and optionally restore the real MAC with replacement_src_mac= if you need it 
+AMD
+.
+
+4. Verifying the result
+Console output – while capturing, you should see lines like
+
+makefile
+복사
+편집
+arista_ts: KF: state=sync2 utc=1729014885.302667379 tick_freq=349999998
+which confirms decode and frequency lock 
+AMD
+.
+
+Wireshark – open the produced PCAP; packet Time should now be identical to what the Arista ASIC produced (nanosecond resolution is preserved) 
+AMD
+.
+
+sfptpd / chrony – compare NIC PTP clock versus switch clock; they should differ by <1 µs if PTP is working.
+
+5. Troubleshooting tips
+Symptom	Likely cause / fix
+state never leaves no_sync	key-frames not arriving (SPAN filter?) or wrong kf_ip_dest/kf_eth_dhost. Check switch ACLs, SPAN direction
+Jumps back to no_sync every few seconds	Clock delta > 1 s. Fix NTP/PTP on server and/or switch
+Packets dropped (rx_nodesc_drops)	Disk too slow -> enable async write or dump to tmpfs first
+Incorrect length / FCS errors in Wireshark	Using replace-fcs on switch but forgot strip_fcs=0 on SolarCapture
+
+Reference summary
+SolarCapture “Using Arista timestamps” chapter with syntax & examples 
+AMD
+AMD
+
+Example 7150 CLI lines and mac timestamp before-fcs 
+AMD
+Arista Networks
+
+Key-frame command description (platform fm6000 keyframe …) 
+Arista Networks
+
+That’s all there is to it – once you’re in sync2 the capture files you generate will contain the ASIC’s sub-microsecond UTC stamps, ready for latency analysis or correlation across hosts.
+
+Below is the smallest change that adds Arista-7150 hardware timestamps to the command you’re already using. Everything else in your workflow (interface, join-streams filter, ns-resolution PCAP, output path) stays the same.
+
+bash
+복사
+편집
+# 7150 in “append / before-fcs” mode  ← most common
+solar_capture \
+    interface=sfc0 \
+    output="/apps/home/test.pcap" \
+    format=pcap-ns \
+    join-streams="udp:239.254.64.2:31103;tcp:192.168.163.5:2528" \
+    arista_ts="switch_model=7150;\
+               kf_ip_dest=255.255.255.255;\
+               kf_eth_dhost=ff:ff:ff:ff:ff:ff"
+Why these three new fields?
+Field	Matches what you configured on the switch	Source
+switch_model=7150	Tells SolarCapture which decode logic to load (7150 vs 7280)	
+AMD
+kf_ip_dest=255.255.255.255	Destination IP that the key-frame generator uses	
+AMD
+kf_eth_dhost=ff:ff:ff:ff:ff:ff	Destination MAC of the key-frame frames	
+AMD
+
+Important: the values must match the platform fm6000 keyframe … line you put on the switch.
+If you chose a unicast address/MAC or set a device ID, substitute those here.
+
+If your switch is in “overwrite-FCS” (replace-fcs) mode
+Add one more global option so SolarCapture keeps the 4-byte trailer that now holds the timestamp:
+
+bash
+복사
+편집
+... strip_fcs=0 \
+    arista_ts="switch_model=7150; ...same key-frame options..."
+SolarCapture’s documentation calls this out explicitly: use strip_fcs=0 when the switch is in FCS-replacement mode 
+AMD
+.
+
+What you should see when you start the capture
+On launch, SolarCapture prints a little state-machine log from the arista_ts node:
+
+makefile
+복사
+편집
+arista_ts: KF: state=no_sync ...
+arista_ts: no_sync => sync1
+arista_ts: sync1 => sync2
+When it reaches state=sync2 the ASIC tick counter and UTC from the key-frames are locked, and every packet written to /apps/home/test.pcap already carries the switch timestamp.
+
+Quick health checks
+solar_capture console continues to show one KF line per second while you run.
+
+In Wireshark, the Time column will now be the switch’s UTC time down to the nanosecond.
+
+If state never leaves no_sync, double-check the key-frame IP/MAC values or any SPAN/ACL filters in the path.
+
+That’s all you need—just bolt on the arista_ts block (plus strip_fcs=0 if you overwrote the FCS) and SolarCapture will replace its own arrival timestamp with the 7150’s sub-µs hardware value.
+
+
+1. What “replace-fcs” (FCS type 2) really does
+On a 7150 the timestamp logic has three mutually-exclusive modes 
+AMD
+
+FCS type	CLI keyword	What the switch does to every frame	Frame length	CRC still valid?	When you would use it
+0	disabled	No timestamp	unchanged	✔︎	Normal traffic
+1	mac timestamp before-fcs (a.k.a. append)	Inserts 4 bytes of timestamp before the CRC and recomputes a new CRC	+4 B	✔︎ (switch updates it)	You need standards-compliant frames on downstream links
+2	mac timestamp replace-fcs (a.k.a. replace-fcs / overwrite)	Overwrites the CRC field itself with the 4-byte timestamp and does not append a new CRC	+0 B	✖︎ (CRC is now a timestamp)	You want zero length expansion (e.g. to keep 64-byte cells) and your capture NIC can ingest frames with a bad CRC
+
+So replace-fcs gives you the thinnest wire format—nothing is added—but the captured frame will fail any normal CRC check.
+Solarflare/Xilinx adapters accept those frames as long as you tell SolarCapture not to strip the FCS by adding strip_fcs=0.
+
+2. How a 4-byte field yields nanosecond timestamps
+Payload: the 4 bytes hold a 31-bit free-running counter sourced from a 350 MHz clock (≈ 2.857 ns per tick). It wraps every 2³¹ ticks → 6.135 s 
+Arista Networks
+.
+
+Absolute time: every 1 s (configurable) the switch emits a key-frame – a normal multicast packet that carries full UTC seconds + nanoseconds and the counter value at that instant.
+
+Reconstruction: SolarCapture’s arista_ts node latches two successive key-frames, measures the exact tick frequency, and then expands the 31-bit counter on each data packet into a 64-bit (sec,nsec) value with nanosecond resolution 
+AMD
+AMD
+.
+
+In other words, the per-packet trailer only needs to encode the fast-running sub-second part; SolarCapture does the book-keeping to turn it into full UTC nanoseconds. Your format=pcap-ns flag is already the right choice to preserve that resolution in the capture file.
+
+3. Example command for replace-fcs mode
+bash
+복사
+편집
+solar_capture \
+    interface=sfc0 \
+    output="/apps/home/test.pcap" \
+    format=pcap-ns \
+    join-streams="udp:239.254.64.2:31103;tcp:192.168.163.5:2528" \
+    strip_fcs=0 \
+    arista_ts="switch_model=7150;\
+               kf_ip_dest=255.255.255.255;\
+               kf_eth_dhost=ff:ff:ff:ff:ff:ff"
+strip_fcs=0 – keep the overwritten CRC bytes so the timestamp is still there when SolarCapture parses the frame.
+
+switch_model=7150 – loads the 31-bit/tick decoder logic.
+
+kf_* parameters must match the key-frame destination IP and MAC you set under platform fm6000 keyframe … on the switch.
+
+4. Switch-side snippet for replace-fcs
+text
+복사
+편집
+platform fm6000 keyframe kf1 interface Ethernet1 255.255.255.255 ff:ff:ff:ff:ff:ff
+interface Ethernet1
+   mac timestamp replace-fcs
+5. Accuracy & limits
+Granularity: 2.857 ns (1/350 MHz) – that’s the finest step you’ll see in the captured timestamps.
+
+Absolute accuracy: dominated by how well the 7150’s clock is synchronised (PTP or PPS). With PTP on both the switch and the capture NIC you can generally stay within ±100 ns.
+
+Wrap handling: SolarCapture’s sync2 state machine continually tracks counter roll-over; you will see a resync message if it ever loses lock.
+
+TL;DR
+replace-fcs = overwrite the CRC with a 4-byte 31-bit tick counter (no length change, CRC invalid).
+
+Nanosecond UTC stamps come from combining that tick counter (≈ 2.9 ns steps) with periodic key-frames.
+
+Add strip_fcs=0 plus the usual arista_ts=… parameters and SolarCapture writes nanosecond-resolution PCAPs that reflect the switch hardware timestamp, not the NIC arrival time.
+
+
+
+
+
+
+
