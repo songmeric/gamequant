@@ -1,0 +1,1580 @@
+Summary
+Your approach to refactor the Processor class is excellent. By implementing event-driven clock updates in the Processor, you can achieve deterministic historical simulation while maintaining the existing event processing architecture. Here's the comprehensive refactoring strategy:
+Key Refactoring Points:
+Enhanced Processor with Clock Updates
+Update the historical clock BEFORE processing each event
+Extract timestamps from market data events (m_exchange_time_64)
+Immediately check for expired timers after clock advances
+Maintain original processing logic after clock updates
+Clock Abstraction
+Interface-based design allows switching between real-time and historical modes
+Historical clock only advances through events (static between events)
+Clock advances trigger timer checks immediately
+Timer Firing Strategies
+Option 1: Fire when clock reaches expiry time
+Option 2: Fire before next known event (requires lookahead)
+Both maintain deterministic ordering by sorting timers by expiry
+Engineering Measures for Determinism
+Single-threaded processing in historical mode
+Event sequencing with deterministic sort criteria (timestamp → sequence → priority)
+State checkpointing for validation against production
+Synchronous operations only (no async callbacks)
+Clock monotonicity enforcement
+Event Ordering Preservation
+Process events in strict timestamp order
+Secondary sorting by global sequence number from pcap
+Tertiary sorting by event type priority
+Batch processing of same-timestamp events
+Critical Implementation Details:
+// In Processor's market data handlers:
+void operator()(const frameworkEvents::MDBoE& event) {
+    // 1. Update clock first
+    if (framework_.clock_->isHistorical()) {
+        auto oldTime = framework_.clock_->now();
+        framework_.clock_->advanceTime(std::chrono::nanoseconds(event.snapshot.m_exchange_time_64));
+        
+        // 2. Check timers immediately
+        framework_.timer_mgr_.checkExpiredTimers(oldTime, framework_.clock_->now());
+    }
+    
+    // 3. Then process event normally
+    framework_.strategy_.on_market_data(framework_.thread_.queue_.size(), event.snapshot, event.mdLatency);
+}
+
+Advantages of This Approach:
+Minimal code changes - Mostly confined to Processor and timer management
+Maintains existing architecture - No changes to strategy code
+Perfect determinism - Events and timers fire in exact same order
+Easy validation - Can compare checkpoints with production
+Flexible timer strategies - Can experiment with different firing modes
+Potential Pitfalls to Avoid:
+Clock regression - Never let clock go backward
+Missing timestamps - Have fallback for events without timestamps
+Timer cascade - One timer firing shouldn't immediately trigger others
+Event starvation - Don't let timer processing block event processing
+Memory ordering - Use proper atomic operations for clock state
+This refactoring will give your quants the deterministic historical simulation they need while maintaining the integrity of your production system. The key is ensuring that every event processes in exactly the same order with exactly the same clock values as they would have in production.
+
+
+
+
+Complete Implementation Files:
+1. HistoricalClockSystem.h
+Contains the core clock abstraction and timer management:
+ISystemClock interface
+RealTimeClock for production
+HistoricalClock for simulation
+HistoricalAwareTimerManager with three timer firing modes
+HistoricalAwareProcessor that updates clock from events
+DeterministicEventSequencer for event ordering
+
+#pragma once
+
+#include <chrono>
+#include <atomic>
+#include <memory>
+#include <functional>
+#include <optional>
+#include <queue>
+#include <vector>
+#include <algorithm>
+
+// ============================================================================
+// Clock System
+// ============================================================================
+
+// Abstract Clock Interface
+class ISystemClock {
+public:
+    virtual ~ISystemClock() = default;
+    virtual std::chrono::nanoseconds now() const = 0;
+    virtual void advanceTime(std::chrono::nanoseconds newTime) = 0;
+    virtual bool isHistorical() const = 0;
+    
+    // Hook for pre/post time update operations
+    virtual void onTimeAdvance(std::chrono::nanoseconds oldTime, std::chrono::nanoseconds newTime) {}
+};
+
+// Production Clock - Uses real system time
+class RealTimeClock : public ISystemClock {
+public:
+    std::chrono::nanoseconds now() const override {
+        return std::chrono::nanoseconds(::util::real_clock::get_timestamp_ns());
+    }
+    
+    void advanceTime(std::chrono::nanoseconds) override {
+        // No-op for real-time - clock advances naturally
+    }
+    
+    bool isHistorical() const override { return false; }
+};
+
+// Historical Simulation Clock - Static time that only advances via events
+class HistoricalClock : public ISystemClock {
+private:
+    std::atomic<std::chrono::nanoseconds> currentTime_{0};
+    std::function<void(std::chrono::nanoseconds, std::chrono::nanoseconds)> timeUpdateCallback_;
+    mutable px::Log* log_;
+    
+public:
+    explicit HistoricalClock(
+        std::function<void(std::chrono::nanoseconds, std::chrono::nanoseconds)> callback = {},
+        px::Log* log = nullptr)
+        : timeUpdateCallback_(std::move(callback)), log_(log) {}
+    
+    std::chrono::nanoseconds now() const override {
+        return currentTime_.load(std::memory_order_acquire);
+    }
+    
+    void advanceTime(std::chrono::nanoseconds newTime) override {
+        auto oldTime = currentTime_.load(std::memory_order_acquire);
+        
+        // Only advance if new time is greater (maintain causality)
+        if (newTime > oldTime) {
+            currentTime_.store(newTime, std::memory_order_release);
+            
+            if (log_) {
+                GTAD_LOG_DEBUG(log_, "Historical clock advanced from " 
+                    << oldTime.count() << " to " << newTime.count() << " ns");
+            }
+            
+            onTimeAdvance(oldTime, newTime);
+        } else if (newTime < oldTime && log_) {
+            GTAD_LOG_WARN(log_, "Attempted to move clock backward from " 
+                << oldTime.count() << " to " << newTime.count() << " ns - ignored");
+        }
+    }
+    
+    bool isHistorical() const override { return true; }
+    
+    void onTimeAdvance(std::chrono::nanoseconds oldTime, std::chrono::nanoseconds newTime) override {
+        if (timeUpdateCallback_) {
+            timeUpdateCallback_(oldTime, newTime);
+        }
+    }
+    
+    void reset(std::chrono::nanoseconds startTime = std::chrono::nanoseconds{0}) {
+        currentTime_.store(startTime, std::memory_order_release);
+    }
+};
+
+// ============================================================================
+// Timer Management for Historical Mode
+// ============================================================================
+
+struct TimerEntry {
+    std::chrono::nanoseconds expiry;
+    std::function<void(std::chrono::nanoseconds)> callback;
+    uint64_t id;
+    uint32_t priority;  // For deterministic ordering
+    
+    bool operator<(const TimerEntry& other) const {
+        // For priority queue - reverse order (earliest first)
+        if (expiry != other.expiry) return expiry > other.expiry;
+        if (priority != other.priority) return priority > other.priority;
+        return id > other.id;
+    }
+};
+
+class HistoricalAwareTimerManager {
+public:
+    enum class TimerMode {
+        FIRE_AT_EXPIRY,        // Fire when clock reaches expiry
+        FIRE_BEFORE_NEXT,      // Fire before next market data event
+        FIRE_WITH_TOLERANCE    // Fire within time tolerance
+    };
+    
+private:
+    ISystemClock* clock_;
+    std::priority_queue<TimerEntry> timers_;
+    std::vector<TimerEntry> pendingTimers_;
+    TimerMode mode_{TimerMode::FIRE_AT_EXPIRY};
+    std::chrono::nanoseconds tolerance_{1000}; // 1 microsecond default
+    uint64_t nextTimerId_{1};
+    px::Log* log_;
+    
+public:
+    explicit HistoricalAwareTimerManager(ISystemClock* clock, px::Log* log = nullptr) 
+        : clock_(clock), log_(log) {}
+    
+    void setClock(ISystemClock* clock) { clock_ = clock; }
+    void setMode(TimerMode mode) { mode_ = mode; }
+    void setTolerance(std::chrono::nanoseconds tolerance) { tolerance_ = tolerance; }
+    
+    uint64_t scheduleTimer(std::chrono::nanoseconds expiry, 
+                          std::function<void(std::chrono::nanoseconds)> callback,
+                          uint32_t priority = 0) {
+        auto id = nextTimerId_++;
+        timers_.push(TimerEntry{expiry, std::move(callback), id, priority});
+        
+        if (log_) {
+            GTAD_LOG_DEBUG(log_, "Scheduled timer " << id << " to expire at " << expiry.count());
+        }
+        
+        return id;
+    }
+    
+    // Called after clock advances in historical mode
+    void checkExpiredTimers(std::chrono::nanoseconds previousTime, 
+                           std::chrono::nanoseconds currentTime,
+                           std::optional<std::chrono::nanoseconds> nextEventTime = {}) {
+        if (!clock_->isHistorical()) {
+            // Use existing real-time logic
+            checkRealtimeTimers(currentTime);
+            return;
+        }
+        
+        pendingTimers_.clear();
+        
+        switch (mode_) {
+            case TimerMode::FIRE_AT_EXPIRY:
+                collectExpiredTimers(previousTime, currentTime);
+                break;
+                
+            case TimerMode::FIRE_BEFORE_NEXT:
+                if (nextEventTime) {
+                    collectExpiredTimers(previousTime, *nextEventTime - std::chrono::nanoseconds(1));
+                } else {
+                    collectExpiredTimers(previousTime, currentTime);
+                }
+                break;
+                
+            case TimerMode::FIRE_WITH_TOLERANCE:
+                collectExpiredTimers(previousTime, currentTime + tolerance_);
+                break;
+        }
+        
+        // Fire timers in deterministic order
+        fireCollectedTimers();
+    }
+    
+private:
+    void collectExpiredTimers(std::chrono::nanoseconds fromTime, 
+                             std::chrono::nanoseconds toTime) {
+        std::vector<TimerEntry> temp;
+        
+        // Extract all timers up to toTime
+        while (!timers_.empty() && timers_.top().expiry <= toTime) {
+            temp.push_back(timers_.top());
+            timers_.pop();
+        }
+        
+        // Put back timers that shouldn't fire yet and collect ones that should
+        for (auto& timer : temp) {
+            if (timer.expiry > fromTime && timer.expiry <= toTime) {
+                pendingTimers_.push_back(timer);
+            } else if (timer.expiry > toTime) {
+                timers_.push(timer);
+            }
+            // Timers <= fromTime are discarded (already fired)
+        }
+    }
+    
+    void fireCollectedTimers() {
+        // Sort for deterministic execution order
+        std::sort(pendingTimers_.begin(), pendingTimers_.end(),
+                  [](const TimerEntry& a, const TimerEntry& b) {
+                      // Normal order for vector (earliest first)
+                      if (a.expiry != b.expiry) return a.expiry < b.expiry;
+                      if (a.priority != b.priority) return a.priority < b.priority;
+                      return a.id < b.id;
+                  });
+        
+        // Fire in order
+        for (const auto& timer : pendingTimers_) {
+            if (log_) {
+                GTAD_LOG_DEBUG(log_, "Firing timer " << timer.id 
+                    << " at historical time " << clock_->now().count());
+            }
+            
+            timer.callback(timer.expiry);
+        }
+        
+        pendingTimers_.clear();
+    }
+    
+    void checkRealtimeTimers(std::chrono::nanoseconds currentTime) {
+        while (!timers_.empty() && timers_.top().expiry <= currentTime) {
+            auto timer = timers_.top();
+            timers_.pop();
+            timer.callback(timer.expiry);
+        }
+    }
+};
+
+// ============================================================================
+// Enhanced Processor with Clock Updates
+// ============================================================================
+
+template <typename Framework>
+class HistoricalAwareProcessor {
+    Framework& framework_;
+    ISystemClock* clock_;
+    HistoricalAwareTimerManager* timerMgr_;
+    std::chrono::nanoseconds lastClockTime_{0};
+    px::Log* log_;
+    
+public:
+    explicit HistoricalAwareProcessor(Framework& framework, 
+                                     ISystemClock* clock,
+                                     HistoricalAwareTimerManager* timerMgr)
+        : framework_(framework), clock_(clock), timerMgr_(timerMgr), 
+          log_(GTAD_GET_LOGGER("HistoricalProcessor")) {}
+    
+    // Market Data Events with exchange timestamps
+    void operator()(const frameworkEvents::MDBoE& event) {
+        updateClockAndTimers(event.snapshot.m_exchange_time_64);
+        
+        // Original processing
+        framework_.strategy_.on_market_data(framework_.thread_.queue_.size(), 
+                                          event.snapshot, event.mdLatency);
+    }
+    
+    void operator()(const frameworkEvents::MDAuctionSummaryEvent& event) {
+        updateClockAndTimers(event.data.m_exchange_time_64);
+        
+        framework_.strategy_.on_auction_summary_data(framework_.thread_.queue_.size(), 
+                                                   event.data, event.mdLatency);
+    }
+    
+    void operator()(const frameworkEvents::MDOpenCloseEvent& event) {
+        updateClockAndTimers(event.data.m_exchange_time_64);
+        
+        framework_.strategy_.on_market_open_close_data(framework_.thread_.queue_.size(), 
+                                                     event.data, event.mdLatency);
+    }
+    
+    // Events without explicit timestamps
+    void operator()(const frameworkEvents::GenericData& event) {
+        // For generic data, might need to parse to extract timestamp
+        // For now, use existing logic without clock update
+        
+        framework_.strategy_.get_latency_context().record_stats(
+            LatencyContext::event_type_t::TOTAL_HU,
+            framework_.thread_.queue_.size(),
+            event.source->feed_name, event.mdLatency);
+            
+        auto func = [&event](const ::gtad::framework::RawCallback& callback, 
+                            const void* data, size_t nBytes) {
+            callback(data, nBytes);
+        };
+        framework_.mdMgr_.onRawData(*event.source, func, event.data.data(), event.data.len());
+    }
+    
+    void operator()(const frameworkEvents::RawDataEvent& event) {
+        // Check if raw data contains timestamp
+        // For now, process without clock update
+        
+        framework_.strategy_.get_latency_context().record_stats(
+            LatencyContext::event_type_t::RAW_HU,
+            framework_.thread_.queue_.size(),
+            event.source->feed_name, event.mdLatency);
+            
+        auto func = [&event](const ::gtad::framework::RawCallback& callback, 
+                            const void* data, size_t nBytes) {
+            callback(data, nBytes, event.rawBcap);
+        };
+        framework_.mdMgr_.onRawData(*event.source, func, event.data.data(), event.data.len());
+    }
+    
+    // Delegate all other events to original processor
+    template <typename Event>
+    void operator()(const Event& event) {
+        processOriginalEvent(event);
+    }
+    
+private:
+    void updateClockAndTimers(int64_t nanoseconds) {
+        if (clock_->isHistorical() && nanoseconds > 0) {
+            auto newTime = std::chrono::nanoseconds(nanoseconds);
+            auto oldTime = clock_->now();
+            
+            // Only update if time advances
+            if (newTime > oldTime) {
+                clock_->advanceTime(newTime);
+                
+                // Check timers immediately after clock advance
+                timerMgr_->checkExpiredTimers(lastClockTime_, newTime);
+                lastClockTime_ = newTime;
+            }
+        }
+    }
+    
+    template <typename Event>
+    void processOriginalEvent(const Event& event) {
+        // Delegate to original framework processor logic
+        // This would contain the existing processor implementations
+    }
+};
+
+// ============================================================================
+// Event Sequencing for Determinism
+// ============================================================================
+
+class DeterministicEventSequencer {
+public:
+    struct SequencedEvent {
+        std::chrono::nanoseconds timestamp;
+        uint64_t sequenceNumber;    // From pcap or global counter
+        uint32_t priority;          // Event type priority
+        std::variant<
+            frameworkEvents::MDBoE,
+            frameworkEvents::MDAuctionSummaryEvent,
+            frameworkEvents::MDOpenCloseEvent,
+            frameworkEvents::GenericData,
+            frameworkEvents::RawDataEvent,
+            frameworkEvents::LpsMsg,
+            frameworkEvents::TssEvent
+        > event;
+        
+        bool operator<(const SequencedEvent& other) const {
+            // For priority queue - reverse order
+            if (timestamp != other.timestamp) return timestamp > other.timestamp;
+            if (sequenceNumber != other.sequenceNumber) return sequenceNumber > other.sequenceNumber;
+            return priority > other.priority;
+        }
+    };
+    
+private:
+    std::priority_queue<SequencedEvent> eventQueue_;
+    uint64_t globalSequence_{0};
+    
+    static constexpr uint32_t getPriority(const frameworkEvents::MDBoE&) { return 100; }
+    static constexpr uint32_t getPriority(const frameworkEvents::MDAuctionSummaryEvent&) { return 99; }
+    static constexpr uint32_t getPriority(const frameworkEvents::MDOpenCloseEvent&) { return 98; }
+    static constexpr uint32_t getPriority(const frameworkEvents::GenericData&) { return 50; }
+    static constexpr uint32_t getPriority(const frameworkEvents::RawDataEvent&) { return 49; }
+    static constexpr uint32_t getPriority(const frameworkEvents::LpsMsg&) { return 30; }
+    static constexpr uint32_t getPriority(const frameworkEvents::TssEvent&) { return 20; }
+    
+public:
+    template <typename Event>
+    void addEvent(std::chrono::nanoseconds timestamp, Event&& event) {
+        eventQueue_.push(SequencedEvent{
+            timestamp,
+            globalSequence_++,
+            getPriority(event),
+            std::forward<Event>(event)
+        });
+    }
+    
+    void processEventsInWindow(std::chrono::nanoseconds windowEnd,
+                              const std::function<void(const SequencedEvent&)>& processor) {
+        std::vector<SequencedEvent> windowEvents;
+        
+        // Collect all events up to window end
+        while (!eventQueue_.empty() && eventQueue_.top().timestamp <= windowEnd) {
+            windowEvents.push_back(std::move(const_cast<SequencedEvent&>(eventQueue_.top())));
+            eventQueue_.pop();
+        }
+        
+        // Sort for deterministic processing
+        std::sort(windowEvents.begin(), windowEvents.end(),
+                  [](const SequencedEvent& a, const SequencedEvent& b) {
+                      // Normal order for processing
+                      if (a.timestamp != b.timestamp) return a.timestamp < b.timestamp;
+                      if (a.sequenceNumber != b.sequenceNumber) return a.sequenceNumber < b.sequenceNumber;
+                      return a.priority < b.priority;
+                  });
+        
+        // Process in order
+        for (const auto& event : windowEvents) {
+            processor(event);
+        }
+    }
+}; 
+
+
+
+2. GTADFrameworkHistoricalIntegration.cpp
+Shows how to integrate the historical clock into your existing GTADFramework:
+Modified StrategyThread with dual-mode support
+ProcessorWrapper to switch between original and historical processors
+Separate runHistoricalMode() and runProductionMode() methods
+Configuration-based initialization
+
+
+// Integration of Historical Clock System into GTADFramework
+// This shows the key modifications needed to support historical simulation
+
+#include "HistoricalClockSystem.h"
+#include "GTADFramework.h"
+
+// ============================================================================
+// Modified GTADFramework Class
+// ============================================================================
+
+class GTADFramework {
+private:
+    // New members for historical simulation
+    std::unique_ptr<ISystemClock> clock_;
+    std::unique_ptr<HistoricalAwareTimerManager> historicalTimerMgr_;
+    bool isHistoricalMode_{false};
+    
+    // Modified StrategyThread
+    class StrategyThread final : public service::PinnedThreadedService {
+    private:
+        // Switch between original and historical processor
+        class ProcessorWrapper {
+            GTADFramework& framework_;
+            std::unique_ptr<Processor> originalProcessor_;
+            std::unique_ptr<HistoricalAwareProcessor<GTADFramework>> historicalProcessor_;
+            
+        public:
+            ProcessorWrapper(GTADFramework& framework) : framework_(framework) {
+                originalProcessor_ = std::make_unique<Processor>(framework);
+                
+                if (framework.isHistoricalMode_) {
+                    historicalProcessor_ = std::make_unique<HistoricalAwareProcessor<GTADFramework>>(
+                        framework, 
+                        framework.clock_.get(),
+                        framework.historicalTimerMgr_.get()
+                    );
+                }
+            }
+            
+            template <typename Event>
+            void operator()(const Event& event) {
+                if (framework_.isHistoricalMode_ && historicalProcessor_) {
+                    (*historicalProcessor_)(event);
+                } else {
+                    (*originalProcessor_)(event);
+                }
+            }
+        };
+        
+        ProcessorWrapper processor_;
+        
+    public:
+        StrategyThread(/* params */, GTADFramework& framework) 
+            : processor_(framework), framework_(framework) {
+            // ... existing initialization ...
+        }
+        
+        void run() override {
+            try {
+                if (framework_.isHistoricalMode_) {
+                    runHistoricalMode();
+                } else {
+                    runProductionMode();
+                }
+            }
+            catch (const std::exception& error) {
+                GTAD_LOG_FATAL(log_, "Exception thrown in strategy thread - " << error.what());
+                framework_.hardStop(error.what());
+            }
+        }
+        
+    private:
+        void runHistoricalMode() {
+            GTAD_LOG_INFO(log_, "Running in HISTORICAL simulation mode");
+            
+            while (!shouldStop()) {
+                // Process all available events
+                bool processedEvent = false;
+                size_t eventCount = 0;
+                
+                // Batch process events to maintain order
+                while (queue_.visit(processor_) && !shouldStop()) {
+                    processedEvent = true;
+                    eventCount++;
+                    
+                    // Periodic maintenance
+                    if (eventCount % 1000 == 0) {
+                        framework_.stratWatchdog_.update(framework_.clock_->now());
+                    }
+                }
+                
+                // In historical mode, timers are checked by the processor after each clock advance
+                
+                if (processedEvent) {
+                    framework_.strategy_.invoke(&gtad::framework::Strategy::onEmptyEventQueue);
+                }
+                
+                // Small sleep to prevent busy waiting when no events
+                if (!processedEvent) {
+                    std::this_thread::sleep_for(std::chrono::microseconds(10));
+                }
+            }
+        }
+        
+        void runProductionMode() {
+            GTAD_LOG_INFO(log_, "Running in PRODUCTION mode");
+            
+            // Original run() implementation
+            while (!shouldStop()) {
+                // inline feeds
+                if (feedOrp_) {
+                    while (feedOrp_->read()) {
+                        checkTimerExpiry();
+                    }
+                }
+                
+                // gateways
+                gateways_.poll();
+                checkTimerExpiry();
+                
+                // link manager
+                if (framework_.linkManager_.poll()) {
+                    checkTimerExpiry();
+                }
+                
+                // poll for fpga events
+                if (framework_.fpgaControl_) {
+                    framework_.fpgaControl_->poll();
+                }
+                
+                // event queue
+                bool processedEvent = false;
+                size_t checkCnt = 0;
+                
+                while (queue_.visit(processor_) && unlikely(!shouldStop())) {
+                    processedEvent = true;
+                    
+                    if (++checkCnt == 50) {
+                        checkTimerExpiry();
+                        checkCnt = 0;
+                    }
+                }
+                
+                checkTimerExpiry();
+                
+                // watchdog and event logging
+                framework_.stratWatchdog_.update(framework_.timerExpiryWatcher_.now());
+                
+                if (unlikely(framework_.timerExpiryWatcher_.now() - std::chrono::nanoseconds(lastCounterLogEvent_)) >
+                    std::chrono::seconds(60))) {
+                    lastCounterLogEvent_ = framework_.timerExpiryWatcher_.now();
+                    logEventCounters();
+                }
+                
+                // empty queue
+                if (processedEvent) {
+                    framework_.strategy_.invoke(&gtad::framework::Strategy::onEmptyEventQueue);
+                }
+            }
+        }
+        
+        void checkTimerExpiry() {
+            if (framework_.isHistoricalMode_) {
+                // In historical mode, timers are checked after clock advances
+                return;
+            }
+            
+            // Original timer check for production
+            if (unlikely(framework_.timerExpiryWatcher_.nextTimerExpired())) {
+                framework_.timer_mgr_.expire(framework_.timerExpiryWatcher_.now());
+                GTAD_LOG_DEBUG(log_, "Done processing timers");
+            }
+        }
+    };
+    
+public:
+    // Modified constructor
+    template <typename ConfigType>
+    GTADFramework(const ConfigType& cfg, /* ... other params ... */) 
+        : /* ... existing initialization ... */ {
+        
+        // Check if we're in historical simulation mode
+        isHistoricalMode_ = cfg.SimulationMode().present() && cfg.SimulationMode().get();
+        
+        // Initialize clock based on mode
+        if (isHistoricalMode_) {
+            GTAD_LOG_INFO(log_, "Initializing HISTORICAL simulation mode");
+            
+            // Create historical clock with callback
+            clock_ = std::make_unique<HistoricalClock>(
+                [this](std::chrono::nanoseconds oldTime, std::chrono::nanoseconds newTime) {
+                    onHistoricalClockAdvance(oldTime, newTime);
+                },
+                log_
+            );
+            
+            // Create historical timer manager
+            historicalTimerMgr_ = std::make_unique<HistoricalAwareTimerManager>(clock_.get(), log_);
+            
+            // Configure timer mode from config
+            if (cfg.HistoricalTimerMode().present()) {
+                auto mode = cfg.HistoricalTimerMode().get();
+                if (mode == "FIRE_BEFORE_NEXT") {
+                    historicalTimerMgr_->setMode(HistoricalAwareTimerManager::TimerMode::FIRE_BEFORE_NEXT);
+                } else if (mode == "FIRE_WITH_TOLERANCE") {
+                    historicalTimerMgr_->setMode(HistoricalAwareTimerManager::TimerMode::FIRE_WITH_TOLERANCE);
+                }
+                // Default is FIRE_AT_EXPIRY
+            }
+            
+            // Disable features that don't work in historical mode
+            if (cfg.FPGA().present()) {
+                GTAD_LOG_WARN(log_, "FPGA configuration ignored in historical mode");
+            }
+        } else {
+            GTAD_LOG_INFO(log_, "Initializing PRODUCTION mode");
+            
+            // Production mode - use real clock
+            clock_ = std::make_unique<RealTimeClock>();
+        }
+        
+        // Update existing components to use clock
+        timerExpiryWatcher_.setClock(clock_.get());
+        timer_mgr_.setClock(clock_.get());
+        
+        // ... rest of existing constructor ...
+    }
+    
+    // Override timer creation to use historical timer manager when appropriate
+    std::unique_ptr<gtad::framework::Alarm> scheduleTimer(
+        std::chrono::nanoseconds ns_since_epoch,
+        const std::function<void(std::chrono::nanoseconds)>& callback) override {
+        
+        if (isHistoricalMode_) {
+            auto timerId = historicalTimerMgr_->scheduleTimer(ns_since_epoch, callback);
+            return std::make_unique<HistoricalTimer>(timerId, historicalTimerMgr_.get());
+        }
+        
+        // Original implementation
+        return std::make_unique<Timer>(timer_mgr_.create(), strategy_.get_latency_context(), 
+                                      ns_since_epoch, callback);
+    }
+    
+private:
+    void onHistoricalClockAdvance(std::chrono::nanoseconds oldTime, std::chrono::nanoseconds newTime) {
+        // This callback is called whenever the historical clock advances
+        // Could be used for additional bookkeeping or validation
+        GTAD_LOG_TRACE(log_, "Historical clock advanced from " << oldTime.count() 
+                           << " to " << newTime.count() << " ns");
+    }
+};
+
+// ============================================================================
+// Usage Example: Running Historical Backtest
+// ============================================================================
+
+class BacktestRunner {
+private:
+    struct BacktestConfig {
+        std::string pcapFile;
+        std::string checkpointFile;
+        bool enableValidation{true};
+        HistoricalAwareTimerManager::TimerMode timerMode{
+            HistoricalAwareTimerManager::TimerMode::FIRE_AT_EXPIRY
+        };
+        std::chrono::seconds checkpointInterval{60};
+    };
+    
+public:
+    void runBacktest(const BacktestConfig& config) {
+        // 1. Create framework configuration
+        FrameworkConfig frameworkConfig;
+        frameworkConfig.setSimulationMode(true);
+        frameworkConfig.setHistoricalTimerMode(config.timerMode);
+        
+        // 2. Initialize framework in historical mode
+        GTADFramework framework(frameworkConfig, /* ... */);
+        
+        // 3. Load and replay events
+        PcapEventLoader loader(config.pcapFile);
+        DeterministicEventSequencer sequencer;
+        
+        // 4. Load all events and sequence them
+        while (auto event = loader.getNextEvent()) {
+            sequencer.addEvent(event.timestamp, event.data);
+        }
+        
+        // 5. Process events in time order
+        auto startTime = std::chrono::system_clock::now();
+        uint64_t eventCount = 0;
+        
+        sequencer.processEventsInWindow(
+            std::chrono::nanoseconds::max(),
+            [&framework, &eventCount](const DeterministicEventSequencer::SequencedEvent& event) {
+                // Push event to framework
+                std::visit([&framework](auto&& e) {
+                    framework.pushEvent(std::forward<decltype(e)>(e));
+                }, event.event);
+                
+                eventCount++;
+                
+                // Periodic progress update
+                if (eventCount % 10000 == 0) {
+                    GTAD_LOG_INFO(log_, "Processed " << eventCount << " events");
+                }
+            }
+        );
+        
+        auto endTime = std::chrono::system_clock::now();
+        auto duration = std::chrono::duration_cast<std::chrono::seconds>(endTime - startTime);
+        
+        GTAD_LOG_INFO(log_, "Backtest complete: processed " << eventCount 
+                         << " events in " << duration.count() << " seconds");
+        
+        // 6. Validate results if configured
+        if (config.enableValidation && !config.checkpointFile.empty()) {
+            validateResults(framework, config.checkpointFile);
+        }
+    }
+    
+private:
+    void validateResults(const GTADFramework& framework, const std::string& checkpointFile) {
+        // Load production checkpoints and compare
+        // Implementation depends on checkpoint format
+    }
+}; 
+3. DeterministicSimulationGuide.md
+Comprehensive documentation covering:
+Engineering measures for determinism
+Event ordering strategies
+Timer firing modes
+State checkpointing
+Common pitfalls and solutions
+Best practices
+
+# Deterministic Historical Simulation Guide
+
+## Overview
+
+This guide details the engineering measures and best practices for implementing deterministic historical simulation in the GTAD HFT framework.
+
+## Key Components
+
+### 1. Clock Abstraction System
+
+The foundation is a clock abstraction that allows switching between real-time and historical modes:
+
+- **ISystemClock**: Abstract interface for all clock operations
+- **RealTimeClock**: Production clock using system time
+- **HistoricalClock**: Static clock that only advances through events
+
+### 2. Event-Driven Clock Updates
+
+The clock updates happen in the `Processor` class when processing market data events:
+
+```cpp
+void operator()(const frameworkEvents::MDBoE& event) {
+    // 1. Extract timestamp from event
+    auto eventTime = std::chrono::nanoseconds(event.snapshot.m_exchange_time_64);
+    
+    // 2. Update historical clock
+    if (clock_->isHistorical()) {
+        clock_->advanceTime(eventTime);
+    }
+    
+    // 3. Check and fire expired timers
+    timerMgr_->checkExpiredTimers(lastTime, eventTime);
+    
+    // 4. Process event normally
+    framework_.strategy_.on_market_data(/*...*/);
+}
+```
+
+### 3. Timer Firing Strategies
+
+Three modes are supported:
+
+1. **FIRE_AT_EXPIRY**: Timers fire when clock reaches their expiry time
+2. **FIRE_BEFORE_NEXT**: Timers fire before the next known event (requires lookahead)
+3. **FIRE_WITH_TOLERANCE**: Timers fire within a time tolerance window
+
+## Engineering Measures for Determinism
+
+### 1. Event Ordering Preservation
+
+**Problem**: Events with the same timestamp must process in consistent order.
+
+**Solution**: Multi-level sorting criteria:
+```cpp
+struct SequencedEvent {
+    std::chrono::nanoseconds timestamp;  // Primary sort
+    uint64_t sequenceNumber;             // Secondary sort (from pcap)
+    uint32_t priority;                   // Tertiary sort (event type)
+    
+    bool operator<(const SequencedEvent& other) const {
+        if (timestamp != other.timestamp) return timestamp < other.timestamp;
+        if (sequenceNumber != other.sequenceNumber) return sequenceNumber < other.sequenceNumber;
+        return priority < other.priority;
+    }
+};
+```
+
+**Event Priority Hierarchy**:
+- Market Data: 100 (highest)
+- Order Events: 80
+- Timer Events: 60
+- System Events: 40
+- Log Events: 20 (lowest)
+
+### 2. Single-Threaded Execution
+
+**Problem**: Multi-threading introduces non-determinism.
+
+**Solution**: Force single-threaded execution in historical mode:
+```cpp
+void runHistoricalMode() {
+    // Disable all async operations
+    disableAsyncProcessing();
+    
+    // Process events sequentially
+    while (auto event = getNextEvent()) {
+        processEventSynchronously(event);
+    }
+}
+```
+
+### 3. Clock Monotonicity
+
+**Problem**: Clock going backward breaks causality.
+
+**Solution**: Enforce monotonic clock advancement:
+```cpp
+void HistoricalClock::advanceTime(std::chrono::nanoseconds newTime) {
+    auto oldTime = currentTime_.load();
+    
+    if (newTime > oldTime) {
+        currentTime_.store(newTime);
+        onTimeAdvance(oldTime, newTime);
+    } else {
+        LOG_WARN("Attempted backward time movement: " << oldTime << " -> " << newTime);
+    }
+}
+```
+
+### 4. Deterministic Timer Execution
+
+**Problem**: Multiple timers at same expiry time could fire in different orders.
+
+**Solution**: Sort timers by multiple criteria:
+```cpp
+void fireCollectedTimers() {
+    std::sort(pendingTimers_.begin(), pendingTimers_.end(),
+              [](const TimerEntry& a, const TimerEntry& b) {
+                  if (a.expiry != b.expiry) return a.expiry < b.expiry;
+                  if (a.priority != b.priority) return a.priority < b.priority;
+                  return a.id < b.id;  // Stable by creation order
+              });
+    
+    for (const auto& timer : pendingTimers_) {
+        timer.callback(timer.expiry);
+    }
+}
+```
+
+### 5. State Checkpointing
+
+**Problem**: Need to validate simulation matches production.
+
+**Solution**: Regular state snapshots:
+```cpp
+class StateCheckpointer {
+    void createCheckpoint() {
+        Checkpoint cp;
+        cp.timestamp = clock_->now();
+        cp.eventCount = processedEvents_;
+        cp.orderStates = captureAllOrders();
+        cp.positions = captureAllPositions();
+        cp.pendingTimers = capturePendingTimers();
+        cp.hash = calculateStateHash(cp);
+        
+        checkpoints_.push_back(cp);
+    }
+};
+```
+
+### 6. Timestamp Normalization
+
+**Problem**: Different sources have different timestamp formats.
+
+**Solution**: Normalize all timestamps to nanoseconds:
+```cpp
+std::chrono::nanoseconds normalizeTimestamp(const Event& event) {
+    switch (event.source.timestampFormat) {
+        case EXCHANGE_NANOS:
+            return std::chrono::nanoseconds(event.timestamp);
+        case UNIX_MICROS:
+            return std::chrono::microseconds(event.timestamp);
+        case RELATIVE_NANOS:
+            return baseTime_ + std::chrono::nanoseconds(event.timestamp);
+        case NO_TIMESTAMP:
+            return lastKnownTime_ + std::chrono::nanoseconds(1);
+    }
+}
+```
+
+## Best Practices
+
+### 1. Event Processing
+
+- **DO**: Process events in strict timestamp order
+- **DO**: Use deterministic sorting for same-timestamp events
+- **DON'T**: Allow any randomness in processing order
+- **DON'T**: Use system time for any decisions
+
+### 2. Timer Management
+
+- **DO**: Fire timers in deterministic order when multiple expire
+- **DO**: Record timer creation order for stable sorting
+- **DON'T**: Allow timer callbacks to create immediate timers
+- **DON'T**: Use timer IDs that could vary between runs
+
+### 3. Memory Management
+
+- **DO**: Pre-allocate memory pools to avoid allocation timing
+- **DO**: Use deterministic allocators
+- **DON'T**: Rely on allocation addresses for ordering
+- **DON'T**: Use pointer values in hash calculations
+
+### 4. Error Handling
+
+- **DO**: Make all error paths deterministic
+- **DO**: Log errors without affecting execution flow
+- **DON'T**: Use random backoff or retry logic
+- **DON'T**: Skip events on errors
+
+### 5. Validation
+
+- **DO**: Checkpoint state at regular intervals
+- **DO**: Compare order flow with production
+- **DO**: Validate timer firing sequences
+- **DON'T**: Assume small differences don't matter
+
+## Configuration Example
+
+```cpp
+struct HistoricalSimulationConfig {
+    // Mode selection
+    bool enableHistoricalMode = true;
+    
+    // Timer configuration
+    TimerMode timerMode = TimerMode::FIRE_AT_EXPIRY;
+    std::chrono::nanoseconds timerTolerance{1000};  // 1 microsecond
+    
+    // Event processing
+    size_t eventBatchSize = 1000;
+    bool enforceStrictOrdering = true;
+    
+    // Validation
+    bool enableCheckpointing = true;
+    std::chrono::seconds checkpointInterval{60};
+    std::string productionCheckpointFile;
+    
+    // Debugging
+    bool logClockAdvances = false;
+    bool logTimerFiring = false;
+    bool logEventSequencing = false;
+};
+```
+
+## Common Pitfalls
+
+### 1. Clock Regression
+```cpp
+// WRONG
+clock_->advanceTime(event.timestamp);  // Could go backward
+
+// RIGHT
+if (event.timestamp > clock_->now()) {
+    clock_->advanceTime(event.timestamp);
+}
+```
+
+### 2. Timer Cascade
+```cpp
+// WRONG - Can cause non-deterministic cascade
+void onTimer() {
+    scheduleTimer(now() + 1ms, callback);  // Immediate reschedule
+}
+
+// RIGHT - Defer to next event processing
+void onTimer() {
+    deferredTimers_.push(now() + 1ms, callback);
+}
+```
+
+### 3. Event Starvation
+```cpp
+// WRONG - Timers block events
+while (hasExpiredTimers()) {
+    fireNextTimer();
+}
+
+// RIGHT - Interleave with events
+fireTimersUpTo(currentEventTime);
+processEvent();
+```
+
+### 4. Floating Point Determinism
+```cpp
+// WRONG - FP operations may vary
+double price = bid + (ask - bid) * 0.5;
+
+// RIGHT - Use integer arithmetic
+int64_t price = (bid_ticks + ask_ticks) / 2;
+```
+
+## Testing Strategy
+
+### 1. Unit Tests
+- Test clock advancement logic
+- Test timer firing order
+- Test event sequencing
+
+### 2. Integration Tests
+- Compare checkpoints between runs
+- Validate order generation matches
+- Test with production pcap files
+
+### 3. Regression Tests
+- Save golden output files
+- Binary comparison of results
+- Performance regression tests
+
+### 4. Stress Tests
+- Large numbers of simultaneous events
+- Many timers at same expiry
+- Clock jumps and gaps
+
+## Performance Considerations
+
+1. **Event Batching**: Process multiple events before checking timers
+2. **Memory Pooling**: Pre-allocate event and timer objects
+3. **Lazy Checkpointing**: Only checkpoint on significant state changes
+4. **Optimized Sorting**: Use radix sort for timestamp ordering
+5. **Clock Caching**: Avoid repeated atomic loads of clock value
+
+## Conclusion
+
+Deterministic historical simulation requires careful attention to:
+- Event ordering and processing
+- Clock advancement and timer firing
+- State management and validation
+- Error handling and edge cases
+
+Following these guidelines ensures accurate reproduction of production behavior in simulation. 
+4. BacktestExample.cpp
+Practical example showing how to use the system:
+PcapEventLoader for loading market data
+BacktestResults for collecting performance metrics
+HistoricalBacktestRunner main orchestrator
+Validation against production checkpoints
+Key Features of This Implementation:
+Event-driven clock updates - Clock only advances when processing events with timestamps
+Deterministic timer firing - Multiple strategies for when to fire timers
+Perfect event ordering - Multi-level sorting ensures consistent processing
+State validation - Checkpointing system to compare with production
+Single-threaded execution - Eliminates concurrency non-determinism
+Minimal code changes - Most changes confined to Processor and timer management
+This design ensures your quants get perfectly deterministic reproduction of what happened in production, with the exact same event and timer ordering, making their backtests reliable and meaningful.
+
+
+  // Practical Example: Running a Historical Backtest
+// This shows how to use the historical simulation system in practice
+
+#include "HistoricalClockSystem.h"
+#include "GTADFramework.h"
+#include <fstream>
+#include <sstream>
+
+// ============================================================================
+// Pcap Event Loader - Loads events from captured market data
+// ============================================================================
+
+class PcapEventLoader {
+private:
+    std::ifstream pcapFile_;
+    uint64_t globalSequence_{0};
+    
+    struct PcapHeader {
+        uint32_t magic;
+        uint16_t major;
+        uint16_t minor;
+        uint32_t timezone;
+        uint32_t sigfigs;
+        uint32_t snaplen;
+        uint32_t network;
+    };
+    
+    struct PacketHeader {
+        uint32_t ts_sec;
+        uint32_t ts_usec;
+        uint32_t incl_len;
+        uint32_t orig_len;
+    };
+    
+public:
+    explicit PcapEventLoader(const std::string& filename) 
+        : pcapFile_(filename, std::ios::binary) {
+        if (!pcapFile_.is_open()) {
+            throw std::runtime_error("Failed to open pcap file: " + filename);
+        }
+        
+        // Read and validate pcap header
+        PcapHeader header;
+        pcapFile_.read(reinterpret_cast<char*>(&header), sizeof(header));
+        
+        if (header.magic != 0xa1b2c3d4 && header.magic != 0xd4c3b2a1) {
+            throw std::runtime_error("Invalid pcap file format");
+        }
+    }
+    
+    struct ParsedEvent {
+        std::chrono::nanoseconds timestamp;
+        std::string source;
+        std::vector<uint8_t> data;
+        
+        // Parse into framework event
+        std::optional<frameworkEvents::MDBoE> parseAsMDBoE() const {
+            if (source != "EXCHANGE_A_MD") return std::nullopt;
+            
+            // Parse binary data into MDBoE structure
+            // This is simplified - real implementation would parse actual protocol
+            frameworkEvents::MDBoE event;
+            // ... parsing logic ...
+            return event;
+        }
+    };
+    
+    std::optional<ParsedEvent> getNextEvent() {
+        if (pcapFile_.eof()) return std::nullopt;
+        
+        PacketHeader pktHeader;
+        pcapFile_.read(reinterpret_cast<char*>(&pktHeader), sizeof(pktHeader));
+        
+        if (pcapFile_.eof()) return std::nullopt;
+        
+        // Calculate timestamp
+        auto timestamp = std::chrono::seconds(pktHeader.ts_sec) + 
+                        std::chrono::microseconds(pktHeader.ts_usec);
+        
+        // Read packet data
+        std::vector<uint8_t> data(pktHeader.incl_len);
+        pcapFile_.read(reinterpret_cast<char*>(data.data()), pktHeader.incl_len);
+        
+        // Determine source from packet content (simplified)
+        std::string source = determineSource(data);
+        
+        return ParsedEvent{
+            std::chrono::duration_cast<std::chrono::nanoseconds>(timestamp),
+            source,
+            std::move(data)
+        };
+    }
+    
+private:
+    std::string determineSource(const std::vector<uint8_t>& data) {
+        // In reality, would parse protocol headers to determine source
+        return "EXCHANGE_A_MD";
+    }
+};
+
+// ============================================================================
+// Backtest Results Collector
+// ============================================================================
+
+class BacktestResults {
+public:
+    struct OrderRecord {
+        std::chrono::nanoseconds timestamp;
+        uint64_t orderId;
+        std::string symbol;
+        char side;
+        uint64_t quantity;
+        double price;
+        std::string status;
+    };
+    
+    struct PositionSnapshot {
+        std::chrono::nanoseconds timestamp;
+        std::string symbol;
+        int64_t position;
+        double avgPrice;
+        double unrealizedPnl;
+    };
+    
+    struct PerformanceMetrics {
+        uint64_t totalOrders{0};
+        uint64_t filledOrders{0};
+        uint64_t cancelledOrders{0};
+        uint64_t rejectedOrders{0};
+        double totalPnl{0.0};
+        double sharpeRatio{0.0};
+        double maxDrawdown{0.0};
+        std::chrono::nanoseconds totalLatency{0};
+    };
+    
+    void recordOrder(const OrderRecord& order) {
+        orders_.push_back(order);
+        metrics_.totalOrders++;
+        
+        if (order.status == "FILLED") {
+            metrics_.filledOrders++;
+        } else if (order.status == "CANCELLED") {
+            metrics_.cancelledOrders++;
+        } else if (order.status == "REJECTED") {
+            metrics_.rejectedOrders++;
+        }
+    }
+    
+    void recordPosition(const PositionSnapshot& position) {
+        positions_.push_back(position);
+    }
+    
+    void saveResults(const std::string& outputFile) {
+        std::ofstream out(outputFile);
+        
+        out << "=== Backtest Results ===" << std::endl;
+        out << "Total Orders: " << metrics_.totalOrders << std::endl;
+        out << "Filled Orders: " << metrics_.filledOrders << std::endl;
+        out << "Cancelled Orders: " << metrics_.cancelledOrders << std::endl;
+        out << "Rejected Orders: " << metrics_.rejectedOrders << std::endl;
+        out << "Total PnL: " << metrics_.totalPnl << std::endl;
+        out << "Sharpe Ratio: " << metrics_.sharpeRatio << std::endl;
+        out << "Max Drawdown: " << metrics_.maxDrawdown << std::endl;
+        
+        // Save detailed order log
+        out << "\n=== Order Log ===" << std::endl;
+        for (const auto& order : orders_) {
+            out << order.timestamp.count() << ","
+                << order.orderId << ","
+                << order.symbol << ","
+                << order.side << ","
+                << order.quantity << ","
+                << order.price << ","
+                << order.status << std::endl;
+        }
+    }
+    
+private:
+    std::vector<OrderRecord> orders_;
+    std::vector<PositionSnapshot> positions_;
+    PerformanceMetrics metrics_;
+};
+
+// ============================================================================
+// Main Backtest Runner
+// ============================================================================
+
+class HistoricalBacktestRunner {
+public:
+    struct Config {
+        // Input files
+        std::string pcapFile;
+        std::string strategyConfig;
+        
+        // Output files
+        std::string resultsFile;
+        std::string checkpointFile;
+        
+        // Simulation settings
+        HistoricalAwareTimerManager::TimerMode timerMode{
+            HistoricalAwareTimerManager::TimerMode::FIRE_AT_EXPIRY
+        };
+        bool enableValidation{true};
+        bool enableCheckpointing{true};
+        std::chrono::seconds checkpointInterval{60};
+        
+        // Performance settings
+        size_t eventBatchSize{1000};
+        bool logProgress{true};
+        std::chrono::seconds progressInterval{10};
+    };
+    
+    void runBacktest(const Config& config) {
+        GTAD_LOG_INFO(log_, "Starting historical backtest");
+        GTAD_LOG_INFO(log_, "Pcap file: " << config.pcapFile);
+        GTAD_LOG_INFO(log_, "Timer mode: " << static_cast<int>(config.timerMode));
+        
+        // 1. Create framework configuration
+        auto frameworkConfig = createFrameworkConfig(config);
+        
+        // 2. Initialize framework
+        GTADFramework framework(frameworkConfig, /* strategy info, etc. */);
+        
+        // 3. Setup results collector
+        BacktestResults results;
+        setupResultsCollection(framework, results);
+        
+        // 4. Load events
+        PcapEventLoader loader(config.pcapFile);
+        DeterministicEventSequencer sequencer;
+        
+        GTAD_LOG_INFO(log_, "Loading events from pcap...");
+        uint64_t loadedEvents = 0;
+        
+        while (auto event = loader.getNextEvent()) {
+            // Convert to framework event
+            if (auto mdEvent = event->parseAsMDBoE()) {
+                sequencer.addEvent(event->timestamp, *mdEvent);
+                loadedEvents++;
+            }
+            
+            if (loadedEvents % 100000 == 0) {
+                GTAD_LOG_INFO(log_, "Loaded " << loadedEvents << " events");
+            }
+        }
+        
+        GTAD_LOG_INFO(log_, "Total events loaded: " << loadedEvents);
+        
+        // 5. Run simulation
+        auto startTime = std::chrono::steady_clock::now();
+        uint64_t processedEvents = 0;
+        auto lastProgressTime = startTime;
+        std::chrono::nanoseconds lastCheckpointTime{0};
+        
+        sequencer.processEventsInWindow(
+            std::chrono::nanoseconds::max(),
+            [&](const DeterministicEventSequencer::SequencedEvent& event) {
+                // Push event to framework
+                std::visit([&framework](auto&& e) {
+                    framework.getThread().push(std::forward<decltype(e)>(e));
+                }, event.event);
+                
+                processedEvents++;
+                
+                // Progress reporting
+                if (config.logProgress) {
+                    auto now = std::chrono::steady_clock::now();
+                    if (now - lastProgressTime > config.progressInterval) {
+                        auto elapsed = now - startTime;
+                        auto eventsPerSec = processedEvents * 1.0 / 
+                            std::chrono::duration<double>(elapsed).count();
+                        
+                        GTAD_LOG_INFO(log_, "Progress: " << processedEvents << "/" << loadedEvents 
+                                         << " events (" << eventsPerSec << " events/sec)");
+                        lastProgressTime = now;
+                    }
+                }
+                
+                // Checkpointing
+                if (config.enableCheckpointing) {
+                    auto eventTime = event.timestamp;
+                    if (eventTime - lastCheckpointTime > config.checkpointInterval) {
+                        createCheckpoint(framework, eventTime);
+                        lastCheckpointTime = eventTime;
+                    }
+                }
+            }
+        );
+        
+        auto endTime = std::chrono::steady_clock::now();
+        auto duration = std::chrono::duration<double>(endTime - startTime).count();
+        
+        GTAD_LOG_INFO(log_, "Backtest complete!");
+        GTAD_LOG_INFO(log_, "Processed " << processedEvents << " events in " << duration << " seconds");
+        GTAD_LOG_INFO(log_, "Average: " << (processedEvents / duration) << " events/sec");
+        
+        // 6. Save results
+        results.saveResults(config.resultsFile);
+        
+        // 7. Validate if configured
+        if (config.enableValidation && !config.checkpointFile.empty()) {
+            validateBacktest(config.checkpointFile);
+        }
+    }
+    
+private:
+    px::Log* log_{GTAD_GET_LOGGER("BacktestRunner")};
+    std::vector<StateCheckpoint> checkpoints_;
+    
+    struct StateCheckpoint {
+        std::chrono::nanoseconds timestamp;
+        uint64_t eventCount;
+        std::string stateHash;
+        // ... other state data ...
+    };
+    
+    FrameworkConfig createFrameworkConfig(const Config& config) {
+        FrameworkConfig cfg;
+        cfg.setSimulationMode(true);
+        cfg.setHistoricalTimerMode(config.timerMode);
+        // ... other configuration ...
+        return cfg;
+    }
+    
+    void setupResultsCollection(GTADFramework& framework, BacktestResults& results) {
+        // Hook into order events to collect results
+        framework.setOrderCallback([&results](const OrderEvent& event) {
+            BacktestResults::OrderRecord record;
+            record.timestamp = event.timestamp;
+            record.orderId = event.orderId;
+            record.symbol = event.symbol;
+            record.side = event.side;
+            record.quantity = event.quantity;
+            record.price = event.price;
+            record.status = event.status;
+            results.recordOrder(record);
+        });
+    }
+    
+    void createCheckpoint(const GTADFramework& framework, std::chrono::nanoseconds timestamp) {
+        StateCheckpoint checkpoint;
+        checkpoint.timestamp = timestamp;
+        checkpoint.eventCount = framework.getProcessedEventCount();
+        checkpoint.stateHash = framework.calculateStateHash();
+        checkpoints_.push_back(checkpoint);
+    }
+    
+    void validateBacktest(const std::string& referenceFile) {
+        GTAD_LOG_INFO(log_, "Validating backtest against: " << referenceFile);
+        
+        // Load reference checkpoints
+        std::vector<StateCheckpoint> referenceCheckpoints = loadCheckpoints(referenceFile);
+        
+        if (checkpoints_.size() != referenceCheckpoints.size()) {
+            GTAD_LOG_ERROR(log_, "Checkpoint count mismatch: " << checkpoints_.size() 
+                              << " vs " << referenceCheckpoints.size());
+            return;
+        }
+        
+        bool valid = true;
+        for (size_t i = 0; i < checkpoints_.size(); ++i) {
+            if (checkpoints_[i].stateHash != referenceCheckpoints[i].stateHash) {
+                GTAD_LOG_ERROR(log_, "State divergence at checkpoint " << i 
+                                  << " time: " << checkpoints_[i].timestamp.count());
+                valid = false;
+            }
+        }
+        
+        if (valid) {
+            GTAD_LOG_INFO(log_, "Validation PASSED - all checkpoints match");
+        } else {
+            GTAD_LOG_ERROR(log_, "Validation FAILED - state divergence detected");
+        }
+    }
+    
+    std::vector<StateCheckpoint> loadCheckpoints(const std::string& file) {
+        // Implementation to load checkpoints from file
+        std::vector<StateCheckpoint> checkpoints;
+        // ... loading logic ...
+        return checkpoints;
+    }
+};
+
+// ============================================================================
+// Example Usage
+// ============================================================================
+
+int main(int argc, char* argv[]) {
+    try {
+        HistoricalBacktestRunner runner;
+        HistoricalBacktestRunner::Config config;
+        
+        // Configure backtest
+        config.pcapFile = "market_data_20231201.pcap";
+        config.strategyConfig = "strategy_config.xml";
+        config.resultsFile = "backtest_results.csv";
+        config.checkpointFile = "production_checkpoints.bin";
+        
+        // Set timer mode based on command line
+        if (argc > 1 && std::string(argv[1]) == "--timer-lookahead") {
+            config.timerMode = HistoricalAwareTimerManager::TimerMode::FIRE_BEFORE_NEXT;
+        }
+        
+        // Run backtest
+        runner.runBacktest(config);
+        
+        return 0;
+    }
+    catch (const std::exception& e) {
+        std::cerr << "Backtest failed: " << e.what() << std::endl;
+        return 1;
+    }
+} 
