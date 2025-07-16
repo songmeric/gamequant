@@ -1,0 +1,1061 @@
+#pragma once
+
+#include <algorithm>
+#include <atomic>
+#include <cstdint>
+#include <cstring>
+#include <memory>
+#include <stdexcept>
+#ifndef NDEBUG
+#include <thread>
+#include <cassert>
+#endif
+#include <cstdlib>
+
+namespace pme {
+
+// SPSC Ring buffer
+//
+//
+
+class RingBuffer {
+private:
+    static constexpr size_t CACHE_LINE_SIZE = 64;
+    static constexpr size_t DEFAULT_SIZE = 1024 * 1024;
+    static constexpr size_t MAX_SIZE = 64 * 1024 * 1024;
+    
+    static size_t nextPowerOf2(size_t n) {
+        if (n == 0) return 1;
+        if (n > MAX_SIZE) return MAX_SIZE;
+
+        n--;
+        n |= n >> 1;
+        n |= n >> 2;
+        n |= n >> 4;
+        n |= n >> 8;
+        n |= n >> 16;
+#if SIZE_MAX > UINT32_MAX
+        n |= n >> 32;
+#endif
+        n++;
+        return n;
+    }
+
+    struct AlignedDeleter {
+        void operator()(void* p) const noexcept {
+            std::free(p);
+        }
+    };
+
+    using aligned_unique_ptr = std::unique_ptr<uint8_t, AlignedDeleter>;
+
+    alignas(CACHE_LINE_SIZE) std::atomic<size_t> write_pos_{0};
+    alignas(CACHE_LINE_SIZE) std::atomic<size_t> read_pos_{0};
+    alignas(CACHE_LINE_SIZE) std::atomic<uint64_t> bytes_written_{0};
+    alignas(CACHE_LINE_SIZE) std::atomic<uint64_t> bytes_dropped_{0};
+    
+    aligned_unique_ptr owned_buffer_;
+    uint8_t* buffer_;
+    size_t capacity_;
+    size_t mask_;
+#ifndef NDEBUG
+    std::thread::id producer_thread_{}, consumer_thread_{};
+#endif
+
+public:
+    explicit RingBuffer(size_t capacity = DEFAULT_SIZE)
+        : capacity_(nextPowerOf2(std::min(capacity, MAX_SIZE))), mask_(capacity_ - 1) {
+        void* ptr = nullptr;
+        if (posix_memalign(&ptr, CACHE_LINE_SIZE, capacity_) != 0) {
+            throw std::bad_alloc();
+        }
+        buffer_ = static_cast<uint8_t*>(ptr);
+        owned_buffer_.reset(buffer_);
+    }
+    
+    RingBuffer(uint8_t* external_buffer, size_t capacity)
+        : buffer_(external_buffer), capacity_(capacity), mask_(capacity_ - 1) {
+        const bool invalid_capacity = (capacity == 0) || (capacity > MAX_SIZE) || ((capacity & (capacity - 1)) != 0);
+        if (!buffer_ || invalid_capacity) {
+            throw std::invalid_argument("External buffer must be non-null, power-of-two sized and <= MAX_SIZE");
+        }
+        if ((reinterpret_cast<uintptr_t>(buffer_) % CACHE_LINE_SIZE) != 0) {
+            throw std::invalid_argument("External buffer must be cache-line aligned");
+        }
+    }
+    
+    RingBuffer(const RingBuffer&) = delete;
+    RingBuffer& operator=(const RingBuffer&) = delete;
+    
+    RingBuffer(RingBuffer&& other) noexcept
+        : write_pos_(other.write_pos_.load()), read_pos_(other.read_pos_.load()),
+          bytes_written_(other.bytes_written_.load()), bytes_dropped_(other.bytes_dropped_.load()),
+          owned_buffer_(std::move(other.owned_buffer_)), buffer_(other.buffer_),
+          capacity_(other.capacity_), mask_(other.mask_) {
+        other.buffer_ = nullptr;
+        other.capacity_ = 0;
+        other.mask_ = 0;
+        other.write_pos_.store(0, std::memory_order_relaxed);
+        other.read_pos_.store(0, std::memory_order_relaxed);
+        other.bytes_written_.store(0, std::memory_order_relaxed);
+        other.bytes_dropped_.store(0, std::memory_order_relaxed);
+    }
+    
+    [[nodiscard]] size_t write(const uint8_t* data, size_t len) noexcept {
+#ifndef NDEBUG
+        if (producer_thread_ == std::thread::id()) {
+            producer_thread_ = std::this_thread::get_id();
+        } else {
+            assert(producer_thread_ == std::this_thread::get_id() && "RingBuffer::write called from multiple producer threads");
+        }
+#endif
+        if (!data || len == 0) {
+            return 0;
+        }
+
+        const size_t write = write_pos_.load(std::memory_order_relaxed);
+        const size_t read  = read_pos_.load(std::memory_order_acquire);
+
+        size_t available = (read + capacity_ - write - 1) & mask_;
+        if (len > available) {
+            // Buffer is full - cannot write
+            bytes_dropped_.fetch_add(len, std::memory_order_relaxed);
+            return 0;
+        }
+
+        const size_t to_write = len;
+
+        const size_t write_idx   = write & mask_;
+        const size_t first_chunk = std::min(to_write, capacity_ - write_idx);
+        std::memcpy(buffer_ + write_idx, data, first_chunk);
+
+        if (first_chunk < to_write) {
+            std::memcpy(buffer_, data + first_chunk, to_write - first_chunk);
+        }
+
+        write_pos_.store(write + to_write, std::memory_order_release);
+        bytes_written_.fetch_add(to_write, std::memory_order_relaxed);
+
+        return to_write;
+    }
+    
+    void consume(size_t len) noexcept {
+#ifndef NDEBUG
+        if (consumer_thread_ == std::thread::id()) {
+            consumer_thread_ = std::this_thread::get_id();
+        } else {
+            assert(consumer_thread_ == std::this_thread::get_id() && "RingBuffer::consume called from multiple consumer threads");
+        }
+#endif
+        const size_t read  = read_pos_.load(std::memory_order_relaxed);
+        const size_t write = write_pos_.load(std::memory_order_acquire);
+
+        const size_t available  = write - read;
+        const size_t to_consume = std::min(len, available);
+
+        read_pos_.store(read + to_consume, std::memory_order_release);
+    }
+    
+    size_t available_data() const {
+        size_t read  = read_pos_.load(std::memory_order_acquire);
+        size_t write = write_pos_.load(std::memory_order_acquire);
+        return write - read;
+    }
+    
+    size_t available_space() const {
+        const size_t read  = read_pos_.load(std::memory_order_acquire);
+        const size_t write = write_pos_.load(std::memory_order_acquire);
+        return (read + capacity_ - write - 1) & mask_;
+    }
+    
+    void reset() noexcept {
+#ifndef NDEBUG
+        producer_thread_ = std::thread::id();
+        consumer_thread_ = std::thread::id();
+#endif
+        write_pos_.store(0, std::memory_order_release);
+        read_pos_.store(0, std::memory_order_release);
+        bytes_written_.store(0, std::memory_order_relaxed);
+        bytes_dropped_.store(0, std::memory_order_relaxed);
+    }
+    
+    uint64_t getBytesWritten() const { 
+        return bytes_written_.load(std::memory_order_relaxed); 
+    }
+    
+    uint64_t getBytesDropped() const { 
+        return bytes_dropped_.load(std::memory_order_relaxed); 
+    }
+    
+    size_t getCapacity() const { return capacity_; }
+    
+    bool empty() const noexcept {
+        return read_pos_.load(std::memory_order_acquire) ==
+               write_pos_.load(std::memory_order_acquire);
+    }
+    
+    class Reader {
+    private:
+        const uint8_t* buffer_;
+        size_t mask_;
+        size_t start_pos_;
+        size_t total_size_;
+        
+    public:
+        Reader(const uint8_t* buffer, size_t mask, size_t start_pos, size_t total_size)
+            : buffer_(buffer), mask_(mask), start_pos_(start_pos), total_size_(total_size) {}
+        
+        uint8_t operator[](size_t offset) const {
+            if (offset >= total_size_) {
+                throw std::out_of_range("Offset beyond available data");
+            }
+            return buffer_[(start_pos_ + offset) & mask_];
+        }
+        
+        void read(void* dest, size_t offset, size_t len) const {
+            if (offset + len > total_size_) {
+                throw std::out_of_range("Read beyond available data");
+            }
+            
+            uint8_t* dest_ptr = static_cast<uint8_t*>(dest);
+            size_t pos = (start_pos_ + offset) & mask_;
+            size_t buffer_size = mask_ + 1;
+            
+            size_t first_chunk = std::min(len, buffer_size - pos);
+            std::memcpy(dest_ptr, buffer_ + pos, first_chunk);
+            
+            if (first_chunk < len) {
+                std::memcpy(dest_ptr + first_chunk, buffer_, len - first_chunk);
+            }
+        }
+        
+        template<typename T>
+        T read(size_t offset) const {
+            T value;
+            read(&value, offset, sizeof(T));
+            return value;
+        }
+        
+        size_t contiguous_from(size_t offset) const {
+            if (offset >= total_size_) return 0;
+            size_t pos = (start_pos_ + offset) & mask_;
+            size_t buffer_size = mask_ + 1;
+            return std::min(buffer_size - pos, total_size_ - offset);
+        }
+        
+        size_t size() const { return total_size_; }
+        
+        const uint8_t* ptr_if_contiguous(size_t offset, size_t len) const {
+            if (offset + len > total_size_) {
+                return nullptr;
+            }
+
+            if (contiguous_from(offset) < len) {
+                return nullptr;
+            }
+
+            size_t pos = (start_pos_ + offset) & mask_;
+            return buffer_ + pos;
+        }
+    };
+    
+    Reader getReader() const noexcept {
+        const size_t read  = read_pos_.load(std::memory_order_acquire);
+        const size_t write = write_pos_.load(std::memory_order_acquire);
+        const size_t available = write - read;
+        const size_t read_idx  = read & mask_;
+        return Reader(buffer_, mask_, read_idx, available);
+    }
+
+    static_assert(sizeof(size_t) == sizeof(uintptr_t), "RingBuffer assumes size_t matches pointer width");
+    static_assert((CACHE_LINE_SIZE & (CACHE_LINE_SIZE - 1)) == 0, "CACHE_LINE_SIZE must be power of two");
+    static_assert(DEFAULT_SIZE <= MAX_SIZE, "DEFAULT_SIZE must not exceed MAX_SIZE");
+};
+
+}
+
+
+
+
+#include <gtest/gtest.h>
+#include "RingBuffer.h"
+#include <cstring>
+#include <vector>
+
+namespace pme {
+
+class RingBufferTest : public ::testing::Test {
+protected:
+    static constexpr size_t BUFFER_SIZE = 1024;
+};
+
+TEST_F(RingBufferTest, WriteAndReadWithReader) {
+    RingBuffer buffer(BUFFER_SIZE);
+    
+    const char* data = "Hello, World!";
+    size_t data_len = strlen(data);
+    
+    EXPECT_EQ(buffer.write(reinterpret_cast<const uint8_t*>(data), data_len), data_len);
+    EXPECT_EQ(buffer.available_data(), data_len);
+    
+    auto reader = buffer.getReader();
+    EXPECT_EQ(reader.size(), data_len);
+    
+    for (size_t i = 0; i < data_len; ++i) {
+        EXPECT_EQ(reader[i], static_cast<uint8_t>(data[i]));
+    }
+    
+    std::vector<uint8_t> read_data(data_len);
+    reader.read(read_data.data(), 0, data_len);
+    EXPECT_EQ(memcmp(data, read_data.data(), data_len), 0);
+    
+    buffer.consume(data_len);
+    EXPECT_EQ(buffer.available_data(), 0);
+}
+
+TEST_F(RingBufferTest, MultipleWritesAndReads) {
+    RingBuffer buffer(BUFFER_SIZE);
+    
+    const char* msg1 = "First message";
+    const char* msg2 = "Second message";
+    const char* msg3 = "Third message";
+    
+    buffer.write(reinterpret_cast<const uint8_t*>(msg1), strlen(msg1));
+    buffer.write(reinterpret_cast<const uint8_t*>(msg2), strlen(msg2));
+    buffer.write(reinterpret_cast<const uint8_t*>(msg3), strlen(msg3));
+    
+    size_t total_size = strlen(msg1) + strlen(msg2) + strlen(msg3);
+    auto reader = buffer.getReader();
+    EXPECT_EQ(reader.size(), total_size);
+    
+    std::vector<uint8_t> all_data(total_size);
+    reader.read(all_data.data(), 0, total_size);
+    
+    size_t offset = 0;
+    EXPECT_EQ(memcmp(all_data.data() + offset, msg1, strlen(msg1)), 0);
+    offset += strlen(msg1);
+    EXPECT_EQ(memcmp(all_data.data() + offset, msg2, strlen(msg2)), 0);
+    offset += strlen(msg2);
+    EXPECT_EQ(memcmp(all_data.data() + offset, msg3, strlen(msg3)), 0);
+}
+
+TEST_F(RingBufferTest, ConsumeData) {
+    RingBuffer buffer(BUFFER_SIZE);
+    
+    std::vector<uint8_t> data(100, 0xAA);
+    buffer.write(data.data(), data.size());
+    EXPECT_EQ(buffer.available_data(), 100);
+    
+    buffer.consume(50);
+    EXPECT_EQ(buffer.available_data(), 50);
+    
+    auto reader = buffer.getReader();
+    EXPECT_EQ(reader.size(), 50);
+    
+    for (size_t i = 0; i < 50; ++i) {
+        EXPECT_EQ(reader[i], 0xAA);
+    }
+}
+
+TEST_F(RingBufferTest, WrapAroundWithReader) {
+    RingBuffer buffer(64);
+    
+    std::vector<uint8_t> data1(50, 0x11);
+    buffer.write(data1.data(), data1.size());
+    
+    buffer.consume(30);
+    
+    std::vector<uint8_t> data2(40, 0x22);
+    buffer.write(data2.data(), data2.size());
+    
+    auto reader = buffer.getReader();
+    EXPECT_EQ(reader.size(), 60);
+    
+    std::vector<uint8_t> all_data(60);
+    reader.read(all_data.data(), 0, 60);
+    
+    for (int i = 0; i < 20; i++) {
+        EXPECT_EQ(all_data[i], 0x11);
+    }
+    for (int i = 20; i < 60; i++) {
+        EXPECT_EQ(all_data[i], 0x22);
+    }
+}
+
+TEST_F(RingBufferTest, ReaderTypedReads) {
+    RingBuffer buffer(BUFFER_SIZE);
+    
+    struct TestData {
+        uint16_t length;
+        uint32_t id;
+        uint8_t type;
+        uint8_t padding;
+        uint64_t timestamp;
+    } __attribute__((packed));
+    
+    TestData data = {0x1234, 0x56789ABC, 0xDE, 0x00, 0x123456789ABCDEF0};
+    buffer.write(reinterpret_cast<const uint8_t*>(&data), sizeof(data));
+    
+    auto reader = buffer.getReader();
+    EXPECT_EQ(reader.read<uint16_t>(0), 0x1234);
+    EXPECT_EQ(reader.read<uint32_t>(2), 0x56789ABC);
+    EXPECT_EQ(reader.read<uint8_t>(6), 0xDE);
+    EXPECT_EQ(reader.read<uint64_t>(8), 0x123456789ABCDEF0);
+}
+
+TEST_F(RingBufferTest, ReaderContiguousPointer) {
+    RingBuffer buffer(BUFFER_SIZE);
+    
+    const char* data = "Test data for contiguous access";
+    buffer.write(reinterpret_cast<const uint8_t*>(data), strlen(data));
+    
+    auto reader = buffer.getReader();
+    
+    const uint8_t* ptr = reader.ptr_if_contiguous(0, strlen(data));
+    EXPECT_NE(ptr, nullptr);
+    EXPECT_EQ(memcmp(ptr, data, strlen(data)), 0);
+    
+    ptr = reader.ptr_if_contiguous(5, 10);
+    EXPECT_NE(ptr, nullptr);
+    EXPECT_EQ(memcmp(ptr, data + 5, 10), 0);
+}
+
+TEST_F(RingBufferTest, ReaderWrapAroundPointer) {
+    RingBuffer buffer(64);
+    
+    std::vector<uint8_t> data1(50, 0xAA);
+    buffer.write(data1.data(), data1.size());
+    buffer.consume(45);
+    
+    std::vector<uint8_t> data2(20, 0xBB);
+    buffer.write(data2.data(), data2.size());
+    
+    auto reader = buffer.getReader();
+    EXPECT_EQ(reader.size(), 25);
+    
+    const uint8_t* ptr = reader.ptr_if_contiguous(0, 5);
+    EXPECT_NE(ptr, nullptr);
+    
+    ptr = reader.ptr_if_contiguous(0, 25);
+    EXPECT_EQ(ptr, nullptr);
+    
+    std::vector<uint8_t> wrapped_data(25);
+    reader.read(wrapped_data.data(), 0, wrapped_data.size());
+    
+    for (int i = 0; i < 5; i++) {
+        EXPECT_EQ(wrapped_data[i], 0xAA);
+    }
+    for (int i = 5; i < wrapped_data.size(); i++) {
+        EXPECT_EQ(wrapped_data[i], 0xBB);
+    }
+}
+
+TEST_F(RingBufferTest, BadInputCases) {
+    RingBuffer buffer(128);
+    
+    EXPECT_EQ(buffer.write(nullptr, 10), 0);
+    
+    uint8_t dummy;
+    EXPECT_EQ(buffer.write(&dummy, 0), 0);
+    
+    buffer.write(&dummy, 1);
+    EXPECT_EQ(buffer.available_data(), 1);
+    buffer.consume(100);
+    EXPECT_EQ(buffer.available_data(), 0);
+    
+    auto reader = buffer.getReader();
+    EXPECT_EQ(reader.size(), 0);
+    
+    EXPECT_THROW(reader[0], std::out_of_range);
+    EXPECT_THROW(reader.read<uint8_t>(0), std::out_of_range);
+}
+
+TEST_F(RingBufferTest, ReaderBoundsChecking) {
+    RingBuffer buffer(128);
+    
+    std::vector<uint8_t> data(10, 0xCC);
+    buffer.write(data.data(), data.size());
+    
+    auto reader = buffer.getReader();
+    
+    EXPECT_NO_THROW(reader[9]);
+    
+    EXPECT_THROW(reader[10], std::out_of_range);
+    EXPECT_THROW(reader.read<uint32_t>(7), std::out_of_range);
+    
+    EXPECT_EQ(reader.ptr_if_contiguous(0, 11), nullptr);
+    EXPECT_EQ(reader.ptr_if_contiguous(5, 10), nullptr);
+}
+
+TEST_F(RingBufferTest, ExternalBufferAlignmentAndCapacityValidation) {
+    alignas(64) uint8_t raw[128];
+    EXPECT_NO_THROW({ RingBuffer buf(raw, 128); });
+
+    uint8_t misaligned[130];
+    EXPECT_THROW({ RingBuffer buf(misaligned + 1, 128); }, std::invalid_argument);
+
+    EXPECT_THROW({ RingBuffer buf(raw, 0); }, std::invalid_argument);
+}
+
+TEST_F(RingBufferTest, RepeatedWrapAround) {
+    constexpr size_t CAPACITY = 128;
+    constexpr size_t ITERATIONS = 5000;
+
+    RingBuffer buffer(CAPACITY);
+
+    std::vector<uint8_t> block(CAPACITY - 1, 0x5A);
+
+    uint64_t total_written = 0;
+
+    for (size_t i = 0; i < ITERATIONS; ++i) {
+        ASSERT_EQ(buffer.write(block.data(), block.size()), block.size());
+        total_written += block.size();
+        buffer.consume(block.size());
+        ASSERT_EQ(buffer.available_data(), 0u);
+    }
+
+    EXPECT_EQ(buffer.getBytesWritten(), total_written);
+    EXPECT_EQ(buffer.getBytesDropped(), 0u);
+}
+
+} 
+
+
+
+
+
+
+
+config.cpp
+ if (auto other_configs = root["other_configs"]; other_configs) {
+            const auto& other = other_configs;
+            if (other["debug_mode"]) {
+                config.debug_mode = other["debug_mode"].as<bool>();
+            }
+            if (other["dropcopy_path"]) {
+                config.dropcopy_path = other["dropcopy_path"].as<std::string>();
+            }
+            if (other["oldest_spcast_date"]) {
+                config.oldest_spcast_date = parseDateToHighResolutionClock(other["oldest_spcast_date"].as<std::string>());
+            }
+            if (other["ringbuffer_size"]) {
+                config.ringbuffer_size = other["ringbuffer_size"].as<size_t>();
+            }
+        }
+
+config.h
+struct AppConfig {
+    std::vector<FlowSet> flow_sets;
+    std::string dropcopy_path;
+    bool debug_mode = false;
+    size_t ringbuffer_size = 1024 * 1024;  // Default 1MB
+
+    ringbuffer_size: 1048576  # Ring buffer size in bytes (default: 1MB)
+
+
+  packetprocessor.cpp
+
+  #include "PacketProcessor.h"
+#include "Log.h"
+#include <PcapFileDevice.h>
+#include <SystemUtils.h>
+#include <Packet.h>
+#include <IPv4Layer.h>
+#include <TcpLayer.h>
+#include <UdpLayer.h>
+#include <chrono>
+#include <algorithm>
+#include "FlowClassifier.h"
+#include "IProtocolHandler.h"
+#include "DropcopyHandler.h"
+
+#ifndef PME_CLEANUP_PACKET_INTERVAL
+constexpr int CLEANUP_PACKET_INTERVAL = 2000;
+#endif
+
+namespace pme {
+
+px::Log* PacketProcessor::getLogger() {
+    static px::Log* logger = PME_GET_LOGGER("PacketProcessor");
+    return logger;
+}
+
+PacketProcessor::PacketProcessor(std::shared_ptr<RuntimeContext> ctx,
+                                const AppConfig& config)
+    : log_(getLogger()),
+      tcp_reassembly_(
+          onTcpMessageReadyCallback,
+          this,
+          onTcpConnectionStartCallback,
+          onTcpConnectionEndCallback
+      ),
+      ctx_(ctx),
+      config_(config),
+      flow_classifier_(config),
+      dc_(config_.dropcopy_path),
+      dcMapRef_(dc_.getMapRef())
+{}
+
+PacketProcessor::~PacketProcessor() {
+}
+
+IProtocolHandler* PacketProcessor::getOrCreateHandler(const Flow* flow) {
+    if (!flow) return nullptr;
+
+    auto& handler = flow_handlers_[flow];
+    if (!handler) {
+        handler = createProtocolHandler(flow->protocol.message, config_, dcMapRef_);
+    }
+    return handler.get();
+}
+
+// TCP Connection lifecycle callbacks
+void PacketProcessor::onTcpConnectionStartCallback(const pcpp::ConnectionData& connectionData, void* userCookie) {
+    PacketProcessor* self = static_cast<PacketProcessor*>(userCookie);
+    if (!self) return;
+
+    uint32_t flow_id = connectionData.flowKey;
+
+    // Create new ring buffer for this connection with configured size
+    self->flow_buffers_.emplace(flow_id, self->config_.ringbuffer_size);
+}
+
+void PacketProcessor::onTcpConnectionEndCallback(const pcpp::ConnectionData& connectionData,
+                                                pcpp::TcpReassembly::ConnectionEndReason reason,
+                                                void* userCookie) {
+    PacketProcessor* self = static_cast<PacketProcessor*>(userCookie);
+    if (!self) return;
+
+    uint32_t flow_id = connectionData.flowKey;
+    // Remove the buffer
+    self->flow_buffers_.erase(flow_id);
+}
+
+
+void PacketProcessor::onTcpMessageReadyCallback(int8_t side, const pcpp::TcpStreamData& tcpData, void* userCookie) {
+    PacketProcessor* self = static_cast<PacketProcessor*>(userCookie);
+    if (!self) {
+        PME_LOG_ERROR(PME_GET_LOGGER("PacketProcessor"), "TCP MessageReady callback: userCookie is null.");
+        return;
+    }
+
+    uint32_t flow_id = tcpData.getConnectionData().flowKey;
+
+    self->processTcpFlowData(flow_id, tcpData);
+}
+
+void PacketProcessor::processTcpFlowData(uint32_t flow_id, const pcpp::TcpStreamData& tcpData) {
+    auto it = flow_buffers_.find(flow_id);
+    if (it == flow_buffers_.end()) {
+        // Buffer doesn't exist, create it with configured size
+        auto [new_it, inserted] = flow_buffers_.emplace(flow_id, config_.ringbuffer_size);
+        it = new_it;
+    }
+    
+    RingBuffer& buffer = it->second;
+
+    // Write new data to ring buffer
+    const uint8_t* new_data = tcpData.getData();
+    size_t new_len = tcpData.getDataLength();
+
+    if (new_data && new_len > 0) {
+        size_t written = buffer.write(new_data, new_len);
+        if (written < new_len) {
+            PME_LOG_ERROR(log_, "Fatal: Ring buffer full for flow " << flow_id 
+                          << " - could only write " << written 
+                          << " of " << new_len << " bytes. Terminating program.");
+            std::exit(1);
+        }
+    }
+
+    const Flow* flow = flow_classifier_.classify(tcpData.getConnectionData());
+    if (!flow) {
+        return;
+    }
+
+    IProtocolHandler* handler = getOrCreateHandler(flow);
+    if (!handler) {
+        PME_LOG_ERROR(log_, "Failed to create handler for flow protocol: "
+                      << messageProtocolToString(flow->protocol.message));
+        return;
+    }
+
+    while (buffer.available_data() > 0) {
+        auto reader = buffer.getReader();
+        if (reader.size() == 0) {
+            break;
+        }
+
+        size_t message_len = handler->getTcpMessageLength(reader);
+        if (message_len == 0 || message_len > reader.size()) {
+            break;
+        }
+
+        const uint8_t* contiguous_ptr = reader.ptr_if_contiguous(0, message_len);
+        
+        if (contiguous_ptr) {
+            processMessages(handler, contiguous_ptr, message_len,
+                           tcpData.getTimeStampPrecise(),
+                           flow->direction, flow);
+            
+            buffer.consume(message_len);
+        } else {
+            std::vector<uint8_t> temp_buffer(message_len);
+            reader.read(temp_buffer.data(), 0, message_len);
+            
+            processMessages(handler, temp_buffer.data(), message_len,
+                           tcpData.getTimeStampPrecise(),
+                           flow->direction, flow);
+            
+            buffer.consume(message_len);
+        }
+    }
+}
+
+void PacketProcessor::processMessages(IProtocolHandler* handler,
+                                     const uint8_t* data,
+                                     size_t data_size,
+                                     const std::chrono::time_point<std::chrono::high_resolution_clock> timestamp,
+                                     FlowDirection direction,
+                                     const Flow* flow) {
+    if (!handler || !data || data_size == 0) {
+        PME_LOG_ERROR(log_, "processMessages called with invalid parameters: handler="
+                          << (handler ? "ok" : "null") << ", data=" << static_cast<const void*>(data)
+                          << ", size=" << data_size);
+        return;
+    }
+
+    std::vector<ParsedMessage> messages = handler->getMessages(flow, data, data_size, timestamp);
+    if(messages.empty()) {
+        PME_LOG_DEBUG(log_, "No messages parsed from " << handler->getProtocolName()
+                      << " data of size " << data_size);
+        return;
+    }
+
+    for (const auto& msg : messages) {
+        if (direction == FlowDirection::INGRESS) {
+            ingressMap_.insert_or_assign(msg.join_key, msg.info);
+        } else {
+            auto it = ingressMap_.find(msg.join_key);
+            if (it != ingressMap_.end()) {
+                auto ingress_msg = it->second;
+                auto egress_msg = msg.info;
+                
+                // Validate timestamps - ingress should be before egress
+                auto ingress_time = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    ingress_msg.getTimeStamp().time_since_epoch()).count();
+                auto egress_time = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    egress_msg.getTimeStamp().time_since_epoch()).count();
+                
+                if (ingress_time >= egress_time) {
+                    PME_LOG_WARN(log_, "Skipping message pair with invalid timestamps - "
+                                 << "ingress time (" << ingress_time 
+                                 << ") >= egress time (" << egress_time 
+                                 << ") for key " << msg.join_key 
+                                 << ". This is likely a switch timestamp edge case.");
+                    ingressMap_.erase(it);
+                    continue;
+                }
+                
+                auto flow_set_name = flow->parent_set;
+                JoinedMsgs joined(ingress_msg, egress_msg, flow_set_name);
+                results_[flow->parent_set].push_back(joined);
+                ingressMap_.erase(it);
+            } else {
+                PME_LOG_ERROR(log_, "Egress message with key " << msg.join_key
+                             << " has no matching ingress packet");
+            }
+        }
+    }
+}
+
+size_t PacketProcessor::cleanupExpiredIngressPackets() {
+    auto now = std::chrono::high_resolution_clock::now();
+    auto now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        now.time_since_epoch()).count();
+
+    size_t removed = 0;
+    for (auto it = ingressMap_.begin(); it != ingressMap_.end();) {
+        if (now_ns - std::chrono::duration_cast<std::chrono::nanoseconds>(
+                it->second.getTimeStamp().time_since_epoch()).count() > INGRESS_PACKET_TIMEOUT_NS) {
+            it = ingressMap_.erase(it);
+            removed++;
+        } else {
+            ++it;
+        }
+    }
+
+    if (removed > 0) {
+        PME_LOG_INFO(log_, "Cleaned up " << removed << " expired ingress packets");
+    }
+
+    return removed;
+}
+
+void PacketProcessor::handlePacket(pcpp::Packet& packet, const Flow* flow) {
+    if (!flow) {
+        return;
+    }
+
+    if (packet.isPacketOfType(pcpp::UDP)) {
+        pcpp::UdpLayer* udpLayer = packet.getLayerOfType<pcpp::UdpLayer>();
+        if (!udpLayer) {
+            PME_LOG_ERROR(log_, "handlePacket called on UDP packet without UDP layer");
+            return;
+        }
+
+        uint8_t* payload = udpLayer->getLayerPayload();
+        size_t payloadSize = udpLayer->getLayerPayloadSize();
+
+        if (payloadSize == 0) {
+            return;
+        }
+
+        IProtocolHandler* handler = getOrCreateHandler(flow);
+        if (!handler) {
+            PME_LOG_ERROR(log_, "Failed to create handler for flow protocol: "
+                          << messageProtocolToString(flow->protocol.message));
+            return;
+        }
+
+        processMessages(handler, payload, payloadSize,
+                       timespecToTimePoint(packet.getRawPacket()->getPacketTimeStamp()),
+                       flow->direction, flow);
+
+    } else if (packet.isPacketOfType(pcpp::TCP)) {
+        pcpp::TcpLayer* tcpLayer = packet.getLayerOfType<pcpp::TcpLayer>();
+        pcpp::IPv4Layer* ipv4Layer = packet.getLayerOfType<pcpp::IPv4Layer>();
+
+        if (tcpLayer && ipv4Layer) {
+            tcp_reassembly_.reassemblePacket(packet);
+        }
+    }
+}
+
+PacketProcessor::BufferStats PacketProcessor::getBufferStats() const {
+    BufferStats stats;
+
+    for (const auto& [flow_id, buffer] : flow_buffers_) {
+        stats.total_bytes_written += buffer.getBytesWritten();
+        stats.total_bytes_dropped += buffer.getBytesDropped();
+        stats.total_buffer_capacity += buffer.getCapacity();
+    }
+
+    stats.active_flows = flow_buffers_.size();
+
+    return stats;
+}
+
+std::unordered_map<std::string, std::vector<JoinedMsgs>> PacketProcessor::processFile(const std::string& filePath) {
+    ingressMap_.clear();
+    results_.clear();
+
+    dcMapRef_ = dc_.refreshDcMap();
+    PME_LOG_INFO(log_, "Starting to process file: " << filePath);
+
+    std::unique_ptr<pcpp::IFileReaderDevice> reader(pcpp::IFileReaderDevice::getReader(filePath));
+    if (!reader || !reader->open()) {
+        PME_LOG_ERROR(log_, "Cannot open PCAP file: " << filePath);
+        return {};
+    }
+
+    tcp_reassembly_.closeAllConnections();
+    flow_buffers_.clear();
+
+    pcpp::RawPacket rawPacket;
+    int packetCount = 0;
+    int ingressCount = 0;
+    int egressCount = 0;
+    int ignoredCount = 0;
+
+    while (reader->getNextPacket(rawPacket)) {
+        if (ctx_->stop.load()) {
+            break;
+        }
+
+        packetCount++;
+        pcpp::Packet parsedPacket(&rawPacket);
+
+        const Flow* flow = flow_classifier_.classify(parsedPacket);
+
+        if (!flow) {
+            ignoredCount++;
+            continue;
+        }
+
+        if (flow->direction == FlowDirection::INGRESS) {
+            ingressCount++;
+        } else {
+            egressCount++;
+        }
+
+        handlePacket(parsedPacket, flow);
+
+        if (packetCount % CLEANUP_PACKET_INTERVAL == 0) {
+            cleanupExpiredIngressPackets();
+        }
+    }
+
+    tcp_reassembly_.closeAllConnections();
+    flow_buffers_.clear();
+
+    BufferStats buffer_stats = getBufferStats();
+
+    PME_LOG_INFO(log_, "Processed " << filePath
+                 << " - Total: " << packetCount
+                 << ", Ingress: " << ingressCount
+                 << ", Egress: " << egressCount
+                 << ", Ignored: " << ignoredCount);
+
+    if (buffer_stats.total_bytes_dropped > 0) {
+        PME_LOG_WARN(log_, "Buffer Statistics - Active flows: " << buffer_stats.active_flows
+                     << ", Total capacity: " << buffer_stats.total_buffer_capacity
+                     << " bytes, Dropped: " << buffer_stats.total_bytes_dropped << " bytes");
+    }
+
+    reader->close();
+
+    if (!ingressMap_.empty()) {
+        PME_LOG_WARN(log_, "File processing complete with " << ingressMap_.size()
+                     << " unmatched ingress packets");
+    }
+
+    return results_;
+}
+
+}
+
+packetprocessor.h
+
+#pragma once
+
+#include <array>
+#include <atomic>
+#include <cassert>
+#include <chrono>
+#include <condition_variable>
+#include <cstdint>
+#include <cstring>
+#include <deque>
+#include <memory>
+#include <mutex>
+#include <string>
+#include <unordered_map>
+#include <utility>
+#include <vector>
+
+#include <boost/functional/hash.hpp>
+#include <Packet.h>
+#include <PcapFileDevice.h>
+#include <TcpReassembly.h>
+
+#include "Config.h"
+#include "DropcopyHandler.h"
+#include "FlowClassifier.h"
+#include "IProtocolHandler.h"
+#include "Log.h"
+#include "RingBuffer.h"
+#include "RuntimeContext.h"
+#include "Types.h"
+
+namespace pme {
+
+static constexpr long long INGRESS_PACKET_TIMEOUT_NS = 5'000'000'000;
+
+struct JoinedMsgs {
+    JoinedMsgs(ParsedMsgInfo ingress, ParsedMsgInfo egress, std::string& setname): ingress_msg(ingress), egress_msg(egress), flow_set_name(setname) {}
+    ParsedMsgInfo ingress_msg;
+    ParsedMsgInfo egress_msg;
+    std::string flow_set_name;
+};
+
+class PacketProcessor {
+public:
+    PacketProcessor(std::shared_ptr<RuntimeContext> ctx,
+                   const AppConfig& config);
+    ~PacketProcessor();
+
+    std::unordered_map<std::string, std::vector<JoinedMsgs>> processFile(const std::string& filePath);
+
+
+    struct BufferStats {
+        uint64_t total_bytes_written = 0;
+        uint64_t total_bytes_dropped = 0;
+        size_t active_flows = 0;
+        size_t total_buffer_capacity = 0;
+    };
+
+    BufferStats getBufferStats() const;
+
+    size_t cleanupExpiredIngressPackets();
+
+private:
+    static void onTcpMessageReadyCallback(int8_t side, const pcpp::TcpStreamData& tcpData, void* userCookie);
+    static void onTcpConnectionStartCallback(const pcpp::ConnectionData& connectionData, void* userCookie);
+    static void onTcpConnectionEndCallback(const pcpp::ConnectionData& connectionData,
+                                          pcpp::TcpReassembly::ConnectionEndReason reason, void* userCookie);
+
+    static std::chrono::time_point<std::chrono::high_resolution_clock> timespecToTimePoint(const timespec& in) {
+        auto duration = std::chrono::duration_cast<std::chrono::high_resolution_clock::duration>(
+            std::chrono::seconds(in.tv_sec) + std::chrono::nanoseconds(in.tv_nsec));
+        return std::chrono::time_point<std::chrono::high_resolution_clock>(duration);
+    }
+
+    void processTcpFlowData(uint32_t flow_id, const pcpp::TcpStreamData& tcpData);
+    void handlePacket(pcpp::Packet& packet, const Flow* flow);
+
+    IProtocolHandler* getOrCreateHandler(const Flow* flow);
+
+    void processRemainingBufferData(uint32_t flow_id, const pcpp::ConnectionData& connectionData);
+
+    px::Log* log_;
+    pcpp::TcpReassembly tcp_reassembly_;
+    std::unordered_map<uint32_t, RingBuffer> flow_buffers_;
+
+    std::shared_ptr<RuntimeContext> ctx_;
+    AppConfig config_;
+
+    std::unordered_map<uint64_t, ParsedMsgInfo> ingressMap_;
+    std::unordered_map<const Flow*, std::unique_ptr<IProtocolHandler>> flow_handlers_;
+    std::unordered_map<std::string, std::vector<JoinedMsgs>> results_;
+
+    FlowClassifier flow_classifier_;
+    DropcopyHandler dc_;
+    std::unordered_map<uint64_t, LatencyStats>& dcMapRef_;
+
+    void processMessages(IProtocolHandler* handler,
+                        const uint8_t* data,
+                        size_t data_size,
+                        const std::chrono::time_point<std::chrono::high_resolution_clock> timestamp,
+                        FlowDirection direction,
+                        const Flow* flow);
+
+    static px::Log* getLogger();
+};
+
+}
+
+
+  I've successfully implemented all the requested changes:
+1. Removed grow functionality from RingBuffer
+Removed the grow() method and all related code
+Removed stale_ buffer management
+Simplified the write() method to return 0 when buffer is full (no growing)
+Removed the AutoGrow test case
+2. Made RingBuffer size configurable
+Added ringbuffer_size field to AppConfig struct with default value of 1MB
+Updated Config.cpp to parse ringbuffer_size from YAML config
+Added example configuration to config_example.yaml
+Updated PacketProcessor to use the configured buffer size instead of hardcoded DEFAULT_BUFFER_SIZE
+3. Fatal termination on buffer full
+Modified PacketProcessor::processTcpFlowData() to terminate the program when the buffer is full
+Changed from throwing an exception to calling std::exit(1) after logging a fatal error message
+4. Added timestamp validation for ingress/egress pairs
+Added validation in processMessages() to check that ingress timestamp < egress timestamp
+If timestamps are invalid (ingress >= egress), logs a warning about the switch timestamp edge case
+Skips the invalid pair and continues processing
+The changes ensure that:
+The program will terminate immediately if a ring buffer fills up
+Invalid timestamp pairs (likely due to switch timestamp edge cases) are detected and skipped with appropriate warnings
+Buffer sizes can be configured per deployment via the YAML config file
+Would you like me to make any additional changes or run any tests to verify the implementation?
