@@ -1,0 +1,4069 @@
+# Performance Testing Framework - Comprehensive Documentation
+
+## Table of Contents
+1. [Overview](#overview)
+2. [Architecture Deep Dive](#architecture-deep-dive)
+3. [Installation & Setup](#installation--setup)
+4. [Core Components](#core-components)
+5. [Test Case Development](#test-case-development)
+6. [Configuration Reference](#configuration-reference)
+7. [API Documentation](#api-documentation)
+8. [Usage Examples](#usage-examples)
+9. [CI/CD Integration Guide](#cicd-integration-guide)
+10. [Performance Tuning](#performance-tuning)
+11. [Troubleshooting Guide](#troubleshooting-guide)
+12. [Migration from ez_test.py](#migration-from-ez_testpy)
+13. [Best Practices](#best-practices)
+14. [Advanced Topics](#advanced-topics)
+15. [FAQ](#frequently-asked-questions)
+
+---
+
+## Overview
+
+The Performance Testing Framework is a sophisticated, production-ready testing solution built on top of the GTF (Global Trading Framework) simulation libraries. It transforms ad-hoc performance testing into a structured, repeatable, and CI/CD-integrated process.
+
+### Key Features
+
+- **True Parallelism**: Market data generation and order response handling operate in separate threads, eliminating blocking operations
+- **Structured Test Cases**: Inheritance-based test case model with clear lifecycle management
+- **CI/CD Ready**: JSON reporting, proper exit codes, timeout management, and automation-friendly design
+- **Extensible Architecture**: Easy to add custom test cases, metrics, and validation logic
+- **Production-Grade**: Resource management, error handling, and comprehensive logging
+
+### Why This Framework?
+
+Traditional testing approaches often suffer from:
+- Sequential operations causing artificial bottlenecks
+- Lack of structure leading to unmaintainable test code
+- No standardized reporting for trend analysis
+- Difficulty integrating with CI/CD pipelines
+
+This framework addresses all these issues with a professional, scalable solution.
+
+---
+
+## Architecture Deep Dive
+
+### System Architecture
+
+```
+┌───────────────────────────────────────────────────────────────┐
+│                    Performance Test Framework                  │
+├───────────────────────────────────────────────────────────────┤
+│                         Test Runner                            │
+│  ┌─────────────┐  ┌──────────────┐  ┌───────────────┐       │
+│  │ Test Suite  │  │   Metrics    │  │   Reporting   │       │
+│  │ Management  │  │  Collection  │  │    Engine     │       │
+│  └─────────────┘  └──────────────┘  └───────────────┘       │
+├───────────────────────────────────────────────────────────────┤
+│                      Test Case Layer                           │
+│  ┌─────────────────────────────────────────────────────┐     │
+│  │              Abstract TestCase Base Class            │     │
+│  ├─────────────────────────────────────────────────────┤     │
+│  │ setup() | run() | validate() | teardown() | metrics │     │
+│  └─────────────────────────────────────────────────────┘     │
+│                              ↑                                 │
+│  ┌──────────────┬───────────┴────────┬────────────────┐     │
+│  │ QuoteChange  │ LatencyMeasurement │ MarketDataStress│     │
+│  │   TestCase   │     TestCase       │    TestCase     │     │
+│  └──────────────┴────────────────────┴────────────────┘     │
+├───────────────────────────────────────────────────────────────┤
+│                    Parallel Components                         │
+│  ┌─────────────────────┐        ┌───────────────────────┐   │
+│  │  MarketDataGenerator │        │  OrderResponseHandler │   │
+│  │  ┌───────────────┐  │        │  ┌─────────────────┐ │   │
+│  │  │ Thread Pool   │  │        │  │  Response Thread │ │   │
+│  │  │ ┌───┐ ┌───┐  │  │        │  │  ┌─────────────┐ │ │   │
+│  │  │ │T1 │ │T2 │  │  │        │  │  │ auto_respond │ │ │   │
+│  │  │ └───┘ └───┘  │  │        │  │  └─────────────┘ │ │   │
+│  │  └───────────────┘  │        │  └─────────────────┘ │   │
+│  └─────────────────────┘        └───────────────────────┘   │
+├───────────────────────────────────────────────────────────────┤
+│                    GTF Integration Layer                       │
+│  ┌──────────────┐  ┌──────────────┐  ┌─────────────────┐   │
+│  │ perf_test_lib │  │GTF Simulators│  │  GTF Libraries  │   │
+│  │   Utilities   │  │   (Wrapped)  │  │   (Original)    │   │
+│  └──────────────┘  └──────────────┘  └─────────────────┘   │
+└───────────────────────────────────────────────────────────────┘
+```
+
+### Component Interactions
+
+```mermaid
+sequenceDiagram
+    participant Runner as Test Runner
+    participant TC as Test Case
+    participant MDG as Market Data Generator
+    participant ORH as Order Response Handler
+    participant GTF as GTF Simulators
+    
+    Runner->>TC: Initialize Test Case
+    TC->>GTF: Setup Simulators
+    TC->>MDG: Create MD Generator
+    TC->>ORH: Create Response Handler
+    
+    Runner->>TC: Execute run()
+    TC->>MDG: start()
+    TC->>ORH: start()
+    
+    par Market Data Generation
+        loop Continuous
+            MDG->>GTF: send_quote()
+        end
+    and Order Response Handling
+        loop Continuous
+            ORH->>GTF: auto_respond_new_order()
+        end
+    end
+    
+    TC->>MDG: stop()
+    TC->>ORH: stop()
+    Runner->>TC: validate()
+    Runner->>TC: teardown()
+```
+
+### Threading Model
+
+The framework uses Python's threading module for true parallelism:
+
+```python
+# Market Data Generator runs in separate thread
+market_data_thread = threading.Thread(target=self._generate_data)
+
+# Order Response Handler runs in another thread  
+response_thread = threading.Thread(target=self._handle_responses)
+
+# Main thread coordinates and collects metrics
+```
+
+This design ensures:
+- Market data flows continuously without interruption
+- Order responses are processed immediately
+- No blocking between market data and order handling
+- Metrics collection doesn't interfere with test execution
+
+---
+
+## Installation & Setup
+
+### Prerequisites
+
+1. **Python 3.8+** with threading support
+2. **GTF Libraries** properly installed
+3. **Network Access** for simulator connections
+4. **System Resources**:
+   - Minimum 4GB RAM
+   - 2+ CPU cores recommended
+   - SSD for log storage
+
+### Installation Steps
+
+```bash
+# 1. Clone the repository
+git clone <your-repo-url>
+cd performance-testing-framework
+
+# 2. Create virtual environment
+python -m venv venv
+source venv/bin/activate  # On Windows: venv\Scripts\activate
+
+# 3. Install dependencies
+pip install -r requirements.txt
+
+# 4. Set environment variables
+export GTAD_PROJECT_ROOT=/path/to/gtad/root
+export PERF_TEST_CONFIG=/path/to/config.json
+export PERF_TEST_OUTPUT=/path/to/output/dir
+
+# 5. Verify installation
+python -c "from perf_test_lib import *; print('Setup successful')"
+```
+
+### Configuration Files
+
+Create necessary configuration files:
+
+```bash
+# Create output directories
+mkdir -p /tmp/perf_test_results
+mkdir -p /apps/sb_afts
+
+# Create default configuration
+cp config/perf_test_config.example.json perf_test_config.json
+
+# Edit configuration
+vim perf_test_config.json
+```
+
+---
+
+## Core Components
+
+### 1. TestCase Base Class (`perf_test_framework.py`)
+
+The abstract base class that all test cases must inherit from:
+
+```python
+class TestCase(abc.ABC):
+    """Abstract base class for all test cases"""
+    
+    def __init__(self, name: str, gtad_config: GtadConfig, instruments: List[Any]):
+        self.name = name
+        self.gtad_config = gtad_config
+        self.instruments = instruments
+        self.metrics = TestMetrics(start_time=time.time())
+        self.running = False
+```
+
+#### Lifecycle Methods
+
+**setup()** - Initialize resources
+```python
+def setup(self):
+    """Called once before test execution
+    
+    Responsibilities:
+    - Initialize GTF simulators
+    - Establish connections
+    - Load test data
+    - Configure logging
+    
+    Raises:
+        SetupError: If initialization fails
+    """
+```
+
+**run()** - Execute test logic
+```python
+def run(self):
+    """Main test execution
+    
+    Responsibilities:
+    - Execute test scenario
+    - Collect metrics
+    - Handle test-specific logic
+    
+    Note: Should not handle cleanup
+    """
+```
+
+**validate()** - Verify results
+```python
+def validate(self) -> bool:
+    """Validate test outcomes
+    
+    Returns:
+        bool: True if test passed, False otherwise
+        
+    Example validations:
+    - Latency thresholds
+    - Order fill rates
+    - Error counts
+    """
+```
+
+**teardown()** - Clean up resources
+```python
+def teardown(self):
+    """Always called, even if test fails
+    
+    Responsibilities:
+    - Close connections
+    - Stop simulators
+    - Save logs
+    - Release resources
+    """
+```
+
+### 2. MarketDataGenerator
+
+Handles high-frequency market data generation in a separate thread:
+
+```python
+class MarketDataGenerator:
+    def __init__(self, simulators: Dict[str, Any], instruments: List[Any]):
+        self.simulators = simulators
+        self.instruments = instruments
+        self.running = False
+        self.thread = None
+        self.quote_queue = queue.Queue()
+        self.seq_nums = {name: 1 for name in simulators.keys()}
+```
+
+#### Key Features
+
+- **Queue-based Pattern System**: Add quote patterns to queue for sequential processing
+- **Thread-safe Operations**: All queue operations are thread-safe
+- **Sequence Number Management**: Automatic sequence number tracking per simulator
+- **Non-blocking Design**: Main thread can add patterns without waiting
+
+#### Usage Example
+
+```python
+# Create generator
+md_gen = MarketDataGenerator(simulators, instruments)
+
+# Start generation thread
+md_gen.start()
+
+# Add quote patterns
+for i in range(100):
+    quote = {
+        'instrument': instruments[0],
+        'bid_price': 100.0 + i * 0.01,
+        'bid_qty': 100,
+        'ask_price': 100.5 + i * 0.01,
+        'ask_qty': 100
+    }
+    md_gen.add_quote_pattern(quote)
+
+# Stop when done
+md_gen.stop()
+```
+
+### 3. OrderResponseHandler
+
+Manages order response processing in parallel:
+
+```python
+class OrderResponseHandler:
+    def __init__(self, raze_simulator):
+        self.raze = raze_simulator
+        self.running = False
+        self.thread = None
+        self.response_delay = 0.001  # 1ms default
+```
+
+#### Configurable Response Delays
+
+```python
+# Set different response delays for different scenarios
+handler.set_response_delay(0.5)   # 500 microseconds for low latency
+handler.set_response_delay(5.0)   # 5ms for normal conditions
+handler.set_response_delay(50.0)  # 50ms for stress testing
+```
+
+### 4. TestMetrics Dataclass
+
+Standardized metrics collection:
+
+```python
+@dataclass
+class TestMetrics:
+    start_time: float
+    end_time: float = 0
+    orders_sent: int = 0
+    orders_filled: int = 0
+    quotes_sent: int = 0
+    latencies: List[float] = None
+    
+    def calculate_statistics(self):
+        """Calculate performance statistics"""
+        if self.latencies:
+            return {
+                'mean': np.mean(self.latencies),
+                'median': np.median(self.latencies),
+                'p95': np.percentile(self.latencies, 95),
+                'p99': np.percentile(self.latencies, 99),
+                'max': np.max(self.latencies)
+            }
+```
+
+---
+
+## Test Case Development
+
+### Creating a Custom Test Case
+
+#### Step 1: Define Your Test Case Class
+
+```python
+from perf_test_framework import TestCase
+import time
+import random
+
+class CustomScenarioTestCase(TestCase):
+    """Test case for custom trading scenario"""
+    
+    def __init__(self, name: str, gtad_config: GtadConfig, 
+                 instruments: List[Any], test_duration: int = 60,
+                 order_rate: int = 10):
+        super().__init__(name, gtad_config, instruments)
+        self.test_duration = test_duration
+        self.order_rate = order_rate
+        self.custom_metric = []  # Track custom metrics
+```
+
+#### Step 2: Implement Setup
+
+```python
+def setup(self):
+    """Initialize test resources"""
+    print(f"[{self.name}] Setting up custom scenario test...")
+    
+    # Define routing IDs for your destinations
+    routing_ids = {
+        ascii_routing_id_to_integer("0000"): "ROUTING_ID_0",
+        ascii_routing_id_to_integer("0001"): "ROUTING_ID_1",
+    }
+    
+    try:
+        # Initialize simulators
+        self.raze = initialize_raze(self.gtad_config, routing_ids)
+        self.md_simulators = create_md_simulators(self.gtad_config)
+        self.gtad = create_gtad(self.gtad_config)
+        self.lmx = initialize_lmx(self.gtad_config, [self.gtad], 
+                                 self.instruments)
+        
+        # Start market data simulators
+        for name, sim in self.md_simulators.items():
+            sim.start()
+            print(f"Started {name} simulator")
+            
+        # Create parallel components
+        self.md_generator = MarketDataGenerator(self.md_simulators, 
+                                              self.instruments)
+        self.order_handler = OrderResponseHandler(self.raze)
+        
+        # Configure order generation on market data
+        send_order_on_md(self.lmx, "nyse_pillar", "SPCAST_L3_V4", 
+                        delay_ms=100)
+        
+    except Exception as e:
+        print(f"Setup failed: {e}")
+        raise
+```
+
+#### Step 3: Implement Run Logic
+
+```python
+def run(self):
+    """Execute the custom test scenario"""
+    print(f"[{self.name}] Starting custom scenario...")
+    
+    # Start parallel components
+    self.md_generator.start()
+    self.order_handler.start()
+    
+    # Test execution
+    start_time = time.time()
+    order_interval = 1.0 / self.order_rate
+    order_id = 1
+    
+    while (time.time() - start_time) < self.test_duration:
+        # Generate market data pattern
+        for instrument in self.instruments:
+            # Create realistic quote
+            mid_price = 100.0 + random.gauss(0, 0.5)
+            spread = random.uniform(0.01, 0.05)
+            
+            quote = {
+                'instrument': instrument,
+                'bid_price': mid_price - spread/2,
+                'bid_qty': random.randint(100, 1000),
+                'ask_price': mid_price + spread/2,
+                'ask_qty': random.randint(100, 1000)
+            }
+            
+            self.md_generator.add_quote_pattern(quote)
+            self.metrics.quotes_sent += 1
+        
+        # Track custom metric
+        self.custom_metric.append({
+            'timestamp': time.time(),
+            'spread': spread,
+            'mid_price': mid_price
+        })
+        
+        # Send order periodically
+        if order_id % self.order_rate == 0:
+            self._send_test_order(order_id)
+            order_id += 1
+            
+        time.sleep(order_interval)
+    
+    # Stop components
+    self.md_generator.stop()
+    self.order_handler.stop()
+    
+def _send_test_order(self, order_id: int):
+    """Helper method to send test orders"""
+    instrument = random.choice(self.instruments)
+    side = random.choice([Side.BUY, Side.SELL])
+    
+    order = Order(
+        instrument,
+        side,
+        Price=99.9 if side == Side.BUY else 100.1,
+        TimeInForce=gtf.fix.TimeInForce.Day,
+        OrderQty=random.randint(100, 500),
+        Destination="nyse_pillar",
+        OrderType=gtf.fix.OrderType.Limit,
+    )
+    order.ClOrdID = order_id
+    
+    self.lmx.send_message(f"create_order,{order_id},...")
+    self.metrics.orders_sent += 1
+```
+
+#### Step 4: Implement Validation
+
+```python
+def validate(self) -> bool:
+    """Validate custom test criteria"""
+    print(f"[{self.name}] Validating results...")
+    
+    # Calculate success criteria
+    quote_rate = self.metrics.quotes_sent / self.test_duration
+    order_rate = self.metrics.orders_sent / self.test_duration
+    
+    # Custom metric analysis
+    spreads = [m['spread'] for m in self.custom_metric]
+    avg_spread = sum(spreads) / len(spreads) if spreads else 0
+    
+    print(f"Performance Summary:")
+    print(f"  - Quote Rate: {quote_rate:.2f} quotes/sec")
+    print(f"  - Order Rate: {order_rate:.2f} orders/sec")
+    print(f"  - Average Spread: ${avg_spread:.4f}")
+    
+    # Define pass criteria
+    passed = True
+    if quote_rate < self.order_rate * len(self.instruments) * 0.9:
+        print(f"  ❌ Quote rate below threshold")
+        passed = False
+    
+    if order_rate < self.order_rate * 0.9:
+        print(f"  ❌ Order rate below threshold")
+        passed = False
+        
+    if avg_spread > 0.10:  # 10 cent spread threshold
+        print(f"  ❌ Average spread too wide")
+        passed = False
+        
+    return passed
+```
+
+#### Step 5: Implement Teardown
+
+```python
+def teardown(self):
+    """Clean up all resources"""
+    print(f"[{self.name}] Cleaning up...")
+    
+    # Save custom metrics
+    self._save_custom_metrics()
+    
+    # Close connections in reverse order
+    resources = [
+        ('LMX', self.lmx),
+        ('Raze', self.raze),
+        ('GTAD', self.gtad)
+    ]
+    
+    for name, resource in resources:
+        if hasattr(self, name.lower()) and resource:
+            try:
+                if hasattr(resource, 'close'):
+                    resource.close()
+                elif hasattr(resource, 'stop'):
+                    resource.stop()
+                print(f"  - {name} stopped")
+            except Exception as e:
+                print(f"  - Error stopping {name}: {e}")
+    
+    # Stop market data simulators
+    if hasattr(self, 'md_simulators'):
+        for name, sim in self.md_simulators.items():
+            try:
+                sim.stop()
+                print(f"  - {name} simulator stopped")
+            except Exception as e:
+                print(f"  - Error stopping {name}: {e}")
+                
+def _save_custom_metrics(self):
+    """Save custom metrics to file"""
+    import json
+    metrics_file = f"/tmp/{self.name}_custom_metrics.json"
+    with open(metrics_file, 'w') as f:
+        json.dump(self.custom_metric, f, indent=2)
+    print(f"  - Custom metrics saved to {metrics_file}")
+```
+
+### Test Case Best Practices
+
+#### 1. Resource Management
+```python
+class WellManagedTestCase(TestCase):
+    def setup(self):
+        self.resources = []  # Track all resources
+        
+        try:
+            resource = self._create_resource()
+            self.resources.append(resource)
+        except Exception as e:
+            self._emergency_cleanup()
+            raise
+            
+    def _emergency_cleanup(self):
+        """Clean up partially initialized resources"""
+        for resource in reversed(self.resources):
+            try:
+                resource.close()
+            except:
+                pass
+```
+
+#### 2. Error Handling
+```python
+def run(self):
+    try:
+        self._run_test_logic()
+    except KeyboardInterrupt:
+        print("Test interrupted by user")
+        raise
+    except Exception as e:
+        print(f"Test error: {e}")
+        self.metrics.errors = str(e)
+        # Don't raise - let teardown run
+```
+
+#### 3. Metric Collection
+```python
+def run(self):
+    # Use context managers for timing
+    with self._time_operation("market_data_setup"):
+        self._setup_market_data()
+        
+    # Track detailed metrics
+    self.metrics.custom_timings = {}
+    
+def _time_operation(self, operation_name):
+    """Context manager for timing operations"""
+    from contextlib import contextmanager
+    
+    @contextmanager
+    def timer():
+        start = time.time()
+        yield
+        duration = time.time() - start
+        self.metrics.custom_timings[operation_name] = duration
+        
+    return timer()
+```
+
+---
+
+## Configuration Reference
+
+### Main Configuration File Structure
+
+```json
+{
+    "output_dir": "/tmp/perf_test_results",
+    "log_level": "INFO",
+    "gtad_config": {
+        "strategy_name": "gts_lts_test",
+        "strategy_leg": "main",
+        "strategy_id": 555,
+        "fund": "paper",
+        "output_dir": "/apps/sb_afts/",
+        "gtad_hostname": "localhost",
+        "gtad_port": 9000
+    },
+    "network": {
+        "multicast_interface": "eth0",
+        "multicast_ttl": 1,
+        "tcp_nodelay": true,
+        "socket_buffer_size": 65536
+    },
+    "instruments": [
+        {
+            "symbol": "AAPL.OQ",
+            "name": "AAPL",
+            "spec_id": 426030,
+            "security_id": 1093160,
+            "type": "EQUITY",
+            "exchange": "NASDAQ"
+        }
+    ],
+    "destinations": {
+        "nyse_pillar": {
+            "routing_id": "0000",
+            "account": "TEST001",
+            "max_order_rate": 100,
+            "enabled": true
+        }
+    },
+    "test_suites": {
+        "quick": {
+            "tests": ["rapid_quote_test", "order_burst_small"],
+            "timeout": 60,
+            "parallel": false
+        },
+        "standard": {
+            "tests": ["rapid_quote_test", "latency_test", "order_burst_test"],
+            "timeout": 300,
+            "parallel": false
+        },
+        "comprehensive": {
+            "tests": ["all"],
+            "timeout": 600,
+            "parallel": true
+        }
+    },
+    "performance": {
+        "thread_pool_size": 4,
+        "queue_size": 10000,
+        "batch_size": 100
+    },
+    "monitoring": {
+        "metrics_interval": 1,
+        "health_check_port": 8080,
+        "prometheus_enabled": false
+    }
+}
+```
+
+### Environment Variables
+
+```bash
+# Required
+export GTAD_PROJECT_ROOT=/path/to/gtad/root
+export PERF_TEST_CONFIG=/path/to/config.json
+
+# Optional
+export PERF_TEST_OUTPUT=/custom/output/dir
+export PERF_TEST_LOG_LEVEL=DEBUG
+export PERF_TEST_DEBUG=1
+export GTF_LOG_LEVEL=INFO
+
+# Performance tuning
+export PERF_TEST_THREADS=8
+export PERF_TEST_QUEUE_SIZE=50000
+
+# Network configuration
+export PERF_TEST_MULTICAST_IF=eth1
+export PERF_TEST_TCP_NODELAY=1
+```
+
+### Test-Specific Configuration
+
+Each test case can have its own configuration section:
+
+```json
+{
+    "test_configs": {
+        "latency_measurement": {
+            "order_rate_per_second": 10,
+            "duration_seconds": 60,
+            "latency_threshold_ms": 10,
+            "percentiles": [50, 90, 95, 99, 99.9]
+        },
+        "market_data_stress": {
+            "quotes_per_second": 1000,
+            "duration_seconds": 30,
+            "thread_count": 4,
+            "batch_processing": true
+        },
+        "order_burst": {
+            "burst_size": 100,
+            "num_bursts": 10,
+            "burst_interval_seconds": 5,
+            "validate_fill_rate": true
+        }
+    }
+}
+```
+
+---
+
+## API Documentation
+
+### Core Classes
+
+#### TestCase
+
+```python
+class TestCase(abc.ABC):
+    """Abstract base class for performance test cases
+    
+    Attributes:
+        name (str): Unique test case name
+        gtad_config (GtadConfig): GTad configuration object
+        instruments (List[Instrument]): List of trading instruments
+        metrics (TestMetrics): Metrics collection object
+        running (bool): Test execution state
+    
+    Abstract Methods:
+        setup(): Initialize test resources
+        run(): Execute test logic
+        validate() -> bool: Validate test results
+        teardown(): Clean up resources
+    """
+    
+    def get_metrics(self) -> TestMetrics:
+        """Get collected metrics with calculated statistics
+        
+        Returns:
+            TestMetrics: Object containing all test metrics
+        """
+```
+
+#### MarketDataGenerator
+
+```python
+class MarketDataGenerator:
+    """Generates market data quotes in a separate thread
+    
+    Args:
+        simulators (Dict[str, Any]): Market data simulators
+        instruments (List[Instrument]): Trading instruments
+        
+    Methods:
+        start(): Start generation thread
+        stop(): Stop generation thread
+        add_quote_pattern(pattern: Dict): Add quote to queue
+        set_batch_size(size: int): Set batch processing size
+        get_stats() -> Dict: Get generation statistics
+    """
+    
+    def add_quote_pattern(self, pattern: Dict[str, Any]):
+        """Add a quote pattern to the generation queue
+        
+        Args:
+            pattern (Dict): Quote pattern with keys:
+                - instrument (Instrument): Target instrument
+                - bid_price (float): Bid price
+                - bid_qty (int): Bid quantity
+                - ask_price (float): Ask price
+                - ask_qty (int): Ask quantity
+                - timestamp (float, optional): Quote timestamp
+        """
+```
+
+#### OrderResponseHandler
+
+```python
+class OrderResponseHandler:
+    """Handles order responses in a separate thread
+    
+    Args:
+        raze_simulator: Raze/Race simulator instance
+        
+    Methods:
+        start(): Start response handler thread
+        stop(): Stop response handler thread
+        set_response_delay(delay_ms: float): Set response delay
+        set_fill_probability(prob: float): Set fill probability
+        get_response_stats() -> Dict: Get response statistics
+    """
+    
+    def set_response_delay(self, delay_ms: float):
+        """Set order response delay
+        
+        Args:
+            delay_ms (float): Delay in milliseconds
+            
+        Example:
+            handler.set_response_delay(0.5)  # 500 microseconds
+        """
+```
+
+#### TestMetrics
+
+```python
+@dataclass
+class TestMetrics:
+    """Container for test metrics
+    
+    Attributes:
+        start_time (float): Test start timestamp
+        end_time (float): Test end timestamp
+        orders_sent (int): Number of orders sent
+        orders_filled (int): Number of orders filled
+        quotes_sent (int): Number of quotes sent
+        latencies (List[float]): Order-to-fill latencies in ms
+        custom_metrics (Dict): Custom test metrics
+    """
+    
+    def add_latency(self, latency_ms: float):
+        """Add a latency measurement"""
+        
+    def calculate_statistics(self) -> Dict:
+        """Calculate latency statistics"""
+        
+    def get_fill_rate(self) -> float:
+        """Calculate order fill rate"""
+```
+
+### Helper Functions
+
+#### Market Data Helpers
+
+```python
+def create_realistic_quote(instrument: Instrument, 
+                          base_price: float = 100.0,
+                          volatility: float = 0.01) -> Dict:
+    """Create a realistic market quote
+    
+    Args:
+        instrument: Trading instrument
+        base_price: Base price for quote
+        volatility: Price volatility factor
+        
+    Returns:
+        Dict: Quote pattern for MarketDataGenerator
+    """
+
+def create_quote_ladder(instrument: Instrument,
+                       levels: int = 5,
+                       base_price: float = 100.0,
+                       spread: float = 0.01) -> List[Dict]:
+    """Create a multi-level order book
+    
+    Args:
+        instrument: Trading instrument
+        levels: Number of price levels
+        base_price: Mid price
+        spread: Spread between levels
+        
+    Returns:
+        List[Dict]: List of quotes representing order book
+    """
+```
+
+#### Order Helpers
+
+```python
+def create_test_order(instrument: Instrument,
+                     side: Side,
+                     order_type: OrderType = OrderType.Limit,
+                     **kwargs) -> Order:
+    """Create a test order with defaults
+    
+    Args:
+        instrument: Trading instrument
+        side: Buy or Sell
+        order_type: Order type
+        **kwargs: Additional order parameters
+        
+    Returns:
+        Order: Configured order object
+    """
+
+def create_order_batch(instruments: List[Instrument],
+                      count: int,
+                      side_ratio: float = 0.5) -> List[Order]:
+    """Create a batch of test orders
+    
+    Args:
+        instruments: List of instruments
+        count: Number of orders to create
+        side_ratio: Ratio of buy orders (0.0-1.0)
+        
+    Returns:
+        List[Order]: List of test orders
+    """
+```
+
+---
+
+## Usage Examples
+
+### Example 1: Basic Test Execution
+
+```python
+# basic_test.py
+from perf_test_framework import PerformanceTestRunner
+from perf_test_cases import QuoteChangeTestCase
+from perf_test_lib import GtadConfig
+from gtf.security_context.instrument import Instrument
+
+# Configure test
+gtad_config = GtadConfig(
+    strategy_name="basic_test",
+    strategy_leg="main",
+    strategy_id=100,
+    fund="test",
+    output_dir="/tmp/test_output/"
+)
+
+# Define instruments
+instruments = [
+    Instrument("AAPL.OQ", "AAPL", 426030, 1093160, "splitstripid", "ric")
+]
+
+# Create test case
+test_case = QuoteChangeTestCase(
+    name="basic_quote_test",
+    gtad_config=gtad_config,
+    instruments=instruments,
+    quote_patterns=[
+        {
+            'instrument': instruments[0],
+            'bid_price': 150.00,
+            'bid_qty': 100,
+            'ask_price': 150.05,
+            'ask_qty': 100
+        }
+    ],
+    duration_seconds=30
+)
+
+# Run test
+runner = PerformanceTestRunner()
+runner.add_test_case(test_case)
+runner.run_all()
+```
+
+### Example 2: Advanced Multi-Instrument Test
+
+```python
+# advanced_test.py
+from perf_test_framework import PerformanceTestRunner
+from perf_test_cases import MultiInstrumentTestCase
+import json
+
+# Load configuration
+with open('config/prod_config.json') as f:
+    config = json.load(f)
+
+# Create instruments from config
+instruments = []
+for inst_config in config['instruments']:
+    instrument = Instrument(
+        inst_config['symbol'],
+        inst_config['name'],
+        inst_config['spec_id'],
+        inst_config['security_id'],
+        "splitstripid",
+        "ric"
+    )
+    instruments.append(instrument)
+
+# Create test with custom parameters
+test_case = MultiInstrumentTestCase(
+    name="prod_multi_instrument",
+    gtad_config=create_gtad_config_from_dict(config['gtad_config']),
+    instruments=instruments,
+    orders_per_instrument_per_second=20,
+    duration_seconds=300
+)
+
+# Add custom validation
+original_validate = test_case.validate
+
+def enhanced_validate():
+    base_result = original_validate()
+    
+    # Add custom validation logic
+    if test_case.metrics.orders_sent < 1000:
+        print("Warning: Low order count")
+        return False
+        
+    return base_result
+
+test_case.validate = enhanced_validate
+
+# Run with custom runner
+runner = PerformanceTestRunner(output_dir=config['output_dir'])
+runner.add_test_case(test_case)
+runner.run_all()
+```
+
+### Example 3: Custom Test Suite
+
+```python
+# custom_suite.py
+from perf_test_framework import PerformanceTestRunner
+from perf_test_cases import *
+
+def create_regression_suite():
+    """Create a regression test suite"""
+    
+    # Base configuration
+    base_config = load_base_config()
+    instruments = load_instruments()
+    
+    # Create test cases with varying parameters
+    test_cases = []
+    
+    # Test 1: Baseline performance
+    test_cases.append(
+        LatencyMeasurementTestCase(
+            name="baseline_latency",
+            gtad_config=base_config,
+            instruments=instruments[:1],  # Single instrument
+            order_rate_per_second=10,
+            duration_seconds=60
+        )
+    )
+    
+    # Test 2: Increased load
+    test_cases.append(
+        LatencyMeasurementTestCase(
+            name="high_load_latency",
+            gtad_config=base_config,
+            instruments=instruments[:1],
+            order_rate_per_second=100,
+            duration_seconds=60
+        )
+    )
+    
+    # Test 3: Multi-instrument stress
+    test_cases.append(
+        MultiInstrumentTestCase(
+            name="multi_instrument_stress",
+            gtad_config=base_config,
+            instruments=instruments[:5],  # Five instruments
+            orders_per_instrument_per_second=20,
+            duration_seconds=120
+        )
+    )
+    
+    # Test 4: Market data saturation
+    test_cases.append(
+        MarketDataStressTestCase(
+            name="market_data_saturation",
+            gtad_config=base_config,
+            instruments=instruments[:3],
+            quotes_per_second=5000,
+            duration_seconds=30
+        )
+    )
+    
+    return test_cases
+
+# Execute suite
+if __name__ == "__main__":
+    runner = PerformanceTestRunner()
+    
+    for test_case in create_regression_suite():
+        runner.add_test_case(test_case)
+        
+    # Run with detailed reporting
+    runner.run_all(parallel=False)
+    
+    # Generate comparison report
+    generate_comparison_report(runner.results)
+```
+
+### Example 4: Continuous Performance Monitoring
+
+```python
+# continuous_monitoring.py
+import schedule
+import time
+from datetime import datetime
+
+class ContinuousPerformanceMonitor:
+    def __init__(self, test_config):
+        self.test_config = test_config
+        self.results_history = []
+        
+    def run_performance_check(self):
+        """Run performance check and alert on degradation"""
+        
+        # Create test case
+        test_case = LatencyMeasurementTestCase(
+            name=f"continuous_check_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
+            gtad_config=self.test_config['gtad_config'],
+            instruments=self.test_config['instruments'],
+            order_rate_per_second=50,
+            duration_seconds=60
+        )
+        
+        # Run test
+        runner = PerformanceTestRunner()
+        runner.add_test_case(test_case)
+        runner.run_all()
+        
+        # Analyze results
+        metrics = test_case.get_metrics()
+        stats = metrics.calculate_statistics()
+        
+        # Store results
+        self.results_history.append({
+            'timestamp': datetime.now(),
+            'metrics': stats
+        })
+        
+        # Check for degradation
+        self._check_performance_degradation(stats)
+        
+    def _check_performance_degradation(self, current_stats):
+        """Check if performance has degraded"""
+        
+        if len(self.results_history) < 2:
+            return
+            
+        # Compare with historical average
+        historical_p99 = [
+            r['metrics']['p99'] 
+            for r in self.results_history[-10:-1]
+            if 'p99' in r['metrics']
+        ]
+        
+        if historical_p99:
+            avg_historical_p99 = sum(historical_p99) / len(historical_p99)
+            current_p99 = current_stats['p99']
+            
+            # Alert if degradation > 20%
+            if current_p99 > avg_historical_p99 * 1.2:
+                self._send_alert(
+                    f"Performance degradation detected! "
+                    f"Current P99: {current_p99:.2f}ms, "
+                    f"Historical avg: {avg_historical_p99:.2f}ms"
+                )
+                
+    def _send_alert(self, message):
+        """Send performance alert"""
+        print(f"ALERT: {message}")
+        # Add email/Slack/PagerDuty integration here
+
+# Set up continuous monitoring
+monitor = ContinuousPerformanceMonitor(load_config())
+
+# Schedule checks every 30 minutes
+schedule.every(30).minutes.do(monitor.run_performance_check)
+
+# Run continuously
+while True:
+    schedule.run_pending()
+    time.sleep(1)
+```
+
+---
+
+## CI/CD Integration Guide
+
+### GitHub Actions Integration
+
+```yaml
+# .github/workflows/performance-tests.yml
+name: Performance Tests
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+  schedule:
+    # Run nightly at 2 AM
+    - cron: '0 2 * * *'
+
+jobs:
+  performance-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    
+    strategy:
+      matrix:
+        test-suite: [quick, standard]
+        
+    steps:
+    - uses: actions/checkout@v3
+    
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.9'
+        
+    - name: Cache dependencies
+      uses: actions/cache@v3
+      with:
+        path: ~/.cache/pip
+        key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
+        
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+        
+    - name: Set up test environment
+      run: |
+        mkdir -p /tmp/perf_test_results
+        echo "${{ secrets.PERF_TEST_CONFIG }}" > perf_test_config.json
+        
+    - name: Run performance tests
+      env:
+        GTAD_PROJECT_ROOT: ${{ secrets.GTAD_PROJECT_ROOT }}
+        PERF_TEST_CONFIG: ./perf_test_config.json
+      run: |
+        python run_perf_tests_cicd.py \
+          --suite ${{ matrix.test-suite }} \
+          --timeout 1200 \
+          --output-dir ./test-results
+          
+    - name: Upload test results
+      if: always()
+      uses: actions/upload-artifact@v3
+      with:
+        name: perf-test-results-${{ matrix.test-suite }}
+        path: ./test-results/
+        
+    - name: Publish test report
+      if: always()
+      uses: dorny/test-reporter@v1
+      with:
+        name: Performance Test Report - ${{ matrix.test-suite }}
+        path: ./test-results/test_summary_*.json
+        reporter: java-junit
+        
+    - name: Comment PR with results
+      if: github.event_name == 'pull_request'
+      uses: actions/github-script@v6
+      with:
+        script: |
+          const fs = require('fs');
+          const results = JSON.parse(
+            fs.readFileSync('./test-results/test_summary_*.json')
+          );
+          
+          const comment = `## Performance Test Results
+          
+          Suite: ${{ matrix.test-suite }}
+          Status: ${results.failed > 0 ? '❌ Failed' : '✅ Passed'}
+          
+          | Metric | Value |
+          |--------|-------|
+          | Total Tests | ${results.total_tests} |
+          | Passed | ${results.passed} |
+          | Failed | ${results.failed} |
+          | Success Rate | ${results.success_rate.toFixed(1)}% |
+          
+          [View detailed results](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})`;
+          
+          github.rest.issues.createComment({
+            issue_number: context.issue.number,
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            body: comment
+          });
+```
+
+### Jenkins Integration
+
+```groovy
+// Jenkinsfile
+pipeline {
+    agent any
+    
+    environment {
+        GTAD_PROJECT_ROOT = credentials('gtad-project-root')
+        PERF_TEST_CONFIG = 'jenkins-config.json'
+    }
+    
+    parameters {
+        choice(
+            name: 'TEST_SUITE',
+            choices: ['quick', 'standard', 'comprehensive'],
+            description: 'Test suite to run'
+        )
+        string(
+            name: 'TIMEOUT',
+            defaultValue: '1800',
+            description: 'Test timeout in seconds'
+        )
+    }
+    
+    stages {
+        stage('Setup') {
+            steps {
+                sh '''
+                    python -m venv venv
+                    . venv/bin/activate
+                    pip install -r requirements.txt
+                    mkdir -p test-results
+                '''
+            }
+        }
+        
+        stage('Configure') {
+            steps {
+                writeFile file: 'jenkins-config.json', text: """
+                {
+                    "output_dir": "${WORKSPACE}/test-results",
+                    "gtad_config": {
+                        "strategy_name": "jenkins_test",
+                        "strategy_leg": "main",
+                        "strategy_id": 999,
+                        "fund": "test"
+                    }
+                }
+                """
+            }
+        }
+        
+        stage('Run Tests') {
+            steps {
+                sh '''
+                    . venv/bin/activate
+                    python run_perf_tests_cicd.py \
+                        --suite ${TEST_SUITE} \
+                        --timeout ${TIMEOUT} \
+                        --config jenkins-config.json
+                '''
+            }
+        }
+        
+        stage('Archive Results') {
+            steps {
+                archiveArtifacts artifacts: 'test-results/**/*'
+                
+                publishHTML([
+                    allowMissing: false,
+                    alwaysLinkToLastBuild: true,
+                    keepAll: true,
+                    reportDir: 'test-results',
+                    reportFiles: 'test_summary_*.json',
+                    reportName: 'Performance Test Report'
+                ])
+            }
+        }
+        
+        stage('Performance Trending') {
+            steps {
+                plot csvFileName: 'plot-perf-trend.csv',
+                     group: 'Performance',
+                     title: 'Latency Trend',
+                     yaxis: 'Latency (ms)',
+                     csvSeries: [[
+                         file: 'test-results/latency_trend.csv',
+                         exclusionValues: '',
+                         displayTableFlag: false,
+                         inclusionFlag: 'OFF',
+                         url: ''
+                     ]]
+            }
+        }
+    }
+    
+    post {
+        always {
+            cleanWs()
+        }
+        failure {
+            emailext (
+                subject: "Performance Test Failed: ${env.JOB_NAME} - ${env.BUILD_NUMBER}",
+                body: '''Build failed. Check console output at:
+                         ${BUILD_URL}console
+                         
+                         Test Suite: ${TEST_SUITE}
+                         ''',
+                to: 'team@example.com'
+            )
+        }
+    }
+}
+```
+
+### GitLab CI Integration
+
+```yaml
+# .gitlab-ci.yml
+stages:
+  - test
+  - report
+
+variables:
+  PIP_CACHE_DIR: "$CI_PROJECT_DIR/.cache/pip"
+
+cache:
+  paths:
+    - .cache/pip
+    - venv/
+
+before_script:
+  - python -m venv venv
+  - source venv/bin/activate
+  - pip install -r requirements.txt
+
+performance-test-quick:
+  stage: test
+  script:
+    - mkdir -p test-results
+    - |
+      python run_perf_tests_cicd.py \
+        --suite quick \
+        --timeout 600 \
+        --output-dir test-results
+  artifacts:
+    when: always
+    paths:
+      - test-results/
+    reports:
+      junit: test-results/test_summary_*.xml
+    expire_in: 1 week
+  only:
+    - merge_requests
+    - main
+
+performance-test-nightly:
+  stage: test
+  script:
+    - |
+      python run_perf_tests_cicd.py \
+        --suite comprehensive \
+        --timeout 3600 \
+        --output-dir test-results
+  artifacts:
+    paths:
+      - test-results/
+    expire_in: 1 month
+  only:
+    - schedules
+
+performance-report:
+  stage: report
+  dependencies:
+    - performance-test-quick
+  script:
+    - python scripts/generate_performance_report.py
+  artifacts:
+    paths:
+      - performance-report.html
+    expose_as: 'Performance Report'
+  only:
+    - merge_requests
+```
+
+---
+
+## Performance Tuning
+
+### System-Level Optimizations
+
+#### 1. CPU Affinity
+```python
+import os
+import psutil
+
+def set_cpu_affinity(cpu_cores: List[int]):
+    """Pin process to specific CPU cores"""
+    p = psutil.Process(os.getpid())
+    p.cpu_affinity(cpu_cores)
+    print(f"Process pinned to cores: {cpu_cores}")
+
+# Pin to cores 2-5 for isolation
+set_cpu_affinity([2, 3, 4, 5])
+```
+
+#### 2. Process Priority
+```python
+def set_high_priority():
+    """Set process to high priority"""
+    if os.name == 'nt':  # Windows
+        import win32api
+        import win32process
+        win32process.SetPriorityClass(
+            win32api.GetCurrentProcess(),
+            win32process.HIGH_PRIORITY_CLASS
+        )
+    else:  # Linux/Unix
+        os.nice(-10)  # Requires privileges
+```
+
+#### 3. Memory Pre-allocation
+```python
+class OptimizedTestCase(TestCase):
+    def setup(self):
+        # Pre-allocate memory for metrics
+        self.metrics.latencies = [0.0] * 10000
+        self.metrics.latency_index = 0
+        
+        # Pre-allocate quote patterns
+        self.quote_buffer = [
+            {'instrument': None, 'bid_price': 0.0, 
+             'bid_qty': 0, 'ask_price': 0.0, 'ask_qty': 0}
+            for _ in range(1000)
+        ]
+```
+
+### Application-Level Optimizations
+
+#### 1. Batch Processing
+```python
+class BatchOptimizedGenerator(MarketDataGenerator):
+    def __init__(self, simulators, instruments, batch_size=100):
+        super().__init__(simulators, instruments)
+        self.batch_size = batch_size
+        self.batch_buffer = []
+        
+    def _generate_data(self):
+        while self.running:
+            # Collect batch
+            for _ in range(self.batch_size):
+                try:
+                    pattern = self.quote_queue.get_nowait()
+                    self.batch_buffer.append(pattern)
+                except queue.Empty:
+                    break
+                    
+            # Process batch
+            if self.batch_buffer:
+                self._send_batch()
+                self.batch_buffer.clear()
+```
+
+#### 2. Lock-Free Queues
+```python
+from collections import deque
+from threading import RLock
+
+class LockFreeQueue:
+    """Optimized queue for high-frequency operations"""
+    
+    def __init__(self, maxsize=10000):
+        self.queue = deque(maxlen=maxsize)
+        self.lock = RLock()  # Reentrant lock
+        
+    def put_nowait(self, item):
+        with self.lock:
+            self.queue.append(item)
+            
+    def get_nowait(self):
+        with self.lock:
+            if self.queue:
+                return self.queue.popleft()
+            raise queue.Empty()
+```
+
+#### 3. Memory Pool Pattern
+```python
+class ObjectPool:
+    """Reuse objects to reduce allocation overhead"""
+    
+    def __init__(self, factory, size=1000):
+        self.factory = factory
+        self.pool = [factory() for _ in range(size)]
+        self.available = list(range(size))
+        
+    def acquire(self):
+        if self.available:
+            idx = self.available.pop()
+            return self.pool[idx]
+        return self.factory()
+        
+    def release(self, obj):
+        # Reset object state
+        obj.reset()
+        # Return to pool
+        if len(self.available) < len(self.pool):
+            idx = len(self.pool) - len(self.available) - 1
+            self.pool[idx] = obj
+            self.available.append(idx)
+```
+
+### Network Optimizations
+
+#### 1. TCP Tuning
+```python
+import socket
+
+def optimize_socket(sock):
+    """Apply TCP optimizations"""
+    # Disable Nagle's algorithm
+    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    
+    # Increase buffer sizes
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 262144)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 262144)
+    
+    # Enable keepalive
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+    
+    # Set low latency TOS
+    sock.setsockopt(socket.IPPROTO_IP, socket.IP_TOS, 0x10)
+```
+
+#### 2. Multicast Optimization
+```python
+def optimize_multicast(sock, interface='eth0'):
+    """Optimize multicast socket"""
+    # Set multicast TTL
+    sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 1)
+    
+    # Set multicast interface
+    sock.setsockopt(
+        socket.IPPROTO_IP,
+        socket.IP_MULTICAST_IF,
+        socket.inet_aton(get_interface_ip(interface))
+    )
+    
+    # Disable loopback
+    sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_LOOP, 0)
+```
+
+### Profiling and Monitoring
+
+#### 1. Built-in Profiler
+```python
+import cProfile
+import pstats
+
+class ProfilingTestCase(TestCase):
+    def run(self):
+        # Profile the critical section
+        profiler = cProfile.Profile()
+        profiler.enable()
+        
+        # Run test logic
+        self._run_core_logic()
+        
+        profiler.disable()
+        
+        # Save profile data
+        stats = pstats.Stats(profiler)
+        stats.dump_stats(f'{self.name}_profile.prof')
+```
+
+#### 2. Memory Profiling
+```python
+import tracemalloc
+
+class MemoryProfilingMixin:
+    def setup(self):
+        tracemalloc.start()
+        self.memory_snapshots = []
+        
+    def take_memory_snapshot(self, label):
+        snapshot = tracemalloc.take_snapshot()
+        self.memory_snapshots.append((label, snapshot))
+        
+    def analyze_memory(self):
+        for i in range(1, len(self.memory_snapshots)):
+            label1, snap1 = self.memory_snapshots[i-1]
+            label2, snap2 = self.memory_snapshots[i]
+            
+            stats = snap2.compare_to(snap1, 'lineno')
+            print(f"\nMemory changes from {label1} to {label2}:")
+            for stat in stats[:10]:
+                print(stat)
+```
+
+---
+
+## Troubleshooting Guide
+
+### Common Issues and Solutions
+
+#### 1. Connection Timeouts
+
+**Symptom**: `RaceSimulator connection timeout after 100.0 seconds`
+
+**Causes and Solutions**:
+
+```python
+# Check 1: Verify network connectivity
+import socket
+
+def test_connectivity(host, port):
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(5)
+        result = sock.connect_ex((host, port))
+        sock.close()
+        return result == 0
+    except:
+        return False
+
+# Check 2: Verify XML configuration
+def validate_xml_config(config_path):
+    import xml.etree.ElementTree as ET
+    try:
+        tree = ET.parse(config_path)
+        root = tree.getroot()
+        
+        # Check required elements
+        required = [
+            './/gtad:StrategyInfo',
+            './/raze:RazeGateway',
+            './/gtad:uplink'
+        ]
+        
+        for xpath in required:
+            if root.find(xpath, xmlns) is None:
+                print(f"Missing: {xpath}")
+                return False
+        return True
+    except Exception as e:
+        print(f"XML Error: {e}")
+        return False
+
+# Check 3: Increase timeout
+raze = initialize_raze(gtad_config, routing_ids)
+raze.handle_login(timeout=300.0)  # Increase from default
+```
+
+#### 2. Market Data Not Flowing
+
+**Symptom**: No quotes received, test hangs
+
+**Debugging Steps**:
+
+```python
+class MarketDataDebugger:
+    def __init__(self, md_simulators):
+        self.md_simulators = md_simulators
+        self.quote_count = {}
+        
+    def monitor_quotes(self, duration=10):
+        """Monitor quote generation for issues"""
+        import time
+        
+        start_time = time.time()
+        
+        while time.time() - start_time < duration:
+            for name, sim in self.md_simulators.items():
+                # Check simulator status
+                if hasattr(sim, 'get_stats'):
+                    stats = sim.get_stats()
+                    print(f"{name}: {stats}")
+                    
+                # Check connection status
+                if hasattr(sim, 'is_connected'):
+                    if not sim.is_connected():
+                        print(f"WARNING: {name} disconnected!")
+                        
+            time.sleep(1)
+            
+# Usage in test case
+def setup(self):
+    # ... normal setup ...
+    
+    # Add debugging
+    debugger = MarketDataDebugger(self.md_simulators)
+    debugger.monitor_quotes(5)
+```
+
+#### 3. High Latency Measurements
+
+**Symptom**: Latencies much higher than expected
+
+**Analysis Tools**:
+
+```python
+def analyze_latency_distribution(latencies):
+    """Detailed latency analysis"""
+    import numpy as np
+    import matplotlib.pyplot as plt
+    
+    latencies = np.array(latencies)
+    
+    # Remove outliers for analysis
+    q1 = np.percentile(latencies, 25)
+    q3 = np.percentile(latencies, 75)
+    iqr = q3 - q1
+    lower_bound = q1 - 1.5 * iqr
+    upper_bound = q3 + 1.5 * iqr
+    
+    outliers = latencies[(latencies < lower_bound) | 
+                        (latencies > upper_bound)]
+    
+    print(f"Outliers: {len(outliers)} / {len(latencies)}")
+    print(f"Outlier range: {outliers.min():.2f} - {outliers.max():.2f}")
+    
+    # Plot distribution
+    plt.figure(figsize=(10, 6))
+    plt.hist(latencies, bins=50, alpha=0.7)
+    plt.axvline(np.median(latencies), color='r', 
+                linestyle='--', label='Median')
+    plt.axvline(np.percentile(latencies, 99), color='g', 
+                linestyle='--', label='P99')
+    plt.xlabel('Latency (ms)')
+    plt.ylabel('Count')
+    plt.title('Latency Distribution')
+    plt.legend()
+    plt.savefig('latency_distribution.png')
+    
+    # Time series analysis
+    plt.figure(figsize=(10, 6))
+    plt.plot(latencies)
+    plt.xlabel('Order Number')
+    plt.ylabel('Latency (ms)')
+    plt.title('Latency Over Time')
+    plt.savefig('latency_timeline.png')
+```
+
+#### 4. Resource Leaks
+
+**Symptom**: Performance degrades over time, memory usage increases
+
+**Detection and Prevention**:
+
+```python
+import gc
+import psutil
+import weakref
+
+class ResourceMonitor:
+    def __init__(self):
+        self.process = psutil.Process()
+        self.initial_memory = self.process.memory_info().rss
+        self.resource_refs = weakref.WeakSet()
+        
+    def register_resource(self, resource):
+        """Track resource for leak detection"""
+        self.resource_refs.add(resource)
+        
+    def check_leaks(self):
+        """Check for potential resource leaks"""
+        # Force garbage collection
+        gc.collect()
+        
+        # Check memory growth
+        current_memory = self.process.memory_info().rss
+        memory_growth = current_memory - self.initial_memory
+        
+        print(f"Memory growth: {memory_growth / 1024 / 1024:.2f} MB")
+        
+        # Check file descriptors
+        open_files = self.process.open_files()
+        print(f"Open files: {len(open_files)}")
+        
+        # Check threads
+        threads = threading.enumerate()
+        print(f"Active threads: {len(threads)}")
+        for thread in threads:
+            print(f"  - {thread.name}: {thread.is_alive()}")
+            
+        # Check weak references
+        alive_resources = len(self.resource_refs)
+        print(f"Tracked resources still alive: {alive_resources}")
+        
+        return {
+            'memory_growth_mb': memory_growth / 1024 / 1024,
+            'open_files': len(open_files),
+            'threads': len(threads),
+            'alive_resources': alive_resources
+        }
+
+# Usage in test case
+class LeakAwareTestCase(TestCase):
+    def setup(self):
+        self.monitor = ResourceMonitor()
+        super().setup()
+        
+        # Register resources
+        self.monitor.register_resource(self.lmx)
+        self.monitor.register_resource(self.raze)
+        
+    def teardown(self):
+        super().teardown()
+        
+        # Check for leaks
+        leak_report = self.monitor.check_leaks()
+        
+        if leak_report['memory_growth_mb'] > 100:
+            print("WARNING: Significant memory growth detected!")
+```
+
+### Debug Mode Features
+
+Enable comprehensive debugging:
+
+```python
+# debug_config.py
+DEBUG_CONFIG = {
+    'log_level': 'DEBUG',
+    'trace_messages': True,
+    'save_all_messages': True,
+    'profile_enabled': True,
+    'memory_tracking': True,
+    'latency_breakdown': True,
+    'connection_monitoring': True
+}
+
+class DebugTestCase(TestCase):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.debug_mode = True
+        self.message_trace = []
+        
+    def _trace_message(self, direction, message):
+        """Trace all messages for debugging"""
+        if self.debug_mode:
+            self.message_trace.append({
+                'timestamp': time.time(),
+                'direction': direction,
+                'message': message
+            })
+            
+    def save_debug_info(self):
+        """Save debugging information"""
+        import json
+        
+        debug_file = f"{self.name}_debug.json"
+        with open(debug_file, 'w') as f:
+            json.dump({
+                'message_trace': self.message_trace,
+                'metrics': self.metrics.__dict__,
+                'config': self.gtad_config.__dict__
+            }, f, indent=2, default=str)
+```
+
+### Performance Bottleneck Analysis
+
+```python
+import time
+from functools import wraps
+
+def profile_method(method):
+    """Decorator to profile method execution time"""
+    @wraps(method)
+    def wrapper(self, *args, **kwargs):
+        start = time.perf_counter()
+        result = method(self, *args, **kwargs)
+        duration = time.perf_counter() - start
+        
+        if not hasattr(self, '_profile_data'):
+            self._profile_data = {}
+        
+        method_name = method.__name__
+        if method_name not in self._profile_data:
+            self._profile_data[method_name] = []
+            
+        self._profile_data[method_name].append(duration)
+        
+        return result
+    return wrapper
+
+class ProfiledTestCase(TestCase):
+    @profile_method
+    def setup(self):
+        # Setup implementation
+        pass
+        
+    @profile_method
+    def run(self):
+        # Run implementation
+        pass
+        
+    def get_profile_report(self):
+        """Generate profiling report"""
+        if not hasattr(self, '_profile_data'):
+            return "No profiling data available"
+            
+        report = []
+        for method, timings in self._profile_data.items():
+            avg_time = sum(timings) / len(timings)
+            total_time = sum(timings)
+            report.append(
+                f"{method}: "
+                f"avg={avg_time*1000:.2f}ms, "
+                f"total={total_time:.2f}s, "
+                f"calls={len(timings)}"
+            )
+            
+        return "\n".join(report)
+```
+
+---
+
+## Migration from ez_test.py
+
+### Migration Guide
+
+#### Step 1: Identify Current Test Logic
+
+Analyze your `ez_test.py`:
+
+```python
+# Original ez_test.py patterns
+while True:
+    # Market data generation
+    for name, sim in md_simulators.items():
+        sim.meric_send_quote(...)
+        
+    # Order response
+    if seq_num[name] > 2:
+        raze.auto_respond_new_order()
+```
+
+#### Step 2: Extract Test Parameters
+
+```python
+# Create configuration from ez_test.py
+migration_config = {
+    'instruments': [
+        {"symbol": "AAPL.OQ", "name": "AAPL", 
+         "spec_id": 426030, "security_id": 1093160},
+        # ... more instruments
+    ],
+    'quote_generation': {
+        'rate': 10,  # quotes per second
+        'random_prices': True,
+        'price_range': [1, 1000]
+    },
+    'order_generation': {
+        'trigger': 'quote_count',
+        'threshold': 2
+    }
+}
+```
+
+#### Step 3: Create Equivalent Test Case
+
+```python
+class MigratedTestCase(TestCase):
+    """Test case migrated from ez_test.py"""
+    
+    def __init__(self, name: str, gtad_config: GtadConfig,
+                 instruments: List[Any]):
+        super().__init__(name, gtad_config, instruments)
+        self.quote_count = 0
+        self.order_triggered = False
+        
+    def setup(self):
+        # Copy setup logic from ez_test.py
+        routing_ids = {
+            ascii_routing_id_to_integer("0000"): "ROUTING_ID_0",
+            # ... more routing IDs
+        }
+        
+        self.raze = initialize_raze(self.gtad_config, routing_ids)
+        self.md_simulators = create_md_simulators(self.gtad_config)
+        self.gtad = create_gtad(self.gtad_config)
+        self.lmx = initialize_lmx(self.gtad_config, [self.gtad], 
+                                  self.instruments)
+                                  
+        # Start simulators
+        for name, sim in self.md_simulators.items():
+            sim.start()
+            
+        # Setup order generation
+        send_order_on_md(self.lmx, "nyse_pillar", "SPCAST_L3_V4", 
+                        delay_ms=100)
+                        
+    def run(self):
+        # Convert infinite loop to time-bounded execution
+        self.md_generator = MarketDataGenerator(self.md_simulators, 
+                                               self.instruments)
+        self.order_handler = OrderResponseHandler(self.raze)
+        
+        self.md_generator.start()
+        
+        # Start order handler after initial quotes
+        start_time = time.time()
+        
+        while (time.time() - start_time) < 60:  # 60 second test
+            # Generate quotes like original
+            bid_price = random.randint(1, 1000)
+            bid_qty = random.randint(1, 1000)
+            ask_price = random.randint(1, 1000)
+            ask_qty = random.randint(1, 1000)
+            
+            quote = {
+                'instrument': self.instruments[0],
+                'bid_price': bid_price,
+                'bid_qty': bid_qty,
+                'ask_price': ask_price,
+                'ask_qty': ask_qty
+            }
+            
+            self.md_generator.add_quote_pattern(quote)
+            self.quote_count += 1
+            
+            # Start order responses after 2 quotes (like original)
+            if self.quote_count > 2 and not self.order_triggered:
+                self.order_handler.start()
+                self.order_triggered = True
+                
+            time.sleep(0.1)  # Match original timing
+            
+        self.md_generator.stop()
+        if self.order_triggered:
+            self.order_handler.stop()
+```
+
+#### Step 4: Add Improvements
+
+```python
+class ImprovedMigratedTestCase(MigratedTestCase):
+    """Enhanced version with better structure"""
+    
+    def __init__(self, *args, duration_seconds=60, 
+                 quote_delay_ms=100, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.duration_seconds = duration_seconds
+        self.quote_delay_ms = quote_delay_ms
+        
+    def run(self):
+        # More structured approach
+        self._start_components()
+        self._run_test_scenario()
+        self._stop_components()
+        
+    def _run_test_scenario(self):
+        """Organized test execution"""
+        scenarios = [
+            self._random_quote_scenario,
+            self._trending_market_scenario,
+            self._volatile_market_scenario
+        ]
+        
+        scenario_duration = self.duration_seconds / len(scenarios)
+        
+        for scenario in scenarios:
+            scenario(scenario_duration)
+            
+    def _random_quote_scenario(self, duration):
+        """Original random quote behavior"""
+        # Implementation here
+        pass
+        
+    def validate(self) -> bool:
+        """Add validation that was missing"""
+        if self.metrics.quotes_sent < 100:
+            print("Too few quotes generated")
+            return False
+            
+        if not self.order_triggered:
+            print("Order response never triggered")
+            return False
+            
+        return True
+```
+
+### Migration Checklist
+
+- [ ] Extract configuration values
+- [ ] Convert infinite loops to time-bounded
+- [ ] Add proper setup/teardown
+- [ ] Implement validation logic
+- [ ] Add metric collection
+- [ ] Handle errors gracefully
+- [ ] Remove hardcoded values
+- [ ] Add logging/debugging
+- [ ] Document test purpose
+- [ ] Create CI/CD configuration
+
+---
+
+## Best Practices
+
+### 1. Test Case Design
+
+#### Single Responsibility
+```python
+# Good: Focused test case
+class OrderLatencyTest(TestCase):
+    """Measures order-to-fill latency only"""
+    
+# Bad: Mixed concerns
+class EverythingTest(TestCase):
+    """Tests latency, throughput, errors, and validations"""
+```
+
+#### Deterministic Behavior
+```python
+# Good: Predictable test
+class DeterministicTest(TestCase):
+    def run(self):
+        # Use fixed seed for reproducibility
+        random.seed(42)
+        np.random.seed(42)
+        
+        # Use predetermined data
+        test_prices = [100.0, 100.1, 100.2, 100.1, 100.0]
+        
+# Bad: Non-reproducible
+class RandomTest(TestCase):
+    def run(self):
+        # Random without seed
+        price = random.uniform(50, 150)
+```
+
+#### Clear Assertions
+```python
+def validate(self) -> bool:
+    # Good: Specific validation with clear criteria
+    latency_p99 = np.percentile(self.metrics.latencies, 99)
+    
+    validations = [
+        (latency_p99 < 10.0, f"P99 latency {latency_p99:.2f}ms exceeds 10ms threshold"),
+        (self.metrics.orders_filled > 0, "No orders were filled"),
+        (self.metrics.error_count == 0, f"Errors occurred: {self.metrics.error_count}")
+    ]
+    
+    passed = True
+    for condition, message in validations:
+        if not condition:
+            print(f"❌ {message}")
+            passed = False
+        else:
+            print(f"✅ {message}")
+            
+    return passed
+```
+
+### 2. Resource Management
+
+#### Use Context Managers
+```python
+from contextlib import contextmanager
+
+@contextmanager
+def managed_simulator(config):
+    """Ensure simulator cleanup"""
+    sim = create_simulator(config)
+    try:
+        sim.start()
+        yield sim
+    finally:
+        sim.stop()
+        
+# Usage
+def run(self):
+    with managed_simulator(self.config) as sim:
+        # Use simulator
+        pass
+    # Automatically cleaned up
+```
+
+#### Track Resource Lifecycle
+```python
+class ResourceTracker:
+    def __init__(self):
+        self.resources = []
+        
+    def register(self, resource, cleanup_method='close'):
+        """Register resource for cleanup"""
+        self.resources.append((resource, cleanup_method))
+        return resource
+        
+    def cleanup_all(self):
+        """Clean up in reverse order"""
+        for resource, method in reversed(self.resources):
+            try:
+                getattr(resource, method)()
+            except Exception as e:
+                print(f"Cleanup error: {e}")
+```
+
+### 3. Performance Considerations
+
+#### Minimize Allocations
+```python
+class OptimizedTest(TestCase):
+    def setup(self):
+        # Pre-allocate buffers
+        self.quote_buffer = bytearray(1024)
+        self.order_buffer = bytearray(512)
+        
+        # Reuse objects
+        self.quote_template = {
+            'instrument': None,
+            'bid_price': 0.0,
+            'bid_qty': 0,
+            'ask_price': 0.0,
+            'ask_qty': 0
+        }
+        
+    def create_quote(self, instrument, bid, ask):
+        # Reuse template instead of creating new dict
+        self.quote_template['instrument'] = instrument
+        self.quote_template['bid_price'] = bid
+        self.quote_template['ask_price'] = ask
+        return self.quote_template
+```
+
+#### Batch Operations
+```python
+def send_quotes_batch(self, quotes):
+    """Send multiple quotes efficiently"""
+    # Bad: Individual operations
+    # for quote in quotes:
+    #     self.send_quote(quote)
+    
+    # Good: Batch operation
+    self.md_generator.add_quote_batch(quotes)
+```
+
+### 4. Debugging and Logging
+
+#### Structured Logging
+```python
+import logging
+import json
+
+class StructuredLogger:
+    def __init__(self, name):
+        self.logger = logging.getLogger(name)
+        
+    def log_event(self, event_type, **kwargs):
+        """Log structured event"""
+        event = {
+            'timestamp': time.time(),
+            'type': event_type,
+            'test_name': self.test_name,
+            **kwargs
+        }
+        self.logger.info(json.dumps(event))
+        
+# Usage
+logger.log_event('order_sent', 
+                order_id=12345,
+                instrument='AAPL',
+                quantity=100)
+```
+
+#### Debug Helpers
+```python
+def debug_state(self):
+    """Print current test state for debugging"""
+    state = {
+        'test_name': self.name,
+        'running': self.running,
+        'duration': time.time() - self.metrics.start_time,
+        'quotes_sent': self.metrics.quotes_sent,
+        'orders_sent': self.metrics.orders_sent,
+        'active_threads': [t.name for t in threading.enumerate() if t.is_alive()],
+        'memory_usage_mb': psutil.Process().memory_info().rss / 1024 / 1024
+    }
+    
+    print("=== Test State ===")
+    for key, value in state.items():
+        print(f"{key}: {value}")
+    print("================")
+```
+
+### 5. CI/CD Integration
+
+#### Environment Validation
+```python
+def validate_environment():
+    """Validate CI/CD environment before tests"""
+    
+    checks = []
+    
+    # Check environment variables
+    required_vars = ['GTAD_PROJECT_ROOT', 'PERF_TEST_CONFIG']
+    for var in required_vars:
+        if var in os.environ:
+            checks.append((True, f"{var} is set"))
+        else:
+            checks.append((False, f"{var} is not set"))
+            
+    # Check network connectivity
+    test_hosts = [('localhost', 9000), ('localhost', 9001)]
+    for host, port in test_hosts:
+        if test_connectivity(host, port):
+            checks.append((True, f"{host}:{port} is reachable"))
+        else:
+            checks.append((False, f"{host}:{port} is not reachable"))
+            
+    # Check disk space
+    disk_usage = psutil.disk_usage('/')
+    if disk_usage.percent < 90:
+        checks.append((True, f"Disk space available: {disk_usage.percent}%"))
+    else:
+        checks.append((False, f"Low disk space: {disk_usage.percent}%"))
+        
+    # Print results
+    all_passed = all(passed for passed, _ in checks)
+    
+    print("Environment Validation:")
+    for passed, message in checks:
+        symbol = "✅" if passed else "❌"
+        print(f"{symbol} {message}")
+        
+    return all_passed
+
+# Run before tests in CI/CD
+if not validate_environment():
+    sys.exit(1)
+```
+
+---
+
+## Advanced Topics
+
+### 1. Distributed Testing
+
+```python
+from multiprocessing import Process, Queue
+import zmq
+
+class DistributedTestCoordinator:
+    """Coordinate tests across multiple machines"""
+    
+    def __init__(self, coordinator_address="tcp://*:5555"):
+        self.context = zmq.Context()
+        self.socket = self.context.socket(zmq.REP)
+        self.socket.bind(coordinator_address)
+        self.workers = {}
+        
+    def register_worker(self, worker_id, capabilities):
+        """Register a test worker"""
+        self.workers[worker_id] = {
+            'capabilities': capabilities,
+            'status': 'idle',
+            'last_heartbeat': time.time()
+        }
+        
+    def distribute_tests(self, test_cases):
+        """Distribute tests across workers"""
+        assignments = {}
+        
+        for test_case in test_cases:
+            # Find suitable worker
+            suitable_workers = [
+                worker_id for worker_id, info in self.workers.items()
+                if info['status'] == 'idle' and 
+                   self._can_run_test(info['capabilities'], test_case)
+            ]
+            
+            if suitable_workers:
+                worker_id = suitable_workers[0]
+                assignments[worker_id] = test_case
+                self.workers[worker_id]['status'] = 'busy'
+                
+        return assignments
+        
+class DistributedTestWorker:
+    """Worker that runs tests"""
+    
+    def __init__(self, worker_id, coordinator_address):
+        self.worker_id = worker_id
+        self.context = zmq.Context()
+        self.socket = self.context.socket(zmq.REQ)
+        self.socket.connect(coordinator_address)
+        
+    def run(self):
+        """Main worker loop"""
+        while True:
+            # Request work
+            self.socket.send_json({
+                'type': 'request_work',
+                'worker_id': self.worker_id
+            })
+            
+            # Receive test assignment
+            message = self.socket.recv_json()
+            
+            if message['type'] == 'run_test':
+                test_config = message['test_config']
+                result = self._run_test(test_config)
+                
+                # Report results
+                self.socket.send_json({
+                    'type': 'test_complete',
+                    'worker_id': self.worker_id,
+                    'result': result
+                })
+```
+
+### 2. Real-time Monitoring
+
+```python
+from flask import Flask, jsonify, render_template
+import threading
+
+class RealTimeMonitor:
+    """Web-based real-time test monitoring"""
+    
+    def __init__(self, port=8080):
+        self.app = Flask(__name__)
+        self.port = port
+        self.current_tests = {}
+        self.metrics_history = []
+        
+        self._setup_routes()
+        
+    def _setup_routes(self):
+        @self.app.route('/api/status')
+        def status():
+            return jsonify({
+                'active_tests': len(self.current_tests),
+                'tests': list(self.current_tests.values())
+            })
+            
+        @self.app.route('/api/metrics/<test_name>')
+        def metrics(test_name):
+            if test_name in self.current_tests:
+                return jsonify(self.current_tests[test_name]['metrics'])
+            return jsonify({'error': 'Test not found'}), 404
+            
+        @self.app.route('/')
+        def dashboard():
+            return render_template('dashboard.html')
+            
+    def start(self):
+        """Start monitoring server"""
+        thread = threading.Thread(
+            target=self.app.run,
+            kwargs={'host': '0.0.0.0', 'port': self.port}
+        )
+        thread.daemon = True
+        thread.start()
+        
+    def update_test_status(self, test_name, status, metrics=None):
+        """Update test status"""
+        self.current_tests[test_name] = {
+            'name': test_name,
+            'status': status,
+            'last_update': time.time(),
+            'metrics': metrics or {}
+        }
+```
+
+### 3. Machine Learning Integration
+
+```python
+import numpy as np
+from sklearn.ensemble import IsolationForest
+
+class AnomalyDetector:
+    """Detect performance anomalies using ML"""
+    
+    def __init__(self, contamination=0.1):
+        self.model = IsolationForest(contamination=contamination)
+        self.is_trained = False
+        self.training_data = []
+        
+    def add_measurement(self, metrics):
+        """Add performance measurement"""
+        features = self._extract_features(metrics)
+        
+        if not self.is_trained:
+            self.training_data.append(features)
+            
+            if len(self.training_data) >= 100:
+                self._train_model()
+        else:
+            anomaly = self._detect_anomaly(features)
+            if anomaly:
+                self._handle_anomaly(metrics)
+                
+    def _extract_features(self, metrics):
+        """Extract features for ML model"""
+        return np.array([
+            metrics.get('latency_p99', 0),
+            metrics.get('throughput', 0),
+            metrics.get('error_rate', 0),
+            metrics.get('cpu_usage', 0),
+            metrics.get('memory_usage', 0)
+        ])
+        
+    def _train_model(self):
+        """Train anomaly detection model"""
+        X = np.array(self.training_data)
+        self.model.fit(X)
+        self.is_trained = True
+        print("Anomaly detection model trained")
+        
+    def _detect_anomaly(self, features):
+        """Detect if measurement is anomalous"""
+        prediction = self.model.predict([features])
+        return prediction[0] == -1  # -1 indicates anomaly
+        
+    def _handle_anomaly(self, metrics):
+        """Handle detected anomaly"""
+        print(f"ANOMALY DETECTED: {metrics}")
+        # Send alert, log, etc.
+```
+
+### 4. Advanced Profiling
+
+```python
+import dis
+import ast
+import inspect
+
+class AdvancedProfiler:
+    """Deep profiling capabilities"""
+    
+    def __init__(self):
+        self.call_graph = {}
+        self.hot_paths = []
+        
+    def profile_method(self, method):
+        """Deep profile a method"""
+        # Get source code
+        source = inspect.getsource(method)
+        
+        # Parse AST
+        tree = ast.parse(source)
+        
+        # Analyze complexity
+        complexity = self._calculate_complexity(tree)
+        
+        # Disassemble bytecode
+        bytecode = dis.Bytecode(method)
+        
+        # Profile execution
+        import cProfile
+        profiler = cProfile.Profile()
+        
+        # Run method multiple times
+        for _ in range(100):
+            profiler.enable()
+            method()
+            profiler.disable()
+            
+        # Analyze results
+        stats = pstats.Stats(profiler)
+        stats.sort_stats('cumulative')
+        
+        return {
+            'complexity': complexity,
+            'bytecode_ops': len(list(bytecode)),
+            'hot_functions': self._get_hot_functions(stats),
+            'call_graph': self._build_call_graph(stats)
+        }
+        
+    def _calculate_complexity(self, tree):
+        """Calculate cyclomatic complexity"""
+        # Implementation here
+        pass
+        
+    def optimize_hot_path(self, method):
+        """Suggest optimizations for hot paths"""
+        profile = self.profile_method(method)
+        
+        suggestions = []
+        
+        # Check for common inefficiencies
+        source = inspect.getsource(method)
+        
+        if 'append' in source and 'for' in source:
+            suggestions.append(
+                "Consider list comprehension instead of append in loop"
+            )
+            
+        if source.count('for') > 2:
+            suggestions.append(
+                "Multiple nested loops detected - consider algorithmic optimization"
+            )
+            
+        return suggestions
+```
+
+---
+
+## Frequently Asked Questions
+
+### General Questions
+
+**Q: How do I know which test suite to run?**
+
+A: Choose based on your needs:
+- `quick`: For rapid feedback during development (< 2 minutes)
+- `standard`: For pre-commit validation (< 10 minutes)
+- `comprehensive`: For nightly builds or release validation (< 30 minutes)
+
+**Q: Can I run tests in parallel?**
+
+A: Yes, but with caveats:
+- Tests must use different ports/resources
+- System must have sufficient resources
+- Some simulators may not support concurrent instances
+
+**Q: How do I debug a failing test?**
+
+A: Follow this process:
+1. Run with debug logging: `export PERF_TEST_DEBUG=1`
+2. Check test-specific logs in output directory
+3. Use `--test` flag to run single test in isolation
+4. Add print statements in test's `run()` method
+5. Use the debug helpers provided in troubleshooting section
+
+### Technical Questions
+
+**Q: Why are my latency measurements inconsistent?**
+
+A: Common causes:
+- System load variations
+- Network congestion
+- Garbage collection pauses
+- CPU throttling
+
+Solutions:
+- Run on dedicated hardware
+- Disable CPU frequency scaling
+- Use process affinity
+- Increase sample size
+
+**Q: How do I add custom metrics?**
+
+A: Extend the TestMetrics class:
+
+```python
+@dataclass
+class CustomTestMetrics(TestMetrics):
+    custom_field: float = 0.0
+    custom_list: List[float] = field(default_factory=list)
+    
+class MyTest(TestCase):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.metrics = CustomTestMetrics(start_time=time.time())
+```
+
+**Q: Can I test with production data?**
+
+A: Yes, but carefully:
+- Ensure data is anonymized
+- Use read-only connections
+- Run in isolated environment
+- Follow data governance policies
+
+### Performance Questions
+
+**Q: What's the maximum sustainable quote rate?**
+
+A: Depends on:
+- Hardware specifications
+- Network bandwidth
+- Number of instruments
+- Quote size
+
+Typical ranges:
+- Single thread: 1,000-10,000 quotes/sec
+- Multi-thread: 10,000-100,000 quotes/sec
+- Optimized: 100,000+ quotes/sec
+
+**Q: How can I reduce test execution time?**
+
+A: Strategies:
+1. Run tests in parallel
+2. Use smaller data sets for quick tests
+3. Implement test result caching
+4. Skip redundant setup/teardown
+5. Use faster simulators for non-critical tests
+
+### Integration Questions
+
+**Q: How do I integrate with existing CI/CD?**
+
+A: The framework provides:
+- Standard exit codes (0=success, 1=failure)
+- JSON output for parsing
+- Command-line interface
+- Environment variable configuration
+
+See CI/CD Integration Guide for platform-specific examples.
+
+**Q: Can I use this with cloud testing services?**
+
+A: Yes, considerations:
+- Ensure GTF libraries are available
+- Configure network security groups
+- Use cloud-specific storage for results
+- Consider latency to market data sources
+
+**Q: How do I compare results across versions?**
+
+A: Implement trending:
+
+```python
+class TrendAnalyzer:
+    def compare_runs(self, current_results, historical_results):
+        """Compare current run with historical data"""
+        
+        comparison = {}
+        
+        for test_name, current in current_results.items():
+            historical = historical_results.get(test_name, [])
+            
+            if historical:
+                avg_historical = np.mean([h['latency_p99'] for h in historical])
+                current_p99 = current['metrics']['latency_p99']
+                
+                comparison[test_name] = {
+                    'current': current_p99,
+                    'historical_avg': avg_historical,
+                    'change_pct': ((current_p99 - avg_historical) / avg_historical) * 100
+                }
+                
+        return comparison
+```
+
+---
+
+## Conclusion
+
+This performance testing framework provides a robust, scalable solution for testing trading systems. By following the patterns and practices outlined in this documentation, you can:
+
+- Create reliable, reproducible performance tests
+- Integrate seamlessly with CI/CD pipelines
+- Identify performance regressions early
+- Scale testing across multiple systems
+- Maintain high code quality standards
+
+For additional support or contributions, please refer to the project repository.
+
+## Appendices
+
+### A. Complete API Reference
+[Link to generated API docs]
+
+### B. Configuration Schema
+[Link to JSON schema]
+
+### C. Performance Benchmarks
+[Link to benchmark results]
+
+### D. Troubleshooting Flowcharts
+[Link to visual troubleshooting guides] 
+
+
+
+
+perf_test_cases.py
+
+"""
+Additional test case implementations for the performance testing framework
+"""
+
+from perf_test_framework import *
+from gtf.oms import Order, Side
+import gtf.fix
+import random
+import numpy as np
+
+class LatencyMeasurementTestCase(TestCase):
+    """Test case focused on measuring order-to-fill latencies"""
+    
+    def __init__(self, name: str, gtad_config: GtadConfig, instruments: List[Any],
+                 order_rate_per_second: int = 10, duration_seconds: int = 60):
+        super().__init__(name, gtad_config, instruments)
+        self.order_rate_per_second = order_rate_per_second
+        self.duration_seconds = duration_seconds
+        self.order_timestamps = {}
+        self.fill_timestamps = {}
+        
+    def setup(self):
+        """Setup test resources with latency tracking"""
+        print(f"[{self.name}] Setting up latency measurement test...")
+        
+        routing_ids = {
+            ascii_routing_id_to_integer("0000"): "ROUTING_ID_0",
+            ascii_routing_id_to_integer("0001"): "ROUTING_ID_1",
+        }
+        
+        self.raze = initialize_raze(self.gtad_config, routing_ids)
+        self.md_simulators = create_md_simulators(self.gtad_config)
+        self.gtad = create_gtad(self.gtad_config)
+        self.lmx = initialize_lmx(self.gtad_config, [self.gtad], self.instruments)
+        
+        # Start market data simulators
+        for name, sim in self.md_simulators.items():
+            sim.start()
+            
+        # Setup order response handler with callback
+        self.order_handler = OrderResponseHandler(self.raze)
+        self.order_handler.set_response_delay(0.5)  # 500 microseconds
+        
+    def run(self):
+        """Run latency measurement test"""
+        print(f"[{self.name}] Starting latency measurement...")
+        
+        self.order_handler.start()
+        
+        # Send stable market data
+        md_generator = MarketDataGenerator(self.md_simulators, self.instruments)
+        md_generator.start()
+        
+        # Send initial quote
+        stable_quote = {
+            'instrument': self.instruments[0],
+            'bid_price': 100.0,
+            'bid_qty': 1000,
+            'ask_price': 100.1,
+            'ask_qty': 1000
+        }
+        md_generator.add_quote_pattern(stable_quote)
+        
+        # Order generation loop
+        start_time = time.time()
+        order_interval = 1.0 / self.order_rate_per_second
+        order_id = 1
+        
+        while (time.time() - start_time) < self.duration_seconds:
+            # Record order timestamp
+            self.order_timestamps[order_id] = time.time()
+            
+            # Send order
+            order = Order(
+                self.instruments[0],
+                Side.BUY,
+                Price=99.9,
+                TimeInForce=gtf.fix.TimeInForce.Day,
+                OrderQty=100,
+                Destination="nyse_pillar",
+                OrderType=gtf.fix.OrderType.Limit,
+            )
+            order.ClOrdID = order_id
+            
+            # Send via LMX
+            self.lmx.send_message(f"create_order,{order_id},...")
+            
+            self.metrics.orders_sent += 1
+            order_id += 1
+            
+            # Wait for next order
+            time.sleep(order_interval)
+            
+        # Stop handlers
+        md_generator.stop()
+        self.order_handler.stop()
+        
+        # Calculate latencies
+        for order_id in self.order_timestamps:
+            if order_id in self.fill_timestamps:
+                latency = (self.fill_timestamps[order_id] - self.order_timestamps[order_id]) * 1000  # ms
+                self.metrics.latencies.append(latency)
+                
+    def teardown(self):
+        """Cleanup resources"""
+        if self.lmx:
+            self.lmx.close()
+        if self.raze:
+            self.raze.stop()
+        if self.gtad:
+            self.gtad.stop()
+        for sim in self.md_simulators.values():
+            sim.stop()
+            
+    def validate(self) -> bool:
+        """Validate latency results"""
+        if not self.metrics.latencies:
+            print(f"[{self.name}] No latency data collected!")
+            return False
+            
+        latencies = np.array(self.metrics.latencies)
+        
+        print(f"[{self.name}] Latency Statistics:")
+        print(f"  - Mean: {np.mean(latencies):.2f} ms")
+        print(f"  - Median: {np.median(latencies):.2f} ms")
+        print(f"  - 95th percentile: {np.percentile(latencies, 95):.2f} ms")
+        print(f"  - 99th percentile: {np.percentile(latencies, 99):.2f} ms")
+        print(f"  - Max: {np.max(latencies):.2f} ms")
+        
+        # Validate against thresholds
+        return np.percentile(latencies, 99) < 10.0  # 99th percentile < 10ms
+
+class MarketDataStressTestCase(TestCase):
+    """Test case for high-frequency market data processing"""
+    
+    def __init__(self, name: str, gtad_config: GtadConfig, instruments: List[Any],
+                 quotes_per_second: int = 1000, duration_seconds: int = 30):
+        super().__init__(name, gtad_config, instruments)
+        self.quotes_per_second = quotes_per_second
+        self.duration_seconds = duration_seconds
+        self.quote_delays = []
+        
+    def setup(self):
+        """Setup for market data stress test"""
+        print(f"[{self.name}] Setting up market data stress test...")
+        
+        routing_ids = {ascii_routing_id_to_integer("0000"): "ROUTING_ID_0"}
+        
+        self.raze = initialize_raze(self.gtad_config, routing_ids)
+        self.md_simulators = create_md_simulators(self.gtad_config)
+        self.gtad = create_gtad(self.gtad_config)
+        self.lmx = initialize_lmx(self.gtad_config, [self.gtad], self.instruments)
+        
+        for name, sim in self.md_simulators.items():
+            sim.start()
+            
+    def run(self):
+        """Run market data stress test"""
+        print(f"[{self.name}] Starting market data stress test...")
+        print(f"Target rate: {self.quotes_per_second} quotes/second")
+        
+        # Use multiple threads for market data generation
+        num_threads = min(4, self.quotes_per_second // 250)  # Max 250 quotes/sec per thread
+        quotes_per_thread = self.quotes_per_second // num_threads
+        
+        generators = []
+        for i in range(num_threads):
+            gen = MarketDataGenerator(self.md_simulators, self.instruments)
+            gen.start()
+            generators.append(gen)
+            
+        # Generate rapid quote changes
+        start_time = time.time()
+        quote_interval = 1.0 / quotes_per_thread
+        
+        while (time.time() - start_time) < self.duration_seconds:
+            for i, gen in enumerate(generators):
+                # Vary prices rapidly
+                base_price = 100.0 + random.uniform(-1, 1)
+                spread = random.uniform(0.01, 0.1)
+                
+                quote = {
+                    'instrument': self.instruments[i % len(self.instruments)],
+                    'bid_price': base_price,
+                    'bid_qty': random.randint(100, 1000),
+                    'ask_price': base_price + spread,
+                    'ask_qty': random.randint(100, 1000)
+                }
+                
+                gen.add_quote_pattern(quote)
+                self.metrics.quotes_sent += 1
+                
+            time.sleep(quote_interval)
+            
+        # Stop generators
+        for gen in generators:
+            gen.stop()
+            
+    def teardown(self):
+        """Cleanup resources"""
+        if self.lmx:
+            self.lmx.close()
+        if self.raze:
+            self.raze.stop()
+        if self.gtad:
+            self.gtad.stop()
+        for sim in self.md_simulators.values():
+            sim.stop()
+            
+    def validate(self) -> bool:
+        """Validate market data processing"""
+        actual_rate = self.metrics.quotes_sent / self.duration_seconds
+        target_rate = self.quotes_per_second
+        
+        print(f"[{self.name}] Market Data Processing:")
+        print(f"  - Target rate: {target_rate} quotes/sec")
+        print(f"  - Actual rate: {actual_rate:.1f} quotes/sec")
+        print(f"  - Efficiency: {(actual_rate/target_rate)*100:.1f}%")
+        
+        # Success if we achieved at least 90% of target rate
+        return actual_rate >= (target_rate * 0.9)
+
+class OrderBurstTestCase(TestCase):
+    """Test case for handling order bursts"""
+    
+    def __init__(self, name: str, gtad_config: GtadConfig, instruments: List[Any],
+                 burst_size: int = 100, num_bursts: int = 10, burst_interval_seconds: int = 5):
+        super().__init__(name, gtad_config, instruments)
+        self.burst_size = burst_size
+        self.num_bursts = num_bursts
+        self.burst_interval_seconds = burst_interval_seconds
+        
+    def setup(self):
+        """Setup for order burst test"""
+        print(f"[{self.name}] Setting up order burst test...")
+        
+        routing_ids = {
+            ascii_routing_id_to_integer(f"000{i}"): f"ROUTING_ID_{i}" 
+            for i in range(6)
+        }
+        
+        self.raze = initialize_raze(self.gtad_config, routing_ids)
+        self.md_simulators = create_md_simulators(self.gtad_config)
+        self.gtad = create_gtad(self.gtad_config)
+        self.lmx = initialize_lmx(self.gtad_config, [self.gtad], self.instruments)
+        
+        for name, sim in self.md_simulators.items():
+            sim.start()
+            
+        # Send initial market data
+        md_gen = MarketDataGenerator(self.md_simulators, self.instruments)
+        md_gen.start()
+        
+        for inst in self.instruments:
+            quote = {
+                'instrument': inst,
+                'bid_price': 100.0,
+                'bid_qty': 10000,
+                'ask_price': 100.1,
+                'ask_qty': 10000
+            }
+            md_gen.add_quote_pattern(quote)
+            
+        self.md_generator = md_gen
+        self.order_handler = OrderResponseHandler(self.raze)
+        self.order_handler.start()
+        
+    def run(self):
+        """Run order burst test"""
+        print(f"[{self.name}] Starting order burst test...")
+        print(f"Burst configuration: {self.burst_size} orders x {self.num_bursts} bursts")
+        
+        order_id = 1
+        
+        for burst_num in range(self.num_bursts):
+            print(f"[{self.name}] Sending burst {burst_num + 1}/{self.num_bursts}")
+            
+            burst_start = time.time()
+            
+            # Send burst of orders
+            for i in range(self.burst_size):
+                instrument = self.instruments[i % len(self.instruments)]
+                side = Side.BUY if i % 2 == 0 else Side.SELL
+                price = 99.9 if side == Side.BUY else 100.1
+                
+                order = Order(
+                    instrument,
+                    side,
+                    Price=price,
+                    TimeInForce=gtf.fix.TimeInForce.Day,
+                    OrderQty=100 + (i * 10),
+                    Destination="nyse_pillar",
+                    OrderType=gtf.fix.OrderType.Limit,
+                )
+                order.ClOrdID = order_id
+                
+                # Send order
+                self.lmx.send_message(f"create_order,{order_id},...")
+                self.metrics.orders_sent += 1
+                order_id += 1
+                
+            burst_duration = time.time() - burst_start
+            print(f"[{self.name}] Burst sent in {burst_duration:.2f}s ({self.burst_size/burst_duration:.0f} orders/sec)")
+            
+            # Wait before next burst
+            if burst_num < self.num_bursts - 1:
+                time.sleep(self.burst_interval_seconds)
+                
+    def teardown(self):
+        """Cleanup resources"""
+        if self.md_generator:
+            self.md_generator.stop()
+        if self.order_handler:
+            self.order_handler.stop()
+        if self.lmx:
+            self.lmx.close()
+        if self.raze:
+            self.raze.stop()
+        if self.gtad:
+            self.gtad.stop()
+        for sim in self.md_simulators.values():
+            sim.stop()
+            
+    def validate(self) -> bool:
+        """Validate burst handling"""
+        total_expected = self.burst_size * self.num_bursts
+        
+        print(f"[{self.name}] Order Burst Results:")
+        print(f"  - Total orders sent: {self.metrics.orders_sent}")
+        print(f"  - Expected: {total_expected}")
+        
+        return self.metrics.orders_sent == total_expected
+
+class MultiInstrumentTestCase(TestCase):
+    """Test case for multiple instruments trading simultaneously"""
+    
+    def __init__(self, name: str, gtad_config: GtadConfig, instruments: List[Any],
+                 orders_per_instrument_per_second: int = 5, duration_seconds: int = 60):
+        super().__init__(name, gtad_config, instruments)
+        self.orders_per_instrument_per_second = orders_per_instrument_per_second
+        self.duration_seconds = duration_seconds
+        self.orders_by_instrument = {inst.SpecID: 0 for inst in instruments}
+        
+    def setup(self):
+        """Setup for multi-instrument test"""
+        print(f"[{self.name}] Setting up multi-instrument test...")
+        
+        routing_ids = {
+            ascii_routing_id_to_integer(f"000{i}"): f"ROUTING_ID_{i}" 
+            for i in range(len(self.instruments))
+        }
+        
+        self.raze = initialize_raze(self.gtad_config, routing_ids)
+        self.md_simulators = create_md_simulators(self.gtad_config)
+        self.gtad = create_gtad(self.gtad_config)
+        self.lmx = initialize_lmx(self.gtad_config, [self.gtad], self.instruments)
+        
+        for name, sim in self.md_simulators.items():
+            sim.start()
+            
+    def run(self):
+        """Run multi-instrument test"""
+        print(f"[{self.name}] Testing {len(self.instruments)} instruments simultaneously...")
+        
+        # Start market data for all instruments
+        md_generators = []
+        for inst in self.instruments:
+            gen = MarketDataGenerator(self.md_simulators, [inst])
+            gen.start()
+            md_generators.append(gen)
+            
+        # Start order handler
+        order_handler = OrderResponseHandler(self.raze)
+        order_handler.start()
+        
+        # Trading loop
+        start_time = time.time()
+        order_interval = 1.0 / (self.orders_per_instrument_per_second * len(self.instruments))
+        order_id = 1
+        
+        while (time.time() - start_time) < self.duration_seconds:
+            for i, inst in enumerate(self.instruments):
+                # Update market data for this instrument
+                price_change = random.uniform(-0.5, 0.5)
+                quote = {
+                    'instrument': inst,
+                    'bid_price': 100.0 + price_change,
+                    'bid_qty': random.randint(100, 1000),
+                    'ask_price': 100.1 + price_change,
+                    'ask_qty': random.randint(100, 1000)
+                }
+                md_generators[i].add_quote_pattern(quote)
+                
+                # Send order for this instrument
+                side = Side.BUY if random.random() > 0.5 else Side.SELL
+                order = Order(
+                    inst,
+                    side,
+                    Price=100.0 + price_change + (0.1 if side == Side.SELL else -0.1),
+                    TimeInForce=gtf.fix.TimeInForce.Day,
+                    OrderQty=random.randint(100, 500),
+                    Destination="nyse_pillar",
+                    OrderType=gtf.fix.OrderType.Limit,
+                )
+                order.ClOrdID = order_id
+                
+                self.lmx.send_message(f"create_order,{order_id},...")
+                self.orders_by_instrument[inst.SpecID] += 1
+                self.metrics.orders_sent += 1
+                order_id += 1
+                
+            time.sleep(order_interval)
+            
+        # Stop all handlers
+        for gen in md_generators:
+            gen.stop()
+        order_handler.stop()
+        
+    def teardown(self):
+        """Cleanup resources"""
+        if self.lmx:
+            self.lmx.close()
+        if self.raze:
+            self.raze.stop()
+        if self.gtad:
+            self.gtad.stop()
+        for sim in self.md_simulators.values():
+            sim.stop()
+            
+    def validate(self) -> bool:
+        """Validate multi-instrument trading"""
+        print(f"[{self.name}] Multi-Instrument Results:")
+        print(f"  - Total orders sent: {self.metrics.orders_sent}")
+        
+        for inst in self.instruments:
+            count = self.orders_by_instrument[inst.SpecID]
+            expected = self.orders_per_instrument_per_second * self.duration_seconds
+            print(f"  - {inst.Symbol}: {count} orders (expected ~{expected})")
+            
+        # Check that all instruments received orders
+        return all(count > 0 for count in self.orders_by_instrument.values()) 
+
+
+perf_test_example.py
+
+#!/usr/bin/env python3
+
+from perf_test_framework import *
+from gtf.security_context.instrument import Instrument
+from gtf.oms import Order, Side
+import gtf.fix
+
+def create_test_suite():
+    """Create a comprehensive test suite"""
+    
+    # Test configuration
+    gtad_config = GtadConfig(
+        strategy_name="gts_lts_test",
+        strategy_leg="main", 
+        strategy_id=555,
+        fund="paper",
+        output_dir="/apps/sb_afts/"
+    )
+    
+    # Test instruments
+    instruments = [
+        Instrument("AAPL.OQ", "AAPL", 426030, 1093160, "splitstripid", "ric"),
+        Instrument("MSFT.OQ", "MSFT", 544939, 690475, "splitstripid", "ric"),
+        Instrument("NVDA.OQ", "NVDA", 880615, 622865, "splitstripid", "ric"),
+    ]
+    
+    # Define quote patterns for different test scenarios
+    quote_patterns_rapid = [
+        {'instrument': instruments[0], 'bid_price': 100.0, 'bid_qty': 100, 'ask_price': 100.5, 'ask_qty': 100},
+        {'instrument': instruments[0], 'bid_price': 100.1, 'bid_qty': 200, 'ask_price': 100.6, 'ask_qty': 200},
+        {'instrument': instruments[0], 'bid_price': 100.2, 'bid_qty': 150, 'ask_price': 100.7, 'ask_qty': 150},
+        {'instrument': instruments[0], 'bid_price': 100.0, 'bid_qty': 100, 'ask_price': 100.5, 'ask_qty': 100},
+    ]
+    
+    quote_patterns_spread = [
+        {'instrument': instruments[0], 'bid_price': 100.0, 'bid_qty': 100, 'ask_price': 101.0, 'ask_qty': 100},
+        {'instrument': instruments[0], 'bid_price': 99.5, 'bid_qty': 200, 'ask_price': 100.5, 'ask_qty': 200},
+        {'instrument': instruments[0], 'bid_price': 99.0, 'bid_qty': 300, 'ask_price': 100.0, 'ask_qty': 300},
+    ]
+    
+    # Create test runner
+    runner = PerformanceTestRunner(output_dir="/tmp/perf_test_results")
+    
+    # Add test cases
+    runner.add_test_case(
+        QuoteChangeTestCase(
+            name="rapid_quote_changes",
+            gtad_config=gtad_config,
+            instruments=instruments,
+            quote_patterns=quote_patterns_rapid,
+            duration_seconds=30
+        )
+    )
+    
+    runner.add_test_case(
+        QuoteChangeTestCase(
+            name="wide_spread_test",
+            gtad_config=gtad_config,
+            instruments=instruments,
+            quote_patterns=quote_patterns_spread,
+            duration_seconds=20
+        )
+    )
+    
+    # Add more test cases here...
+    
+    return runner
+
+def main():
+    """Main entry point"""
+    import argparse
+    
+    parser = argparse.ArgumentParser(description='Performance Test Suite')
+    parser.add_argument('--parallel', action='store_true', help='Run tests in parallel')
+    parser.add_argument('--test', type=str, help='Run specific test case')
+    parser.add_argument('--duration', type=int, default=30, help='Test duration in seconds')
+    
+    args = parser.parse_args()
+    
+    # Create and run test suite
+    runner = create_test_suite()
+    
+    if args.test:
+        # Run specific test
+        for test_case in runner.test_cases:
+            if test_case.name == args.test:
+                runner.test_cases = [test_case]
+                break
+    
+    # Run tests
+    runner.run_all(parallel=args.parallel)
+
+if __name__ == "__main__":
+    main() 
+
+perf_test_framework.py
+
+import threading
+import multiprocessing
+import queue
+import time
+import json
+import abc
+from typing import Dict, List, Optional, Callable, Any
+from dataclasses import dataclass
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
+from perf_test_lib import *
+
+@dataclass
+class TestMetrics:
+    """Container for test metrics"""
+    start_time: float
+    end_time: float = 0
+    orders_sent: int = 0
+    orders_filled: int = 0
+    quotes_sent: int = 0
+    latencies: List[float] = None
+    
+    def __post_init__(self):
+        if self.latencies is None:
+            self.latencies = []
+
+class TestCase(abc.ABC):
+    """Abstract base class for test cases"""
+    
+    def __init__(self, name: str, gtad_config: GtadConfig, instruments: List[Any]):
+        self.name = name
+        self.gtad_config = gtad_config
+        self.instruments = instruments
+        self.metrics = TestMetrics(start_time=time.time())
+        self.running = False
+        
+    @abc.abstractmethod
+    def setup(self):
+        """Setup test case resources"""
+        pass
+        
+    @abc.abstractmethod
+    def run(self):
+        """Run the actual test"""
+        pass
+        
+    @abc.abstractmethod
+    def teardown(self):
+        """Cleanup test resources"""
+        pass
+        
+    @abc.abstractmethod
+    def validate(self) -> bool:
+        """Validate test results"""
+        pass
+        
+    def get_metrics(self) -> TestMetrics:
+        """Return test metrics"""
+        self.metrics.end_time = time.time()
+        return self.metrics
+
+class MarketDataGenerator:
+    """Handles market data generation in a separate thread"""
+    
+    def __init__(self, simulators: Dict[str, Any], instruments: List[Any]):
+        self.simulators = simulators
+        self.instruments = instruments
+        self.running = False
+        self.thread = None
+        self.quote_queue = queue.Queue()
+        self.seq_nums = {name: 1 for name in simulators.keys()}
+        
+    def start(self):
+        """Start market data generation thread"""
+        self.running = True
+        self.thread = threading.Thread(target=self._generate_data)
+        self.thread.start()
+        
+    def stop(self):
+        """Stop market data generation"""
+        self.running = False
+        if self.thread:
+            self.thread.join()
+            
+    def add_quote_pattern(self, pattern: Dict[str, Any]):
+        """Add a quote pattern to the queue"""
+        self.quote_queue.put(pattern)
+        
+    def _generate_data(self):
+        """Main market data generation loop"""
+        while self.running:
+            try:
+                # Check for quote patterns
+                pattern = self.quote_queue.get_nowait()
+                self._send_quote(pattern)
+            except queue.Empty:
+                time.sleep(0.001)  # Small sleep to prevent CPU spinning
+                
+    def _send_quote(self, pattern: Dict[str, Any]):
+        """Send quote to simulators"""
+        for name, sim in self.simulators.items():
+            sim.send_quote(
+                self.seq_nums[name],
+                pattern['bid_price'],
+                pattern['bid_qty'],
+                pattern['ask_price'],
+                pattern['ask_qty'],
+                symbol=pattern['instrument'].SpecID
+            )
+            self.seq_nums[name] += 1
+
+class OrderResponseHandler:
+    """Handles order responses in a separate thread"""
+    
+    def __init__(self, raze_simulator):
+        self.raze = raze_simulator
+        self.running = False
+        self.thread = None
+        self.response_delay = 0.001  # 1ms default
+        
+    def start(self):
+        """Start order response handler"""
+        self.running = True
+        self.thread = threading.Thread(target=self._handle_responses)
+        self.thread.start()
+        
+    def stop(self):
+        """Stop order response handler"""
+        self.running = False
+        if self.thread:
+            self.thread.join()
+            
+    def set_response_delay(self, delay_ms: float):
+        """Set response delay in milliseconds"""
+        self.response_delay = delay_ms / 1000.0
+        
+    def _handle_responses(self):
+        """Main order response loop"""
+        while self.running:
+            self.raze.auto_respond_new_order()
+            time.sleep(self.response_delay)
+
+class QuoteChangeTestCase(TestCase):
+    """Test case for quote-triggered order generation"""
+    
+    def __init__(self, name: str, gtad_config: GtadConfig, instruments: List[Any], 
+                 quote_patterns: List[Dict], duration_seconds: int = 10):
+        super().__init__(name, gtad_config, instruments)
+        self.quote_patterns = quote_patterns
+        self.duration_seconds = duration_seconds
+        self.md_generator = None
+        self.order_handler = None
+        self.lmx = None
+        self.raze = None
+        self.gtad = None
+        self.md_simulators = None
+        
+    def setup(self):
+        """Setup test resources"""
+        print(f"[{self.name}] Setting up test case...")
+        
+        # Initialize simulators
+        routing_ids = {
+            ascii_routing_id_to_integer("0000"): "ROUTING_ID_0",
+            ascii_routing_id_to_integer("0001"): "ROUTING_ID_1",
+        }
+        
+        self.raze = initialize_raze(self.gtad_config, routing_ids)
+        self.md_simulators = create_md_simulators(self.gtad_config)
+        self.gtad = create_gtad(self.gtad_config)
+        self.lmx = initialize_lmx(self.gtad_config, [self.gtad], self.instruments)
+        
+        # Start market data simulators
+        for name, sim in self.md_simulators.items():
+            sim.start()
+            
+        # Setup parallel handlers
+        self.md_generator = MarketDataGenerator(self.md_simulators, self.instruments)
+        self.order_handler = OrderResponseHandler(self.raze)
+        
+        # Configure order generation
+        send_order_on_md(self.lmx, "nyse_pillar", "SPCAST_L3_V4", delay_ms=100)
+        
+    def run(self):
+        """Run the test"""
+        print(f"[{self.name}] Starting test execution...")
+        
+        # Start parallel handlers
+        self.md_generator.start()
+        self.order_handler.start()
+        
+        # Execute quote patterns
+        start_time = time.time()
+        pattern_index = 0
+        
+        while (time.time() - start_time) < self.duration_seconds:
+            # Send quote pattern
+            pattern = self.quote_patterns[pattern_index % len(self.quote_patterns)]
+            self.md_generator.add_quote_pattern(pattern)
+            self.metrics.quotes_sent += 1
+            
+            # Small delay between quotes
+            time.sleep(0.01)  # 10ms between quotes
+            pattern_index += 1
+            
+        # Stop handlers
+        self.md_generator.stop()
+        self.order_handler.stop()
+        
+    def teardown(self):
+        """Cleanup resources"""
+        print(f"[{self.name}] Cleaning up...")
+        
+        if self.lmx:
+            self.lmx.close()
+        if self.raze:
+            self.raze.stop()
+        if self.gtad:
+            self.gtad.stop()
+        for sim in self.md_simulators.values():
+            sim.stop()
+            
+    def validate(self) -> bool:
+        """Validate test results"""
+        print(f"[{self.name}] Validating results...")
+        # Add validation logic here
+        return True
+
+class BurstTestCase(TestCase):
+    """Test case for burst order generation"""
+    
+    def __init__(self, name: str, gtad_config: GtadConfig, instruments: List[Any],
+                 burst_size: int = 100, burst_interval_ms: int = 1000):
+        super().__init__(name, gtad_config, instruments)
+        self.burst_size = burst_size
+        self.burst_interval_ms = burst_interval_ms
+        
+    def setup(self):
+        # Implementation here
+        pass
+        
+    def run(self):
+        # Implementation here
+        pass
+        
+    def teardown(self):
+        # Implementation here
+        pass
+        
+    def validate(self) -> bool:
+        # Implementation here
+        return True
+
+class PerformanceTestRunner:
+    """Main test runner for performance tests"""
+    
+    def __init__(self, output_dir: str = "/tmp/perf_test_results"):
+        self.test_cases: List[TestCase] = []
+        self.output_dir = output_dir
+        self.results = {}
+        
+    def add_test_case(self, test_case: TestCase):
+        """Add a test case to the runner"""
+        self.test_cases.append(test_case)
+        
+    def run_all(self, parallel: bool = False):
+        """Run all test cases"""
+        print(f"Running {len(self.test_cases)} test cases...")
+        
+        if parallel:
+            self._run_parallel()
+        else:
+            self._run_sequential()
+            
+        self._generate_report()
+        
+    def _run_sequential(self):
+        """Run tests sequentially"""
+        for test_case in self.test_cases:
+            self._run_single_test(test_case)
+            
+    def _run_parallel(self):
+        """Run tests in parallel (if resources allow)"""
+        # Note: May need careful resource management for parallel execution
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            futures = [executor.submit(self._run_single_test, tc) for tc in self.test_cases]
+            for future in futures:
+                future.result()
+                
+    def _run_single_test(self, test_case: TestCase):
+        """Run a single test case"""
+        print(f"\n{'='*60}")
+        print(f"Running test case: {test_case.name}")
+        print(f"{'='*60}")
+        
+        try:
+            test_case.setup()
+            test_case.run()
+            success = test_case.validate()
+            metrics = test_case.get_metrics()
+            
+            self.results[test_case.name] = {
+                'success': success,
+                'metrics': metrics,
+                'duration': metrics.end_time - metrics.start_time
+            }
+            
+            print(f"Test {test_case.name}: {'PASSED' if success else 'FAILED'}")
+            print(f"Duration: {metrics.end_time - metrics.start_time:.2f}s")
+            print(f"Quotes sent: {metrics.quotes_sent}")
+            
+        except Exception as e:
+            print(f"Test {test_case.name} failed with error: {e}")
+            self.results[test_case.name] = {
+                'success': False,
+                'error': str(e)
+            }
+        finally:
+            test_case.teardown()
+            
+    def _generate_report(self):
+        """Generate test report"""
+        report_path = f"{self.output_dir}/perf_test_report_{int(time.time())}.json"
+        
+        with open(report_path, 'w') as f:
+            json.dump(self.results, f, indent=2, default=str)
+            
+        print(f"\nTest report saved to: {report_path}")
+        
+        # Print summary
+        total_tests = len(self.results)
+        passed_tests = sum(1 for r in self.results.values() if r.get('success', False))
+        
+        print(f"\nTest Summary:")
+        print(f"Total tests: {total_tests}")
+        print(f"Passed: {passed_tests}")
+        print(f"Failed: {total_tests - passed_tests}") 
+
+
+run_perf_tests_cicd.py
+
+#!/usr/bin/env python3
+"""
+CI/CD ready performance test runner
+Designed for automated testing in continuous integration pipelines
+"""
+
+import sys
+import os
+import argparse
+import json
+import time
+from pathlib import Path
+from datetime import datetime
+
+# Add imports for test framework
+from perf_test_framework import PerformanceTestRunner
+from perf_test_cases import *
+from perf_test_lib import GtadConfig
+from gtf.security_context.instrument import Instrument
+
+class CICDTestRunner:
+    """CI/CD optimized test runner with proper exit codes and reporting"""
+    
+    def __init__(self, config_file: str = None):
+        self.config_file = config_file or os.environ.get('PERF_TEST_CONFIG', 'perf_test_config.json')
+        self.config = self._load_config()
+        self.exit_code = 0
+        
+    def _load_config(self):
+        """Load configuration from file or use defaults"""
+        default_config = {
+            "output_dir": os.environ.get('PERF_TEST_OUTPUT', '/tmp/perf_test_results'),
+            "gtad_config": {
+                "strategy_name": "gts_lts_test",
+                "strategy_leg": "main",
+                "strategy_id": 555,
+                "fund": "paper",
+                "output_dir": "/apps/sb_afts/"
+            },
+            "instruments": [
+                {"symbol": "AAPL.OQ", "name": "AAPL", "spec_id": 426030, "security_id": 1093160},
+                {"symbol": "MSFT.OQ", "name": "MSFT", "spec_id": 544939, "security_id": 690475},
+                {"symbol": "NVDA.OQ", "name": "NVDA", "spec_id": 880615, "security_id": 622865}
+            ],
+            "test_suites": {
+                "quick": ["rapid_quote_test", "order_burst_small"],
+                "standard": ["rapid_quote_test", "latency_test", "order_burst_test", "multi_instrument_test"],
+                "comprehensive": ["all"]
+            },
+            "timeout_seconds": 300,  # 5 minute overall timeout
+            "parallel_execution": False
+        }
+        
+        if os.path.exists(self.config_file):
+            with open(self.config_file, 'r') as f:
+                loaded_config = json.load(f)
+                default_config.update(loaded_config)
+                
+        return default_config
+        
+    def create_test_cases(self, suite_name: str):
+        """Create test cases based on suite selection"""
+        # Create GTad config
+        gtad_config = GtadConfig(
+            strategy_name=self.config['gtad_config']['strategy_name'],
+            strategy_leg=self.config['gtad_config']['strategy_leg'],
+            strategy_id=self.config['gtad_config']['strategy_id'],
+            fund=self.config['gtad_config']['fund'],
+            output_dir=self.config['gtad_config']['output_dir']
+        )
+        
+        # Create instruments
+        instruments = [
+            Instrument(
+                inst['symbol'],
+                inst['name'],
+                inst['spec_id'],
+                inst['security_id'],
+                "splitstripid",
+                "ric"
+            )
+            for inst in self.config['instruments']
+        ]
+        
+        # Define available test cases
+        available_tests = {
+            "rapid_quote_test": QuoteChangeTestCase(
+                name="rapid_quote_changes",
+                gtad_config=gtad_config,
+                instruments=instruments,
+                quote_patterns=[
+                    {'instrument': instruments[0], 'bid_price': 100.0 + i*0.1, 
+                     'bid_qty': 100, 'ask_price': 100.5 + i*0.1, 'ask_qty': 100}
+                    for i in range(5)
+                ],
+                duration_seconds=10  # Short duration for CI/CD
+            ),
+            
+            "latency_test": LatencyMeasurementTestCase(
+                name="latency_measurement",
+                gtad_config=gtad_config,
+                instruments=instruments,
+                order_rate_per_second=10,
+                duration_seconds=20
+            ),
+            
+            "order_burst_small": OrderBurstTestCase(
+                name="order_burst_small",
+                gtad_config=gtad_config,
+                instruments=instruments,
+                burst_size=50,
+                num_bursts=3,
+                burst_interval_seconds=2
+            ),
+            
+            "order_burst_test": OrderBurstTestCase(
+                name="order_burst_standard",
+                gtad_config=gtad_config,
+                instruments=instruments,
+                burst_size=100,
+                num_bursts=5,
+                burst_interval_seconds=3
+            ),
+            
+            "market_data_stress": MarketDataStressTestCase(
+                name="market_data_stress",
+                gtad_config=gtad_config,
+                instruments=instruments,
+                quotes_per_second=500,  # Moderate rate for CI/CD
+                duration_seconds=15
+            ),
+            
+            "multi_instrument_test": MultiInstrumentTestCase(
+                name="multi_instrument_trading",
+                gtad_config=gtad_config,
+                instruments=instruments,
+                orders_per_instrument_per_second=5,
+                duration_seconds=30
+            )
+        }
+        
+        # Select tests based on suite
+        suite_tests = self.config['test_suites'].get(suite_name, [])
+        
+        if 'all' in suite_tests:
+            return list(available_tests.values())
+        else:
+            return [available_tests[test_name] for test_name in suite_tests 
+                   if test_name in available_tests]
+            
+    def run(self, suite_name: str = "quick"):
+        """Run the test suite"""
+        print(f"{'='*60}")
+        print(f"Performance Test Suite: {suite_name}")
+        print(f"Start Time: {datetime.now().isoformat()}")
+        print(f"Config: {self.config_file}")
+        print(f"Output Directory: {self.config['output_dir']}")
+        print(f"{'='*60}\n")
+        
+        # Create output directory
+        Path(self.config['output_dir']).mkdir(parents=True, exist_ok=True)
+        
+        # Create test runner
+        runner = PerformanceTestRunner(output_dir=self.config['output_dir'])
+        
+        # Add test cases
+        test_cases = self.create_test_cases(suite_name)
+        for test_case in test_cases:
+            runner.add_test_case(test_case)
+            
+        print(f"Running {len(test_cases)} test cases...\n")
+        
+        # Run with timeout
+        start_time = time.time()
+        try:
+            runner.run_all(parallel=self.config['parallel_execution'])
+            
+            # Check results
+            self._process_results(runner.results)
+            
+        except Exception as e:
+            print(f"\nERROR: Test suite failed with exception: {e}")
+            self.exit_code = 2
+            
+        finally:
+            duration = time.time() - start_time
+            print(f"\nTotal execution time: {duration:.2f} seconds")
+            
+            # Check timeout
+            if duration > self.config['timeout_seconds']:
+                print(f"WARNING: Tests exceeded timeout of {self.config['timeout_seconds']} seconds")
+                self.exit_code = 3
+                
+    def _process_results(self, results: dict):
+        """Process test results and set exit code"""
+        total_tests = len(results)
+        passed_tests = sum(1 for r in results.values() if r.get('success', False))
+        failed_tests = total_tests - passed_tests
+        
+        # Generate summary report
+        summary = {
+            'timestamp': datetime.now().isoformat(),
+            'total_tests': total_tests,
+            'passed': passed_tests,
+            'failed': failed_tests,
+            'success_rate': (passed_tests / total_tests * 100) if total_tests > 0 else 0,
+            'results': results
+        }
+        
+        # Save summary
+        summary_path = Path(self.config['output_dir']) / f"test_summary_{int(time.time())}.json"
+        with open(summary_path, 'w') as f:
+            json.dump(summary, f, indent=2, default=str)
+            
+        print(f"\n{'='*60}")
+        print(f"TEST SUMMARY")
+        print(f"{'='*60}")
+        print(f"Total Tests: {total_tests}")
+        print(f"Passed: {passed_tests}")
+        print(f"Failed: {failed_tests}")
+        print(f"Success Rate: {summary['success_rate']:.1f}%")
+        print(f"\nDetailed results saved to: {summary_path}")
+        
+        # Set exit code based on results
+        if failed_tests > 0:
+            self.exit_code = 1
+            print("\nSTATUS: FAILED")
+        else:
+            print("\nSTATUS: PASSED")
+            
+        # Print failed test details
+        if failed_tests > 0:
+            print(f"\nFailed Tests:")
+            for test_name, result in results.items():
+                if not result.get('success', False):
+                    error = result.get('error', 'Unknown error')
+                    print(f"  - {test_name}: {error}")
+
+def main():
+    """Main entry point for CI/CD"""
+    parser = argparse.ArgumentParser(description='CI/CD Performance Test Runner')
+    parser.add_argument('--suite', type=str, default='quick',
+                      choices=['quick', 'standard', 'comprehensive'],
+                      help='Test suite to run')
+    parser.add_argument('--config', type=str, help='Path to configuration file')
+    parser.add_argument('--output-dir', type=str, help='Output directory for results')
+    parser.add_argument('--timeout', type=int, help='Overall timeout in seconds')
+    parser.add_argument('--parallel', action='store_true', help='Run tests in parallel')
+    
+    args = parser.parse_args()
+    
+    # Create runner
+    runner = CICDTestRunner(config_file=args.config)
+    
+    # Override config with command line args
+    if args.output_dir:
+        runner.config['output_dir'] = args.output_dir
+    if args.timeout:
+        runner.config['timeout_seconds'] = args.timeout
+    if args.parallel:
+        runner.config['parallel_execution'] = True
+        
+    # Run tests
+    runner.run(suite_name=args.suite)
+    
+    # Exit with appropriate code
+    sys.exit(runner.exit_code)
+
+if __name__ == "__main__":
+    main() 
