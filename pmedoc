@@ -1,0 +1,100 @@
+# PME – Packet Matching Engine Documentation
+
+## 1. Introduction
+This document captures the current behaviour of the Packet Matching Engine (PME) as implemented in this repository. All statements, default values and examples are taken directly from the source-code so that this page stays truthful to the implementation.
+
+---
+
+## 2. Configuration Reference (`yaml`)
+The application expects a single YAML configuration file supplied at runtime (see command-line).  The file is parsed in `AppConfig::load` (```1:1:src/Config.cpp```) and validated in `AppConfig::validate` (```60:100:src/Config.cpp```).
+
+### 2.1 Top level keys
+| Key | Type | Required | Description |
+|-----|------|----------|-------------|
+| `flow_sets` | list<FlowSet> | **yes** | At least one flow set must be defined. (`validate()` throws if empty). |
+| `other_configs` | map | no | Miscellaneous options. |
+
+### 2.2 `FlowSet`
+A flow-set groups one *ingress* flow with one *egress* flow so that PME can measure latency between them.
+
+| Field | Type | Required | Default | Notes |
+|-------|------|----------|---------|-------|
+| `set_name` | string | **yes** | – | Must be non-empty. |
+| `watch_directory` | string | **yes** | – | Directory that PME watches for new `.pcap`/`.pcapng` files (created in `Engine::getNextPcapFile`). PME will create it if it does not exist. |
+| `output_directory` | string | **yes** | – | Where PME writes `<set_name>_results.csv`. Created if missing. |
+| `ingress_flows` | list<Flow> | **yes** | – | At least one ingress flow. |
+| `egress_flows` | list<Flow> | **yes** | – | At least one egress flow. |
+
+#### 2.2.1 `Flow`
+| Field | Type | Required | Default | Permissible values |
+|--------|------|----------|---------|--------------------|
+| `name` | string | **yes** | – | Descriptive label; used only for logging. |
+| `protocol.communication` | enum | **yes** | – | `tcp`, `udp` (case-insensitive). Parsed in `stringToCommunicationProtocol`. |
+| `protocol.message` | enum | **yes** | – | `spcastv3`, `raze` (case-insensitive). Parsed in `stringToMessageProtocol`. |
+| `src_ip` | string | no | empty | Any valid IP or empty = wildcard. |
+| `dst_ip` | string | no | empty | "" means wildcard. |
+| `src_port` | integer | no | `0` | 0 means wildcard. |
+| `dst_port` | integer | no | `0` | 0 means wildcard. |
+
+### 2.3 `other_configs`
+| Field | Type | Default | Purpose | Notable log / behaviour |
+|-------|------|---------|---------|------------------------|
+| `debug_mode` | bool | `false` | When **true** PME sets global log level to DEBUG in `main.cpp` line 13. |
+| `dropcopy_path` | string | – | Currently stored but **not used elsewhere** in codebase. |
+| `oldest_spcast_date` | string `dd/mm/yyyy` | – | Converted to `std::chrono::high_resolution_clock` (see helper in `Config.h`). `SpcastV3Handler` logs a WARN if any packet timestamp is older than this. |
+| `ringbuffer_size` | size (bytes) | `1048576` (1 MiB) | Initial capacity for `RingBuffer` allocations (`Config.h` default). Currently not referenced outside configuration object. |
+
+---
+
+## 3. Command-line usage
+PME exposes one positional option via Boost.Program_options (```1:15:src/Cli.h```).
+
+```bash
+./pme --config path/to/config.yaml       # long form
+./pme -c path/to/config.yaml            # short form
+```
+The application will exit with an error if the argument is omitted or if the file cannot be parsed/validated.
+
+---
+
+## 4. Error reporting
+1. **Startup / config errors** – thrown as `std::runtime_error` or `YAML::Exception` inside `AppConfig::load` & `validate`. Logged to `stderr` by the CLI wrapper.
+2. **Runtime warnings** – logged via `PME_LOG_WARN`, e.g. old market-data date in `SpcastV3Handler`.
+3. **I/O failures** – if PME cannot open/write the result CSV the writer logs `PME_LOG_ERROR` and returns `false`.
+
+Action: examine the accompanying log line, fix config or filesystem permissions, then retry.
+
+---
+
+## 5. Determining a successful run
+A run is considered successful when:
+* The log contains `"Engine started. Processing PCAP files…"` and later `"Finished processing: <file>"`.
+* For each flow-set a CSV named `<set_name>_results.csv` exists in its `output_directory`.
+
+---
+
+## 6. Results format
+Writer implementation (`OutputFileWriter::writeFlowSet`) produces:
+
+```text
+entry_index,ingress_timestamp_ns,egress_timestamp_ns,latency_ns
+0,1720855062162499000,1720855062175020000,12521000
+```
+
+Explanation of columns:
+* `entry_index` – incremental counter starting at 0.
+* `ingress_timestamp_ns` – nanoseconds since epoch when packet arrived on ingress flow.
+* `egress_timestamp_ns` – same for egress.
+* `latency_ns` – simple difference `egress – ingress`.
+
+If `latency_ns` is **negative**, timestamps between the two flows are inconsistent – check system clock sources or that flows are correctly configured.
+
+---
+
+## 7. Port Spanning
+*To-be-documented* – no implementation in this repository.
+
+---
+
+## 8. Sample configuration
+See `config_example.yaml` in the repository for a fully-annotated example. 
