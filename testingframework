@@ -1,0 +1,411 @@
+cases
+
+
+
+from perf_test_framework import *
+
+class MarketDataLiveUpdate(TestCase):
+    """Test case for quote-triggered order generation"""
+    
+    def __init__(self, name: str, gtad_config: GtadConfig, duration_seconds: int = 10, quote_patterns: List[Dict] = None, random_quotes: bool = False):
+        super().__init__(name, gtad_config)
+        self.quote_patterns = quote_patterns if not random_quotes else None
+        self.duration_seconds = duration_seconds
+    
+    def setup(self):
+        """Setup test resources"""
+        print(f"[{self.name}] Setting up test case...")
+        
+        # Initialize simulators
+        self.routing_ids = [
+            ascii_routing_id_to_integer("MRRF"), #ROUTING_ID_A
+            ascii_routing_id_to_integer("MRR"), #ROUTING_ID_1
+            ascii_routing_id_to_integer("MRRR2"), #ROUTING_ID_2
+            ascii_routing_id_to_integer("MRRR3"), #ROUTING_ID_3
+            ascii_routing_id_to_integer("MRRR4"), #ROUTING_ID_4
+            ascii_routing_id_to_integer("MRRR5"), #ROUTING_ID_5
+        ]
+        
+        self.instruments = [
+            Instrument("AAPL.OQ", "AAPL", 426016, 1059346, "splitingid", "clc"),
+            Instrument("NRY.OL", "NRY", 544934, 666673, "splitingid", "clc"),
+            Instrument("VOD.L", "VOD", 880085, 622845, "splitingid", "clc"),
+        ]
+        #Prefer to instrument.py for definition.
+        #Check gtad_universe_list in gtad_test.py for larger example list of valid instruments.
+        
+        self.raze = initialize_raze(self.gtad_config, self.routing_ids)
+        self.md_simulators = create_md_simulators(self.gtad_config)
+        self.gtad = create_gtad(self.gtad_config)
+        self.iex = initialize_iex(self.gtad_config, [self.gtad], self.instruments)
+        
+        # Start market data simulators
+        for name, sim in self.md_simulators.items():
+            sim.start()
+            print(f"Started simulator [{name}]")
+        
+        self.md_generator = MarketDataGenerator(self.md_simulators, self.instruments, self.quote_patterns) #None quote_patterns will result in random quotes, for instruments[0]
+        self.order_handler = OrderResponseHandler(self.raze)
+        
+        # Configure order generation
+        send_order_on_md(self.iex, "nyse_pillar", "SPCAST_11_V4", delay_ms=1)
+    
+    def run(self):
+        """Run the test"""
+        print(f"[{self.name}] Starting test execution...")
+        
+        self.md_generator.start()
+        self.order_handler.start()
+        
+        # Execute quote patterns
+        start_time = time.time()
+        pattern_index = 0
+        
+        while (time.time() - start_time) < self.duration_seconds:
+            time.sleep(0.1)
+        # Stop handlers
+        self.md_generator.stop()
+        self.order_handler.stop()
+    
+    def teardown(self):
+        """Cleanup resources"""
+        print(f"[{self.name}] Cleaning up...")
+        
+        if self.iex:
+            self.iex.stop()
+        if self.raze:
+            self.raze.stop()
+        for sim in self.md_simulators.values():
+            sim.stop()
+
+
+
+
+
+example
+
+"""Unified CLI entry point that discovers and runs performance test cases.
+
+You no longer need to edit this file when adding new cases to perf_test_cases.py.
+Drop a subclass of TestCase anywhere under `perf_test_cases` package and it will
+be picked up automatically.
+"""
+
+from __future__ import annotations
+
+import argparse
+import importlib
+import pkgutil
+import sys
+from pathlib import Path
+
+from perf_test_framework import TestCase, PerformanceTestRunner, GtadConfig
+
+# Ensure all sub-modules of perf_test_cases are imported so that TestCase
+# subclasses can register themselves via TestCase.__init_subclass__().
+import perf_test_cases  # this is a package or module present in workspace
+
+
+def _discover_test_modules(root_pkg):
+    """Recursively import every sub-module in *root_pkg*."""
+    if not hasattr(root_pkg, "__path__"):
+        # Single file module; already imported, nothing to do.
+        return
+
+    for mod_info in pkgutil.walk_packages(root_pkg.__path__, prefix=root_pkg.__name__ + "."):
+        importlib.import_module(mod_info.name)
+
+
+def main(argv: list[str] | None = None):
+    parser = argparse.ArgumentParser(description="Performance Test Suite")
+    parser.add_argument("--test", "-t", type=str, help="Run specific test case by name")
+    parser.add_argument("--list", "-l", action="store_true", help="List available tests and exit")
+    parser.add_argument("--duration", type=int, default=10, help="Default test duration in seconds (if applicable)")
+
+    args = parser.parse_args(argv)
+
+    # Import every test module so subclasses get registered.
+    _discover_test_modules(perf_test_cases)
+
+    available = {cls.__name__: cls for cls in TestCase.available_test_cases()}
+
+    if args.list:
+        print("Available test cases:")
+        for name in sorted(available):
+            print("  -", name)
+        return
+
+    # Global test configuration (could also be parameterized via CLI)
+    gtad_config = GtadConfig(
+        strategy_name="gta_lts_test1",
+        strategy_leg="main",
+        strategy_id=6598,
+        fund="pepec",
+        output_dir="/apps/ep_hft/",
+    )
+
+    runner = PerformanceTestRunner()
+
+    def _instantiate(cls):
+        # If the ctor expects duration_seconds, supply it; else just name+config
+        try:
+            return cls(name=cls.__name__, gtad_config=gtad_config, duration_seconds=args.duration)
+        except TypeError:
+            return cls(name=cls.__name__, gtad_config=gtad_config)
+
+    if args.test:
+        if args.test not in available:
+            print(f"Unknown test '{args.test}'. Use --list to see all options.")
+            sys.exit(1)
+        runner.add_test_case(_instantiate(available[args.test]))
+    else:
+        for cls in available.values():
+            runner.add_test_case(_instantiate(cls))
+
+    runner.run_all()
+
+
+if __name__ == "__main__":
+    main()
+
+
+
+
+
+
+
+
+framework
+
+
+import threading
+import multiprocessing
+import queue
+import time
+import json
+import abc
+import inspect
+import random
+import logging
+from typing import Dict, List, Optional, Callable, Any, Type
+from dataclasses import dataclass
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
+from perf_test_lib import *
+
+# Setup logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+
+class TestCase(abc.ABC):
+    """Abstract base class for test cases"""
+    
+    # Registry that automatically tracks every concrete subclass.
+    _registry: List[Type["TestCase"]] = []
+
+    def __init_subclass__(cls, **kwargs):
+        """Automatically register non-abstract subclasses so that they can be
+        instantiated later without manual bookkeeping in the main script."""
+        super().__init_subclass__(**kwargs)
+
+        # Only register classes that are concrete (i.e. implement all
+        # abstract methods). This avoids adding the base TestCase itself or
+        # any mix-ins to the registry.
+        if not inspect.isabstract(cls):
+            TestCase._registry.append(cls)
+
+    @classmethod
+    def available_test_cases(cls) -> List[Type["TestCase"]]:
+        """Return a list of all discovered concrete TestCase subclasses."""
+        return list(cls._registry)
+
+    def __init__(self, name: str, gtad_config: GtadConfig):
+        self.name = name
+        self.gtad_config = gtad_config
+        self.running = False
+        self.md_generator = None
+        self.order_handler = None
+        self.iex = None
+        self.raze = None
+        self.gtad = None
+        self.md_simulators = None
+    
+    @abc.abstractmethod
+    def setup(self):
+        """Setup test case resources"""
+        pass
+    
+    @abc.abstractmethod
+    def run(self):
+        """Run the actual test"""
+        pass
+    
+    @abc.abstractmethod
+    def teardown(self):
+        """Cleanup test resources"""
+        pass
+
+
+class MarketDataGenerator:
+    """Handles market data generation in a separate thread"""
+    
+    def __init__(self, simulators: Dict[str, Any], instruments: List[Any], quote_patterns: List[Dict] = None):
+        self.simulators = simulators
+        self.instruments = instruments
+        self.running = False
+        self.thread = None
+        self.quote_queue = queue.Queue()
+        self.quote_patterns = quote_patterns
+        self.seq_nums = {name: 1 for name in simulators.keys()}
+    
+    def start(self):
+        """Start market data generation thread"""
+        self.running = True
+        self.thread = threading.Thread(target=self.run)
+        self.thread.start()
+    
+    def stop(self):
+        """Stop market data generation"""
+        self.running = False
+        if self.thread:
+            self.thread.join()
+    
+    def refill_quote_queue(self):
+        """Refill the queue with quote patterns"""
+        for pattern in self.quote_patterns:
+            self.quote_queue.put(pattern)
+    
+    def _random_quotes(self):
+        self.pattern = {
+            'instrument': self.instruments[0], 
+            'bid_price': random.randint(0, 1000), 
+            'bid_qty': random.randint(0, 1000), 
+            'ask_price': random.randint(1, 1000), 
+            'ask_qty': random.randint(1, 1000)
+        }
+        return self.pattern
+    
+    def run(self):
+        """Main market data generation loop"""
+        while self.running:
+            if self.quote_patterns:
+                try:
+                    pattern = self.quote_queue.get_nowait()
+                    self._send_quote(pattern)
+                except queue.Empty:
+                    self.refill_quote_queue()
+            else:
+                pattern = self._random_quotes()
+                self._send_quote(pattern)
+    
+    def _send_quote(self, pattern: Dict[str, Any]):
+        """Send quote to simulators"""
+        print(f"[MarketData] Sending quote - Bid: {pattern['bid_price']}@{pattern['bid_qty']}, Ask: {pattern['ask_price']}@{pattern['ask_qty']}")
+        for name, sim in self.simulators.items():
+            try:
+                sim.send_quote(
+                    self.seq_nums[name],
+                    pattern['bid_price'],
+                    pattern['bid_qty'],
+                    pattern['ask_price'],
+                    pattern['ask_qty'],
+                )
+                self.seq_nums[name] += 1
+            except Exception as e:
+                logger.error(f"Failed to send quote to simulator {name}: {e}")
+
+
+class OrderResponseHandler:
+    """Handles order responses in a separate thread"""
+    
+    def __init__(self, raze_simulator):
+        self.raze = raze_simulator
+        self.running = False
+        self.thread = None
+        self.response_delay = 0.0  # default
+    
+    def start(self):
+        """Start order response handler"""
+        self.running = True
+        self.thread = threading.Thread(target=self._handle_responses)
+        self.thread.start()
+    
+    def stop(self):
+        """Stop order response handler"""
+        self.running = False
+        if self.thread:
+            self.thread.join()
+    
+    def set_response_delay(self, delay_ms: float):
+        """Set response delay in milliseconds"""
+        self.response_delay = delay_ms / 1000.0
+    
+    def _handle_responses(self):
+        """Main order response loop"""
+        while self.running:
+            self.raze.auto_respond_new_order()
+            if self.response_delay != 0.0:
+                time.sleep(self.response_delay)
+
+
+class PerformanceTestRunner:
+    """Main test runner for performance tests"""
+    
+    def __init__(self):
+        self.test_cases: List[TestCase] = []
+
+    def add_test_case(self, test_case: TestCase):
+        """Add a test case to the runner"""
+        self.test_cases.append(test_case)
+
+    def run_all(self):
+        """Run all test cases"""
+        print(f"Running {len(self.test_cases)} test cases...")
+        
+        for test_case in self.test_cases:
+            self._run_single_test(test_case)
+
+    def _run_single_test(self, test_case: TestCase):
+        """Run a single test case"""
+        print(f"\n{'='*60}")
+        print(f"Running test case: {test_case.name}")
+        print(f"{'='*60}")
+        
+        try:
+            logger.info(f"Setting up test case: {test_case.name}")
+            test_case.setup()
+            
+            logger.info(f"Running test case: {test_case.name}")
+            test_case.run()
+            
+            print(f"Test {test_case.name}: COMPLETE")
+            logger.info(f"Test {test_case.name} completed successfully")
+        
+        except Exception as e:
+            print(f"Test {test_case.name} failed with error: {e}")
+            logger.error(f"Test {test_case.name} failed", exc_info=True)
+        finally:
+            try:
+                logger.info(f"Tearing down test case: {test_case.name}")
+                test_case.teardown()
+            except Exception as e:
+                logger.error(f"Error during teardown of test {test_case.name}: {e}")
+
+
+
+
+Implemented automatic discovery/registration so that adding a new subclass of TestCase inside perf_test_cases.py (or any future modules you import) is all that’s required—no more edits to perf_test_example.py (“main.py”).
+Key points:
+perf_test_framework.py 
+TestCase now keeps a class-level _registry and self-registers any non-abstract subclass via __init_subclass__.
+Added TestCase.available_test_cases() to return the collected classes.
+perf_test_example.py 
+Rewritten as a clean CLI:
+Dynamically imports every sub-module under perf_test_cases (if it’s a package) so registration happens automatically.
+Supports --list to show all available tests, --test NAME to run a single test, plus a global --duration override.
+Instantiates each discovered class with sensible defaults; no explicit add_test_case(...) calls remain.
+How to use:
+python perf_test_example.py --list        # see all tests
+python perf_test_example.py               # run every discovered test
+python perf_test_example.py --test MarketDataLiveUpdate  
+Now you can drop new subclasses into perf_test_cases.py (or split them into additional modules and import them) and they’ll be discoverable without touching the CLI.
