@@ -1,0 +1,1024 @@
+{
+  "instruments": {
+    "AAPL": {
+      "symbol": "AAPL.OQ",
+      "name": "AAPL",
+      "id1": 426016,
+      "id2": 1059346,
+      "splitingid": "splitingid",
+      "clc": "clc"
+    },
+    "NRY": {
+      "symbol": "NRY.OL",
+      "name": "NRY", 
+      "id1": 544934,
+      "id2": 666673,
+      "splitingid": "splitingid",
+      "clc": "clc"
+    },
+    "VOD": {
+      "symbol": "VOD.L",
+      "name": "VOD",
+      "id1": 880085,
+      "id2": 622845,
+      "splitingid": "splitingid",
+      "clc": "clc"
+    }
+  },
+  "patterns": {
+    "STABLE_SPREAD": [
+      {
+        "instrument": "AAPL",
+        "bid_price": 100,
+        "bid_qty": 1000,
+        "ask_price": 101,
+        "ask_qty": 1000
+      },
+      {
+        "instrument": "AAPL",
+        "bid_price": 99,
+        "bid_qty": 2000,
+        "ask_price": 100,
+        "ask_qty": 2000
+      }
+    ],
+    "VOLATILE": [
+      {
+        "instrument": "NRY",
+        "bid_price": 50,
+        "bid_qty": 500,
+        "ask_price": 55,
+        "ask_qty": 500
+      },
+      {
+        "instrument": "VOD",
+        "bid_price": 30,
+        "bid_qty": 1500,
+        "ask_price": 31,
+        "ask_qty": 1500
+      }
+    ]
+  },
+  "tests": {
+    "MarketDataLiveUpdate": "STABLE_SPREAD"
+  }
+} 
+
+# Performance Test Configuration
+# Defines instruments, quote patterns, and test assignments
+
+instruments:
+  AAPL:
+    symbol: AAPL.OQ
+    name: AAPL
+    id1: 426016
+    id2: 1059346
+    splitingid: splitingid
+    clc: clc
+    
+  NRY:
+    symbol: NRY.OL
+    name: NRY
+    id1: 544934
+    id2: 666673
+    splitingid: splitingid
+    clc: clc
+    
+  VOD:
+    symbol: VOD.L
+    name: VOD
+    id1: 880085
+    id2: 622845
+    splitingid: splitingid
+    clc: clc
+
+patterns:
+  STABLE_SPREAD:
+    - instrument: AAPL
+      bid_price: 100
+      bid_qty: 1000
+      ask_price: 101
+      ask_qty: 1000
+      
+    - instrument: AAPL
+      bid_price: 99
+      bid_qty: 2000
+      ask_price: 100
+      ask_qty: 2000
+      
+  VOLATILE:
+    - instrument: NRY
+      bid_price: 50
+      bid_qty: 500
+      ask_price: 55
+      ask_qty: 500
+      
+    - instrument: VOD
+      bid_price: 30
+      bid_qty: 1500
+      ask_price: 31
+      ask_qty: 1500
+      
+  RANDOM_MIX:
+    - instrument: null  # Will use random quotes
+      bid_price: 0
+      bid_qty: 0
+      ask_price: 0
+      ask_qty: 0
+
+tests:
+  MarketDataLiveUpdate: STABLE_SPREAD
+  # AnotherTestCase: VOLATILE
+  # RandomTest: RANDOM 
+
+
+  from perf_test_framework import *
+
+class MarketDataLiveUpdate(TestCase):
+    """Test case for quote-triggered order generation"""
+    
+    def __init__(self, name: str, gtad_config: GtadConfig, duration_seconds: int = 10, 
+                 quote_patterns: List[Dict] = None, random_quotes: bool = False, 
+                 instruments: List[Any] = None):
+        super().__init__(name, gtad_config)
+        self.quote_patterns = quote_patterns if not random_quotes else None
+        self.duration_seconds = duration_seconds
+        self.instruments = instruments or []
+    
+    def setup(self):
+        """Setup test resources"""
+        print(f"[{self.name}] Setting up test case...")
+        
+        # Initialize simulators
+        self.routing_ids = [
+            ascii_routing_id_to_integer("MRRF"), #ROUTING_ID_A
+            ascii_routing_id_to_integer("MRR"), #ROUTING_ID_1
+            ascii_routing_id_to_integer("MRRR2"), #ROUTING_ID_2
+            ascii_routing_id_to_integer("MRRR3"), #ROUTING_ID_3
+            ascii_routing_id_to_integer("MRRR4"), #ROUTING_ID_4
+            ascii_routing_id_to_integer("MRRR5"), #ROUTING_ID_5
+        ]
+        
+        # Use instruments from config if provided, otherwise fall back to defaults
+        if not self.instruments:
+            print(f"[{self.name}] Warning: No instruments provided, using defaults")
+            self.instruments = [
+                Instrument("AAPL.OQ", "AAPL", 426016, 1059346, "splitingid", "clc"),
+                Instrument("NRY.OL", "NRY", 544934, 666673, "splitingid", "clc"),
+                Instrument("VOD.L", "VOD", 880085, 622845, "splitingid", "clc"),
+            ]
+        #Prefer to instrument.py for definition.
+        #Check gtad_universe_list in gtad_test.py for larger example list of valid instruments.
+        
+        self.raze = initialize_raze(self.gtad_config, self.routing_ids)
+        self.md_simulators = create_md_simulators(self.gtad_config)
+        self.gtad = create_gtad(self.gtad_config)
+        self.iex = initialize_iex(self.gtad_config, [self.gtad], self.instruments)
+        
+        # Start market data simulators
+        for name, sim in self.md_simulators.items():
+            sim.start()
+            print(f"Started simulator [{name}]")
+        
+        self.md_generator = MarketDataGenerator(self.md_simulators, self.instruments, self.quote_patterns) #None quote_patterns will result in random quotes, for instruments[0]
+        self.order_handler = OrderResponseHandler(self.raze)
+        
+        # Configure order generation
+        send_order_on_md(self.iex, "nyse_pillar", "SPCAST_11_V4", delay_ms=1)
+    
+    def run(self):
+        """Run the test"""
+        print(f"[{self.name}] Starting test execution...")
+        
+        self.md_generator.start()
+        self.order_handler.start()
+        
+        # Execute quote patterns
+        start_time = time.time()
+        pattern_index = 0
+        
+        while (time.time() - start_time) < self.duration_seconds:
+            time.sleep(0.1)
+        # Stop handlers
+        self.md_generator.stop()
+        self.order_handler.stop()
+    
+    def teardown(self):
+        """Cleanup resources"""
+        print(f"[{self.name}] Cleaning up...")
+        
+        if self.iex:
+            self.iex.stop()
+        if self.raze:
+            self.raze.stop()
+        for sim in self.md_simulators.values():
+            sim.stop()
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+"""Unified CLI entry point that discovers and runs performance test cases.
+
+You no longer need to edit this file when adding new cases to perf_test_cases.py.
+Drop a subclass of TestCase anywhere under `perf_test_cases` package and it will
+be picked up automatically.
+"""
+
+from __future__ import annotations
+
+import argparse
+import importlib
+import pkgutil
+import sys
+from pathlib import Path
+
+from perf_test_framework import TestCase, PerformanceTestRunner, GtadConfig
+
+# Ensure all sub-modules of perf_test_cases are imported so that TestCase
+# subclasses can register themselves via TestCase.__init_subclass__().
+import perf_test_cases  # this is a package or module present in workspace
+
+
+def _discover_test_modules(root_pkg):
+    """Recursively import every sub-module in *root_pkg*."""
+    if not hasattr(root_pkg, "__path__"):
+        # Single file module; already imported, nothing to do.
+        return
+
+    for mod_info in pkgutil.walk_packages(root_pkg.__path__, prefix=root_pkg.__name__ + "."):
+        importlib.import_module(mod_info.name)
+
+
+def main(argv: list[str] | None = None):
+    parser = argparse.ArgumentParser(description="Performance Test Suite")
+    parser.add_argument("--list", "-l", action="store_true", help="List available tests and exit")
+    parser.add_argument("--duration", type=int, default=10, help="Default test duration in seconds (if applicable)")
+    parser.add_argument(
+        "--config",
+        "-c",
+        type=str,
+        required=True,
+        help=(
+            "Configuration as JSON or base64-encoded JSON string that maps tests to "
+            "quote patterns. If the string is not valid JSON it is assumed to be base64 "
+            "which will then be decoded to JSON. Format:\n"
+            "{\n  \"patterns\": { \"PAT_NAME\": [ {quote}, ... ] },\n  "
+            "\"tests\": { \"TestCaseName\": \"PAT_NAME\" | \"RANDOM\" }\n}"
+        ),
+    )
+
+    args = parser.parse_args(argv)
+
+    # Import every test module so subclasses get registered.
+    _discover_test_modules(perf_test_cases)
+
+    available = {cls.__name__: cls for cls in TestCase.available_test_cases()}
+
+    if args.list:
+        print("Available test cases:")
+        for name in sorted(available):
+            print("  -", name)
+        return
+
+    # Parse inline configuration JSON/base64
+    import json, base64
+
+    try:
+        cfg_data = json.loads(args.config)
+    except json.JSONDecodeError:
+        try:
+            decoded = base64.b64decode(args.config).decode()
+            cfg_data = json.loads(decoded)
+        except Exception as exc:
+            print(
+                "--config value is neither valid JSON nor base64-encoded JSON: "
+                f"{exc}"
+            )
+            sys.exit(1)
+
+    pattern_cfg: dict[str, list[dict]] = cfg_data.get("patterns", {})
+    test_to_pattern: dict[str, str] = cfg_data.get("tests", {})
+    
+    # Parse instruments from config
+    instruments_cfg: dict[str, dict] = cfg_data.get("instruments", {})
+    
+    # Build Instrument objects from config
+    from perf_test_lib import Instrument
+    available_instruments: dict[str, Instrument] = {}
+    for inst_name, inst_data in instruments_cfg.items():
+        try:
+            available_instruments[inst_name] = Instrument(
+                inst_data["symbol"],
+                inst_data["name"], 
+                inst_data["id1"],
+                inst_data["id2"],
+                inst_data.get("splitingid", "splitingid"),
+                inst_data.get("clc", "clc")
+            )
+        except Exception as exc:
+            print(f"Failed to create instrument '{inst_name}': {exc}")
+            sys.exit(1)
+
+    # Global test configuration (could also be parameterized via CLI)
+    gtad_config = GtadConfig(
+        strategy_name="gta_lts_test1",
+        strategy_leg="main",
+        strategy_id=6598,
+        fund="pepec",
+        output_dir="/apps/ep_hft/",
+    )
+
+    runner = PerformanceTestRunner()
+
+    from inspect import signature
+
+    def _instantiate(cls):
+        """Instantiate *cls* with gtad_config, duration and quote pattern opts."""
+
+        kwargs = {"name": cls.__name__, "gtad_config": gtad_config}
+
+        # duration_seconds if accepted
+        if "duration_seconds" in signature(cls).parameters:
+            kwargs["duration_seconds"] = args.duration
+
+        # instruments if accepted
+        if "instruments" in signature(cls).parameters:
+            # Pass all available instruments as a list
+            kwargs["instruments"] = list(available_instruments.values())
+
+        # quote pattern / random decision
+        pattern_choice = test_to_pattern.get(cls.__name__)
+        if pattern_choice:
+            if pattern_choice.upper() == "RANDOM":
+                kwargs["random_quotes"] = True
+            else:
+                pattern_data = pattern_cfg.get(pattern_choice)
+                if pattern_data is None:
+                    print(
+                        f"Pattern '{pattern_choice}' for test {cls.__name__} not found in config."
+                    )
+                    sys.exit(1)
+                
+                # Post-process quote patterns: map instrument references to objects
+                processed_patterns = []
+                for pattern in pattern_data:
+                    # Make a copy to avoid modifying the original
+                    p = dict(pattern)
+                    
+                    # Handle instrument field
+                    if "instrument" in p:
+                        inst_ref = p["instrument"]
+                        if inst_ref is None:
+                            pass  # Keep as None
+                        elif isinstance(inst_ref, str):
+                            # Look up instrument by reference name
+                            if inst_ref in available_instruments:
+                                p["instrument"] = available_instruments[inst_ref]
+                            else:
+                                print(
+                                    f"Instrument '{inst_ref}' referenced in pattern "
+                                    f"'{pattern_choice}' not found in instruments config."
+                                )
+                                sys.exit(1)
+                    else:
+                        # Default to None if not specified
+                        p["instrument"] = None
+                    
+                    processed_patterns.append(p)
+                
+                kwargs["quote_patterns"] = processed_patterns
+                kwargs["random_quotes"] = False
+
+        return cls(**kwargs)
+
+    # Determine which tests to run based on configuration; if none specified, run all
+    selected_names = set(test_to_pattern.keys()) if test_to_pattern else set(available.keys())
+
+    # Validate selections
+    unknown_tests = selected_names - available.keys()
+    if unknown_tests:
+        print(
+            "Unknown test(s) in config: " + ", ".join(sorted(unknown_tests)) + ". "
+            "Use --list to see all available tests."
+        )
+        sys.exit(1)
+
+    for name in selected_names:
+        runner.add_test_case(_instantiate(available[name]))
+
+    runner.run_all()
+
+
+if __name__ == "__main__":
+    main()
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+import threading
+import multiprocessing
+import queue
+import time
+import json
+import abc
+import inspect
+import random
+import logging
+from typing import Dict, List, Optional, Callable, Any, Type
+from dataclasses import dataclass
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
+from perf_test_lib import *
+
+# Setup logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+
+class TestCase(abc.ABC):
+    """Abstract base class for test cases"""
+    
+    # Registry that automatically tracks every concrete subclass.
+    _registry: List[Type["TestCase"]] = []
+
+    def __init_subclass__(cls, **kwargs):
+        """Automatically register non-abstract subclasses so that they can be
+        instantiated later without manual bookkeeping in the main script."""
+        super().__init_subclass__(**kwargs)
+
+        # Only register classes that are concrete (i.e. implement all
+        # abstract methods). This avoids adding the base TestCase itself or
+        # any mix-ins to the registry.
+        if not inspect.isabstract(cls):
+            TestCase._registry.append(cls)
+
+    @classmethod
+    def available_test_cases(cls) -> List[Type["TestCase"]]:
+        """Return a list of all discovered concrete TestCase subclasses."""
+        return list(cls._registry)
+
+    def __init__(self, name: str, gtad_config: GtadConfig):
+        self.name = name
+        self.gtad_config = gtad_config
+        self.running = False
+        self.md_generator = None
+        self.order_handler = None
+        self.iex = None
+        self.raze = None
+        self.gtad = None
+        self.md_simulators = None
+    
+    @abc.abstractmethod
+    def setup(self):
+        """Setup test case resources"""
+        pass
+    
+    @abc.abstractmethod
+    def run(self):
+        """Run the actual test"""
+        pass
+    
+    @abc.abstractmethod
+    def teardown(self):
+        """Cleanup test resources"""
+        pass
+
+
+class MarketDataGenerator:
+    """Handles market data generation in a separate thread"""
+    
+    def __init__(self, simulators: Dict[str, Any], instruments: List[Any], quote_patterns: List[Dict] = None):
+        self.simulators = simulators
+        self.instruments = instruments
+        self.running = False
+        self.thread = None
+        self.quote_queue = queue.Queue()
+        self.quote_patterns = quote_patterns
+        self.seq_nums = {name: 1 for name in simulators.keys()}
+    
+    def start(self):
+        """Start market data generation thread"""
+        self.running = True
+        self.thread = threading.Thread(target=self.run)
+        self.thread.start()
+    
+    def stop(self):
+        """Stop market data generation"""
+        self.running = False
+        if self.thread:
+            self.thread.join()
+    
+    def refill_quote_queue(self):
+        """Refill the queue with quote patterns"""
+        for pattern in self.quote_patterns:
+            self.quote_queue.put(pattern)
+    
+    def _random_quotes(self):
+        self.pattern = {
+            'instrument': self.instruments[0], 
+            'bid_price': random.randint(0, 1000), 
+            'bid_qty': random.randint(0, 1000), 
+            'ask_price': random.randint(1, 1000), 
+            'ask_qty': random.randint(1, 1000)
+        }
+        return self.pattern
+    
+    def run(self):
+        """Main market data generation loop"""
+        while self.running:
+            if self.quote_patterns:
+                try:
+                    pattern = self.quote_queue.get_nowait()
+                    self._send_quote(pattern)
+                except queue.Empty:
+                    self.refill_quote_queue()
+            else:
+                pattern = self._random_quotes()
+                self._send_quote(pattern)
+    
+    def _send_quote(self, pattern: Dict[str, Any]):
+        """Send quote to simulators"""
+        print(f"[MarketData] Sending quote - Bid: {pattern['bid_price']}@{pattern['bid_qty']}, Ask: {pattern['ask_price']}@{pattern['ask_qty']}")
+        for name, sim in self.simulators.items():
+            try:
+                sim.send_quote(
+                    self.seq_nums[name],
+                    pattern['bid_price'],
+                    pattern['bid_qty'],
+                    pattern['ask_price'],
+                    pattern['ask_qty'],
+                )
+                self.seq_nums[name] += 1
+            except Exception as e:
+                logger.error(f"Failed to send quote to simulator {name}: {e}")
+
+
+class OrderResponseHandler:
+    """Handles order responses in a separate thread"""
+    
+    def __init__(self, raze_simulator):
+        self.raze = raze_simulator
+        self.running = False
+        self.thread = None
+        self.response_delay = 0.0  # default
+    
+    def start(self):
+        """Start order response handler"""
+        self.running = True
+        self.thread = threading.Thread(target=self._handle_responses)
+        self.thread.start()
+    
+    def stop(self):
+        """Stop order response handler"""
+        self.running = False
+        if self.thread:
+            self.thread.join()
+    
+    def set_response_delay(self, delay_ms: float):
+        """Set response delay in milliseconds"""
+        self.response_delay = delay_ms / 1000.0
+    
+    def _handle_responses(self):
+        """Main order response loop"""
+        while self.running:
+            self.raze.auto_respond_new_order()
+            if self.response_delay != 0.0:
+                time.sleep(self.response_delay)
+
+
+class PerformanceTestRunner:
+    """Main test runner for performance tests"""
+    
+    def __init__(self):
+        self.test_cases: List[TestCase] = []
+
+    def add_test_case(self, test_case: TestCase):
+        """Add a test case to the runner"""
+        self.test_cases.append(test_case)
+
+    def run_all(self):
+        """Run all test cases"""
+        print(f"Running {len(self.test_cases)} test cases...")
+        
+        for test_case in self.test_cases:
+            self._run_single_test(test_case)
+
+    def _run_single_test(self, test_case: TestCase):
+        """Run a single test case"""
+        print(f"\n{'='*60}")
+        print(f"Running test case: {test_case.name}")
+        print(f"{'='*60}")
+        
+        try:
+            logger.info(f"Setting up test case: {test_case.name}")
+            test_case.setup()
+            
+            logger.info(f"Running test case: {test_case.name}")
+            test_case.run()
+            
+            print(f"Test {test_case.name}: COMPLETE")
+            logger.info(f"Test {test_case.name} completed successfully")
+        
+        except Exception as e:
+            print(f"Test {test_case.name} failed with error: {e}")
+            logger.error(f"Test {test_case.name} failed", exc_info=True)
+        finally:
+            try:
+                logger.info(f"Tearing down test case: {test_case.name}")
+                test_case.teardown()
+            except Exception as e:
+                logger.error(f"Error during teardown of test {test_case.name}: {e}")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+#!/usr/bin/env python3
+"""
+Benchmark orchestration for ATP three-host setup.
+
+Sequence:
+  1) Application host (nyzls410d)
+  2) Simulator host (nyzls411d)  <-- now takes -c <base64(JSON)> built from a local config file
+  3) Capture host (nyzls593d)
+
+- All three are started with nohup + timeout so they auto-stop after --duration.
+- Artifacts:
+    - PCAP from capture host (/apps/home/songjoon/pme_test.pcap), saved locally as artifacts/<tag>/pme_test_<tag>.pcap
+    - Most recent dropcopy_mseu_* from application host, archived on the host and downloaded as artifacts/<tag>/dropcopy_latest_<tag>.tgz
+
+Usage example:
+  python3 run_benchmark.py --duration 90 \
+      --sim-config ./my_sim_config.json \
+      --ssh-key /lxhome/ssh_key \
+      --outdir ./artifacts
+"""
+
+import argparse
+import base64
+import datetime as dt
+import json
+import os
+import pathlib
+import sys
+import time
+from typing import Tuple
+import shlex
+
+import paramiko
+
+
+# Hosts / user / key
+APP_HOST = "nyzls410d"
+SIM_HOST = "nyzls411d"
+CAP_HOST = "nyzls593d"
+REMOTE_USER = "sp_hfts"
+SSH_KEY_DEFAULT = "/lxhome/ssh_key"
+
+# Base commands
+APP_CMD = (
+    'onload --profile /lxhome/songjoon/gtadconfig/gtastart_itest/onload_profile.opf '
+    '/opt/op/gtad/10.2/bin/gtad '
+    '-c /lxhome/songjoon/gtadconfig/gtastart_itest/gtad.gta_its_test1_main.xml '
+    '| grep -v "ThreadGuard" | tee /apps/sp_hfts/gtad_log'
+)
+
+SIM_BASE_CMD = "/lxhome/songjoon/gtad_new/gtad/tests/ez_test/run"
+
+CAP_PCAP_PATH = '/apps/home/songjoon/pme_test.pcap'
+CAP_CMD = (
+    'solar_capture interface=sfc0 '
+    f'output="{CAP_PCAP_PATH}" '
+    'format=pcap-ns '
+    'join_streams="udp:239.254.64.2:31103;tcp:192.168.163.5:2528;" '
+    'arista_ts="kf_ip_dest=255.255.255.255;kf_eth_dhost=ff:ff:ff:ff:ff:ff"'
+)
+
+DROPCOPY_GLOB = "/apps/sp_hfts/gtad_store/dropcopy_mseu_*"
+
+
+class SSH:
+    """Lightweight SSH wrapper using paramiko."""
+
+    def __init__(self, host: str, user: str, keyfile: str, timeout: int = 20):
+        self.host = host
+        self.user = user
+        self.keyfile = keyfile
+        self.timeout = timeout
+        self.client = None
+        self.sftp = None
+
+    def __enter__(self):
+        self.client = paramiko.SSHClient()
+        self.client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        self.client.connect(
+            self.host,
+            username=self.user,
+            key_filename=self.keyfile,
+            look_for_keys=False,
+            allow_agent=False,
+            timeout=self.timeout,
+        )
+        self.sftp = self.client.open_sftp()
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        try:
+            if self.sftp:
+                self.sftp.close()
+        finally:
+            if self.client:
+                self.client.close()
+
+    def run(self, command: str) -> Tuple[int, str, str]:
+        """
+        Run a command under bash -lc, returning (exit_status, stdout, stderr).
+        """
+        quoted = shlex.quote(command)
+        stdin, stdout, stderr = self.client.exec_command(f"bash -lc {quoted}")
+        out = stdout.read().decode("utf-8", errors="replace")
+        err = stderr.read().decode("utf-8", errors="replace")
+        code = stdout.channel.recv_exit_status()
+        return code, out, err
+
+    def get(self, remote_path: str, local_path: str):
+        pathlib.Path(local_path).parent.mkdir(parents=True, exist_ok=True)
+        self.sftp.get(remote_path, local_path)
+
+
+def start_background_with_timeout(ssh: SSH, raw_cmd: str, duration_s: int, tag: str, role: str):
+    """
+    Start a remote command in background, capped by `timeout`.
+    Output is redirected to a per-host log file in /tmp.
+
+    If duration_s <= 0, starts without timeout (must be stopped manually).
+    """
+    remote_log = f"/tmp/{tag}_{role}.out"
+
+    if duration_s > 0:
+        cmd = f"nohup timeout {duration_s}s sh -c {shlex.quote(raw_cmd)} >{remote_log} 2>&1 < /dev/null &"
+    else:
+        cmd = f"nohup sh -c {shlex.quote(raw_cmd)} >{remote_log} 2>&1 < /dev/null &"
+
+    code, out, err = ssh.run(cmd)
+    if code != 0:
+        raise RuntimeError(
+            f"[{ssh.host}] failed to start '{role}' (exit {code}).\nSTDOUT:\n{out}\nSTDERR:\n{err}"
+        )
+    return remote_log
+
+
+def stage_latest_dropcopy_tar(ssh: SSH, tag: str) -> str:
+    """
+    On the application host, find the most recent dropcopy_mseu_* and tar.gz it to /tmp.
+    Returns the created tar path (raises if none found).
+    """
+    tar_path = f"/tmp/dropcopy_latest_{tag}.tgz"
+    cmd = r"""
+set -euo pipefail
+latest=$(ls -1dt """ + DROPCOPY_GLOB + r""" 2>/dev/null | head -1 || true)
+if [ -z "${latest:-}" ]; then
+  echo "NO_DROPCOPY" ; exit 5
+fi
+base=$(basename "$latest")
+dir=$(dirname "$latest")
+rm -f """ + shlex.quote(tar_path) + r"""
+tar -C "$dir" -czf """ + shlex.quote(tar_path) + r""" "$base"
+echo """ + shlex.quote(tar_path) + r"""
+"""
+    code, out, err = ssh.run(cmd)
+    if code != 0:
+        if "NO_DROPCOPY" in out:
+            raise FileNotFoundError("Could not locate any dropcopy_mseu_* on application host.")
+        raise RuntimeError(f"[{ssh.host}] dropcopy tar failed (exit {code}).\nSTDOUT:\n{out}\nSTDERR:\n{err}")
+    return out.strip().splitlines()[-1].strip()
+
+
+def stage_capture_pcap_copy(ssh: SSH, tag: str) -> str:
+    """
+    On the capture host, copy the pcap to /tmp with a unique name.
+    Returns staged path.
+    """
+    staged = f"/tmp/pme_test_{tag}.pcap"
+    cmd = f"""
+set -e
+if [ ! -f {shlex.quote(CAP_PCAP_PATH)} ]; then
+  echo "MISSING_PCAP"
+  exit 6
+fi
+cp -f {shlex.quote(CAP_PCAP_PATH)} {shlex.quote(staged)}
+echo {shlex.quote(staged)}
+"""
+    code, out, err = ssh.run(cmd)
+    if code != 0:
+        if "MISSING_PCAP" in out:
+            raise FileNotFoundError(f"{CAP_PCAP_PATH} not found on capture host.")
+        raise RuntimeError(f"[{ssh.host}] staging PCAP failed (exit {code}).\nSTDOUT:\n{out}\nSTDERR:\n{err}")
+    return out.strip().splitlines()[-1].strip()
+
+
+def load_and_encode_sim_config(config_path: str) -> str:
+    """
+    Read the local JSON/YAML config file, validate it parses correctly, and return a base64-encoded JSON string.
+    The simulator on 411d accepts JSON directly or base64-encoded JSON via -c/--config.
+    We use base64 to avoid shell quoting issues.
+    
+    Supports both .json and .yaml/.yml files.
+    """
+    p = pathlib.Path(config_path)
+    if not p.is_file():
+        raise FileNotFoundError(f"Simulator config file not found: {config_path}")
+
+    raw = p.read_text(encoding="utf-8")
+    
+    # Parse based on file extension
+    ext = p.suffix.lower()
+    if ext in ('.yaml', '.yml'):
+        try:
+            import yaml
+        except ImportError:
+            raise ImportError("PyYAML is required to parse YAML config files. Install with: pip install pyyaml")
+        
+        try:
+            parsed = yaml.safe_load(raw)
+        except Exception as exc:
+            raise ValueError(f"Simulator config is not valid YAML: {exc}") from exc
+    elif ext == '.json':
+        try:
+            parsed = json.loads(raw)
+        except Exception as exc:
+            raise ValueError(f"Simulator config is not valid JSON: {exc}") from exc
+    else:
+        # Try JSON first, then YAML
+        try:
+            parsed = json.loads(raw)
+        except:
+            try:
+                import yaml
+                parsed = yaml.safe_load(raw)
+            except Exception as exc:
+                raise ValueError(f"Simulator config is neither valid JSON nor YAML: {exc}") from exc
+    
+    # Convert to minified JSON for transmission
+    minified = json.dumps(parsed, separators=(",", ":"))
+    encoded = base64.b64encode(minified.encode("utf-8")).decode("ascii")
+    return encoded
+
+
+def build_sim_cmd(sim_config_b64: str, extra_args: str | None = None) -> str:
+    """
+    Build the simulator command line:
+      /.../run -c <base64(JSON)> [extra_args]
+    """
+    parts = [SIM_BASE_CMD, "-c", sim_config_b64]
+    if extra_args:
+        parts.append(extra_args.strip())
+    return " ".join(parts)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Run ATP benchmark across 410d/411d/593d and collect artifacts.")
+    parser.add_argument("--ssh-key", default=SSH_KEY_DEFAULT, help="Path to SSH private key (default: /lxhome/ssh_key)")
+    parser.add_argument("--duration", type=int, default=60, help="Test duration in seconds (default: 60)")
+    parser.add_argument("--outdir", default="./artifacts", help="Local directory to store results (default: ./artifacts)")
+    parser.add_argument("--sleep-gap", type=float, default=2.0, help="Seconds to wait between starting each role (default: 2.0)")
+
+    # NEW: Simulator configuration
+    parser.add_argument("--sim-config", required=True,
+                        help="Path to local JSON/YAML file containing {instruments:{}, patterns:{}, tests:{}} to pass to 411d via -c (base64-encoded).")
+    parser.add_argument("--sim-args", default="",
+                        help="Optional extra arguments appended to the simulator command on 411d.")
+
+    args = parser.parse_args()
+
+    keyfile = args.ssh_key
+    duration = args.duration
+    gap = max(0.0, args.sleep_gap)
+
+    # Tag for this run
+    tag = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+    outdir = pathlib.Path(args.outdir) / tag
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    print(f"[INFO] Run tag: {tag}")
+    print(f"[INFO] Artifacts will be saved under: {outdir}")
+    print(f"[INFO] Duration: {duration if duration > 0 else 'INDEFINITE'} seconds")
+
+    # Prepare simulator config (read + base64)
+    try:
+        sim_cfg_b64 = load_and_encode_sim_config(args.sim_config)
+    except Exception as exc:
+        print(f"[ERROR] Failed to load simulator config: {exc}")
+        sys.exit(2)
+
+    # 1) Launch application (410d)
+    with SSH(APP_HOST, REMOTE_USER, keyfile) as app_ssh:
+        print(f"[{APP_HOST}] starting APPLICATION ...")
+        app_log = start_background_with_timeout(app_ssh, APP_CMD, duration, tag, "app")
+        print(f"[{APP_HOST}] started; remote log -> {app_log}")
+
+    time.sleep(gap)
+
+    # 2) Launch simulator (411d) with encoded config
+    sim_cmd = build_sim_cmd(sim_cfg_b64, args.sim_args)
+    with SSH(SIM_HOST, REMOTE_USER, keyfile) as sim_ssh:
+        print(f"[{SIM_HOST}] starting SIMULATOR ...")
+        sim_log = start_background_with_timeout(sim_ssh, sim_cmd, duration, tag, "sim")
+        print(f"[{SIM_HOST}] started; remote log -> {sim_log}")
+        print(f"[{SIM_HOST}] config: base64(JSON), length={len(sim_cfg_b64)}"
+              + (f"; extra args: {args.sim_args}" if args.sim_args else ""))
+
+    time.sleep(gap)
+
+    # 3) Launch capture (593d)
+    with SSH(CAP_HOST, REMOTE_USER, keyfile) as cap_ssh:
+        print(f"[{CAP_HOST}] starting CAPTURE ...")
+        cap_log = start_background_with_timeout(cap_ssh, CAP_CMD, duration, tag, "cap")
+        print(f"[{CAP_HOST}] started; remote log -> {cap_log}")
+
+    # Wait for the run to complete (if finite)
+    if duration > 0:
+        wait_s = duration + 5  # grace period
+        print(f"\n[INFO] Waiting {wait_s} seconds for run completion ...")
+        time.sleep(wait_s)
+    else:
+        print("\n[WARN] Duration set to 0 -> commands are running indefinitely.\n"
+              "       Press Ctrl+C to stop this script, then stop remote processes manually.\n")
+        return 0
+
+    # Stage and download artifacts
+    local_pcap = outdir / f"pme_test_{tag}.pcap"
+    local_dropcopy = outdir / f"dropcopy_latest_{tag}.tgz"
+
+    # Capture PCAP
+    with SSH(CAP_HOST, REMOTE_USER, keyfile) as cap_ssh:
+        print(f"[{CAP_HOST}] staging PCAP for download ...")
+        staged_pcap = stage_capture_pcap_copy(cap_ssh, tag)
+        print(f"[{CAP_HOST}] staged PCAP at {staged_pcap}. Downloading ...")
+        cap_ssh.get(staged_pcap, str(local_pcap))
+        print(f"[LOCAL] PCAP saved to {local_pcap}")
+
+    # Dropcopy archive
+    with SSH(APP_HOST, REMOTE_USER, keyfile) as app_ssh:
+        print(f"[{APP_HOST}] archiving latest dropcopy_mseu_* ...")
+        staged_tar = stage_latest_dropcopy_tar(app_ssh, tag)
+        print(f"[{APP_HOST}] staged tar at {staged_tar}. Downloading ...")
+        app_ssh.get(staged_tar, str(local_dropcopy))
+        print(f"[LOCAL] Dropcopy archive saved to {local_dropcopy}")
+
+    print("\n[DONE] Artifacts:")
+    print(f"  - PCAP:     {local_pcap}")
+    print(f"  - Dropcopy: {local_dropcopy}")
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        print("\n[INTERRUPTED] Exiting.")
+        sys.exit(130)
