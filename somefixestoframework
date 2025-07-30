@@ -60,9 +60,18 @@
     ]
   },
   "tests": {
-    "MarketDataLiveUpdate": "STABLE_SPREAD"
+    "MarketDataLiveUpdate": {
+      "pattern": "STABLE_SPREAD",
+      "duration": 60
+    }
   }
 } 
+
+
+
+
+
+
 
 # Performance Test Configuration
 # Defines instruments, quote patterns, and test assignments
@@ -118,21 +127,33 @@ patterns:
       bid_qty: 1500
       ask_price: 31
       ask_qty: 1500
-      
-  RANDOM_MIX:
-    - instrument: null  # Will use random quotes
-      bid_price: 0
-      bid_qty: 0
-      ask_price: 0
-      ask_qty: 0
 
+# Tests run sequentially in the order listed
+# Total duration = sum of all test durations
 tests:
-  MarketDataLiveUpdate: STABLE_SPREAD
-  # AnotherTestCase: VOLATILE
-  # RandomTest: RANDOM 
+  MarketDataLiveUpdate:
+    pattern: STABLE_SPREAD
+    duration: 60  # 1 minute
+    
+  # Uncomment to add more tests that run sequentially
+  # StressTest:
+  #   pattern: VOLATILE
+  #   duration: 120  # 2 minutes (runs after MarketDataLiveUpdate)
+  
+  # RandomQuoteTest:
+  #   pattern: RANDOM
+  #   duration: 30  # 30 seconds (runs after StressTest)
+  
+  # Total duration would be: 60 + 120 + 30 = 210 seconds (3.5 minutes) 
 
 
-  from perf_test_framework import *
+
+
+
+
+
+
+from perf_test_framework import *
 
 class MarketDataLiveUpdate(TestCase):
     """Test case for quote-triggered order generation"""
@@ -218,22 +239,6 @@ class MarketDataLiveUpdate(TestCase):
 
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 """Unified CLI entry point that discovers and runs performance test cases.
 
 You no longer need to edit this file when adding new cases to perf_test_cases.py.
@@ -269,7 +274,6 @@ def _discover_test_modules(root_pkg):
 def main(argv: list[str] | None = None):
     parser = argparse.ArgumentParser(description="Performance Test Suite")
     parser.add_argument("--list", "-l", action="store_true", help="List available tests and exit")
-    parser.add_argument("--duration", type=int, default=10, help="Default test duration in seconds (if applicable)")
     parser.add_argument(
         "--config",
         "-c",
@@ -279,8 +283,20 @@ def main(argv: list[str] | None = None):
             "Configuration as JSON or base64-encoded JSON string that maps tests to "
             "quote patterns. If the string is not valid JSON it is assumed to be base64 "
             "which will then be decoded to JSON. Format:\n"
-            "{\n  \"patterns\": { \"PAT_NAME\": [ {quote}, ... ] },\n  "
-            "\"tests\": { \"TestCaseName\": \"PAT_NAME\" | \"RANDOM\" }\n}"
+            "{\n"
+            "  \"instruments\": {\n"
+            "    \"NAME\": {\"symbol\": \"...\", \"name\": \"...\", \"id1\": N, \"id2\": N, ...}\n"
+            "  },\n"
+            "  \"patterns\": {\n"
+            "    \"PATTERN_NAME\": [ {\"instrument\": \"NAME\", \"bid_price\": N, ...}, ... ]\n"
+            "  },\n"
+            "  \"tests\": {\n"
+            "    \"TestCaseName\": {\n"
+            "      \"pattern\": \"PATTERN_NAME\" | \"RANDOM\",\n"
+            "      \"duration\": N  // seconds\n"
+            "    }\n"
+            "  }\n"
+            "}"
         ),
     )
 
@@ -314,7 +330,19 @@ def main(argv: list[str] | None = None):
             sys.exit(1)
 
     pattern_cfg: dict[str, list[dict]] = cfg_data.get("patterns", {})
-    test_to_pattern: dict[str, str] = cfg_data.get("tests", {})
+    test_to_config: dict[str, dict] = cfg_data.get("tests", {})
+    
+    # Validate test configurations
+    for test_name, test_cfg in test_to_config.items():
+        if not isinstance(test_cfg, dict):
+            print(f"Test '{test_name}' configuration must be an object with 'pattern' and 'duration' fields")
+            sys.exit(1)
+        if "pattern" not in test_cfg:
+            print(f"Test '{test_name}' is missing required 'pattern' field")
+            sys.exit(1)
+        if "duration" not in test_cfg:
+            print(f"Test '{test_name}' is missing required 'duration' field")
+            sys.exit(1)
     
     # Parse instruments from config
     instruments_cfg: dict[str, dict] = cfg_data.get("instruments", {})
@@ -353,10 +381,20 @@ def main(argv: list[str] | None = None):
         """Instantiate *cls* with gtad_config, duration and quote pattern opts."""
 
         kwargs = {"name": cls.__name__, "gtad_config": gtad_config}
+        
+        # Get test configuration
+        test_config = test_to_config.get(cls.__name__)
+        if test_config is None:
+            print(f"Test '{cls.__name__}' not found in configuration")
+            sys.exit(1)
+        
+        # Extract pattern and duration from config object
+        pattern_choice = test_config.get("pattern")
+        test_duration = test_config.get("duration")
 
         # duration_seconds if accepted
         if "duration_seconds" in signature(cls).parameters:
-            kwargs["duration_seconds"] = args.duration
+            kwargs["duration_seconds"] = test_duration
 
         # instruments if accepted
         if "instruments" in signature(cls).parameters:
@@ -364,7 +402,6 @@ def main(argv: list[str] | None = None):
             kwargs["instruments"] = list(available_instruments.values())
 
         # quote pattern / random decision
-        pattern_choice = test_to_pattern.get(cls.__name__)
         if pattern_choice:
             if pattern_choice.upper() == "RANDOM":
                 kwargs["random_quotes"] = True
@@ -409,7 +446,7 @@ def main(argv: list[str] | None = None):
         return cls(**kwargs)
 
     # Determine which tests to run based on configuration; if none specified, run all
-    selected_names = set(test_to_pattern.keys()) if test_to_pattern else set(available.keys())
+    selected_names = set(test_to_config.keys())
 
     # Validate selections
     unknown_tests = selected_names - available.keys()
@@ -428,26 +465,6 @@ def main(argv: list[str] | None = None):
 
 if __name__ == "__main__":
     main()
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 import threading
@@ -631,10 +648,15 @@ class PerformanceTestRunner:
         self.test_cases.append(test_case)
 
     def run_all(self):
-        """Run all test cases"""
-        print(f"Running {len(self.test_cases)} test cases...")
+        """Run all test cases sequentially"""
+        print(f"Running {len(self.test_cases)} test cases sequentially...")
         
-        for test_case in self.test_cases:
+        total_duration = sum(tc.duration_seconds for tc in self.test_cases 
+                           if hasattr(tc, 'duration_seconds'))
+        print(f"Total test duration: {total_duration} seconds")
+        
+        for i, test_case in enumerate(self.test_cases, 1):
+            print(f"\n[{i}/{len(self.test_cases)}] Starting test: {test_case.name}")
             self._run_single_test(test_case)
 
     def _run_single_test(self, test_case: TestCase):
@@ -665,34 +687,27 @@ class PerformanceTestRunner:
 
 
 
-
-
-
-
-
-
-
-
-
-
-
-
 #!/usr/bin/env python3
 """
 Benchmark orchestration for ATP three-host setup.
 
-Sequence:
-  1) Application host (nyzls410d)
-  2) Simulator host (nyzls411d)  <-- now takes -c <base64(JSON)> built from a local config file
-  3) Capture host (nyzls593d)
+Execution Model:
+- Tests defined in config run SEQUENTIALLY on the simulator
+- Total duration = sum of all test durations + padding
+- All three hosts (app/sim/capture) run for the entire duration
 
-- All three are started with nohup + timeout so they auto-stop after --duration.
+Sequence:
+  1) Application host (nyzls410d) - runs for total duration
+  2) Simulator host (nyzls411d) - runs tests sequentially
+  3) Capture host (nyzls593d) - captures for total duration
+
+- All three are started with nohup + timeout so they auto-stop after total duration.
 - Artifacts:
     - PCAP from capture host (/apps/home/songjoon/pme_test.pcap), saved locally as artifacts/<tag>/pme_test_<tag>.pcap
     - Most recent dropcopy_mseu_* from application host, archived on the host and downloaded as artifacts/<tag>/dropcopy_latest_<tag>.tgz
 
 Usage example:
-  python3 run_benchmark.py --duration 90 \
+  python3 run_benchmark.py \
       --sim-config ./my_sim_config.json \
       --ssh-key /lxhome/ssh_key \
       --outdir ./artifacts
@@ -861,13 +876,15 @@ echo {shlex.quote(staged)}
     return out.strip().splitlines()[-1].strip()
 
 
-def load_and_encode_sim_config(config_path: str) -> str:
+def load_and_encode_sim_config(config_path: str) -> Tuple[str, int]:
     """
-    Read the local JSON/YAML config file, validate it parses correctly, and return a base64-encoded JSON string.
+    Read the local JSON/YAML config file, validate it parses correctly, and return a base64-encoded JSON string
+    along with the total duration (sum of all test durations).
     The simulator on 411d accepts JSON directly or base64-encoded JSON via -c/--config.
     We use base64 to avoid shell quoting issues.
     
     Supports both .json and .yaml/.yml files.
+    Returns: (base64_encoded_config, total_duration_seconds)
     """
     p = pathlib.Path(config_path)
     if not p.is_file():
@@ -903,10 +920,21 @@ def load_and_encode_sim_config(config_path: str) -> str:
             except Exception as exc:
                 raise ValueError(f"Simulator config is neither valid JSON nor YAML: {exc}") from exc
     
+    # Calculate total duration (sum of all test durations)
+    total_duration = 0
+    tests = parsed.get("tests", {})
+    if tests:
+        for test_name, test_cfg in tests.items():
+            if isinstance(test_cfg, dict) and "duration" in test_cfg:
+                total_duration += test_cfg["duration"]
+    
+    if total_duration == 0:
+        total_duration = 60  # default fallback
+    
     # Convert to minified JSON for transmission
     minified = json.dumps(parsed, separators=(",", ":"))
     encoded = base64.b64encode(minified.encode("utf-8")).decode("ascii")
-    return encoded
+    return encoded, total_duration
 
 
 def build_sim_cmd(sim_config_b64: str, extra_args: str | None = None) -> str:
@@ -923,20 +951,20 @@ def build_sim_cmd(sim_config_b64: str, extra_args: str | None = None) -> str:
 def main():
     parser = argparse.ArgumentParser(description="Run ATP benchmark across 410d/411d/593d and collect artifacts.")
     parser.add_argument("--ssh-key", default=SSH_KEY_DEFAULT, help="Path to SSH private key (default: /lxhome/ssh_key)")
-    parser.add_argument("--duration", type=int, default=60, help="Test duration in seconds (default: 60)")
+    parser.add_argument("--duration", type=int, default=None, 
+                        help="Override test duration in seconds (default: use value from config file, or 60 if not specified)")
     parser.add_argument("--outdir", default="./artifacts", help="Local directory to store results (default: ./artifacts)")
     parser.add_argument("--sleep-gap", type=float, default=2.0, help="Seconds to wait between starting each role (default: 2.0)")
 
     # NEW: Simulator configuration
     parser.add_argument("--sim-config", required=True,
-                        help="Path to local JSON/YAML file containing {instruments:{}, patterns:{}, tests:{}} to pass to 411d via -c (base64-encoded).")
+                        help="Path to local JSON/YAML file containing {instruments:{}, patterns:{}, tests:{TestName:{pattern:P,duration:N}}} to pass to 411d via -c (base64-encoded).")
     parser.add_argument("--sim-args", default="",
                         help="Optional extra arguments appended to the simulator command on 411d.")
 
     args = parser.parse_args()
 
     keyfile = args.ssh_key
-    duration = args.duration
     gap = max(0.0, args.sleep_gap)
 
     # Tag for this run
@@ -946,14 +974,30 @@ def main():
 
     print(f"[INFO] Run tag: {tag}")
     print(f"[INFO] Artifacts will be saved under: {outdir}")
-    print(f"[INFO] Duration: {duration if duration > 0 else 'INDEFINITE'} seconds")
 
     # Prepare simulator config (read + base64)
     try:
-        sim_cfg_b64 = load_and_encode_sim_config(args.sim_config)
+        sim_cfg_b64, config_duration = load_and_encode_sim_config(args.sim_config)
     except Exception as exc:
         print(f"[ERROR] Failed to load simulator config: {exc}")
         sys.exit(2)
+    
+    # Determine actual duration to use
+    if args.duration is not None:
+        duration = args.duration
+        print(f"[INFO] Using duration override from CLI: {duration} seconds")
+    elif config_duration is not None:
+        # Add padding for startup/shutdown overhead
+        padding = 10  # seconds
+        duration = config_duration + padding
+        print(f"[INFO] Total test duration from config: {config_duration} seconds")
+        print(f"[INFO] Adding {padding}s padding for startup/shutdown")
+        print(f"[INFO] Total process duration: {duration} seconds")
+    else:
+        duration = 60  # default
+        print(f"[INFO] No duration specified in tests, using default: {duration} seconds")
+
+    print(f"[INFO] Process timeout duration: {duration if duration > 0 else 'INDEFINITE'} seconds")
 
     # 1) Launch application (410d)
     with SSH(APP_HOST, REMOTE_USER, keyfile) as app_ssh:
@@ -1022,3 +1066,300 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         print("\n[INTERRUPTED] Exiting.")
         sys.exit(130)
+
+
+
+# Performance Test Framework Documentation
+
+## Overview
+
+The Performance Test Framework is a distributed testing system designed to orchestrate performance tests across multiple hosts. It consists of a core framework, test cases, a CLI runner, and a remote orchestration tool.
+
+## Architecture
+
+```
+┌─────────────────┐     ┌──────────────────┐     ┌─────────────────┐
+│  perf_test_run  │────>│ perf_test_example│────>│ Test Execution  │
+│  (Orchestrator) │     │   (CLI Runner)   │     │   (Sequential)  │
+└─────────────────┘     └──────────────────┘     └─────────────────┘
+        │                        │                         │
+        │                        │                         v
+        v                        v                 ┌───────────────┐
+┌─────────────────┐     ┌──────────────────┐     │ Test Cases    │
+│ Remote Hosts:   │     │ Configuration:   │     │ - Setup       │
+│ - Application   │     │ - Instruments    │     │ - Run         │
+│ - Simulator     │     │ - Patterns       │     │ - Teardown    │
+│ - Capture       │     │ - Tests          │     └───────────────┘
+└─────────────────┘     └──────────────────┘
+```
+
+## File Descriptions
+
+### 1. `perf_test_framework.py` - Core Framework
+
+This file contains the foundational classes and abstractions for the test framework.
+
+#### Key Components:
+
+**TestCase (Abstract Base Class)**
+- Auto-registration system using `__init_subclass__`
+- Maintains a registry of all concrete test implementations
+- Defines the test lifecycle: `setup()`, `run()`, `teardown()`
+- Common attributes: `name`, `gtad_config`, simulators, handlers
+
+```python
+class TestCase(abc.ABC):
+    _registry: List[Type["TestCase"]] = []  # Auto-populated registry
+    
+    def __init_subclass__(cls, **kwargs):
+        # Automatically registers concrete subclasses
+        if not inspect.isabstract(cls):
+            TestCase._registry.append(cls)
+```
+
+**MarketDataGenerator**
+- Runs in a separate thread
+- Generates market data quotes either from patterns or randomly
+- Manages sequence numbers per simulator
+- Supports quote pattern cycling
+
+```python
+# Usage:
+md_generator = MarketDataGenerator(simulators, instruments, quote_patterns)
+md_generator.start()  # Starts background thread
+```
+
+**OrderResponseHandler**
+- Handles order responses in a separate thread
+- Configurable response delay
+- Auto-responds to new orders
+
+**PerformanceTestRunner**
+- Orchestrates test execution
+- Runs tests sequentially
+- Provides execution statistics
+- Handles test failures gracefully
+
+### 2. `perf_test_cases.py` - Test Case Implementations
+
+Contains concrete test case implementations that inherit from `TestCase`.
+
+#### MarketDataLiveUpdate
+
+A test case that simulates live market data updates and monitors order generation.
+
+**Parameters:**
+- `name`: Test identifier
+- `gtad_config`: GTAD configuration
+- `duration_seconds`: How long to run the test
+- `quote_patterns`: List of quote dictionaries (optional)
+- `random_quotes`: Use random quote generation (default: False)
+- `instruments`: List of Instrument objects
+
+**Workflow:**
+1. **Setup**: Initializes routing IDs, instruments, simulators, GTAD, IEX
+2. **Run**: Starts market data generation and order handling for specified duration
+3. **Teardown**: Cleanly stops all components
+
+### 3. `perf_test_example.py` - CLI Runner
+
+The main entry point that discovers tests, parses configuration, and executes them.
+
+#### Features:
+
+**Auto-discovery**
+- Automatically imports all modules in `perf_test_cases`
+- Discovers all TestCase subclasses via the registry
+
+**Configuration Parsing**
+- Accepts JSON or base64-encoded JSON via `-c/--config`
+- Validates configuration structure
+- Creates Instrument objects from config
+- Maps instrument references in patterns
+
+**Test Instantiation**
+- Dynamically instantiates test classes
+- Injects configuration (duration, patterns, instruments)
+- Handles both RANDOM and pattern-based quote generation
+
+#### Usage:
+```bash
+# List available tests
+python perf_test_example.py --list
+
+# Run with inline JSON
+python perf_test_example.py -c '{"instruments":{...}, "patterns":{...}, "tests":{...}}'
+
+# Run with base64-encoded config
+python perf_test_example.py -c "eyJpbnN0cnVtZW50cyI6ey4uLn0sIC4uLn0="
+```
+
+### 4. `perf_test_run.py` - Remote Orchestration
+
+Orchestrates test execution across three remote hosts via SSH.
+
+#### Host Roles:
+
+1. **Application Host (410d)** - Runs GTAD application
+2. **Simulator Host (411d)** - Runs test cases via perf_test_example.py
+3. **Capture Host (593d)** - Captures network traffic
+
+#### Key Features:
+
+**Configuration Management**
+- Reads local YAML/JSON config files
+- Converts to base64 for command-line transmission
+- Calculates total duration (sum of all tests + padding)
+
+**Process Management**
+- Starts all processes with `nohup` and `timeout`
+- Ensures clean shutdown after total duration
+- Configurable startup gaps between hosts
+
+**Artifact Collection**
+- Downloads PCAP files from capture host
+- Archives and downloads dropcopy data from application host
+- Organized storage by timestamp
+
+#### Usage:
+```bash
+python3 perf_test_run.py \
+    --sim-config config.yaml \
+    --ssh-key /path/to/key \
+    --outdir ./results
+```
+
+### 5. Configuration File Format
+
+Configuration files define instruments, quote patterns, and test assignments.
+
+#### Structure:
+
+```yaml
+instruments:
+  SYMBOL_NAME:
+    symbol: "AAPL.OQ"      # Full symbol with exchange
+    name: "AAPL"           # Short name
+    id1: 426016            # Instrument ID 1
+    id2: 1059346           # Instrument ID 2
+    splitingid: "split"    # Splitting identifier
+    clc: "clc"             # CLC identifier
+
+patterns:
+  PATTERN_NAME:
+    - instrument: "SYMBOL_NAME"  # References instrument above
+      bid_price: 100
+      bid_qty: 1000
+      ask_price: 101
+      ask_qty: 1000
+
+tests:
+  TestCaseName:
+    pattern: "PATTERN_NAME" | "RANDOM"
+    duration: 60  # seconds
+```
+
+#### Configuration Examples:
+
+**example_config.yaml** - Human-readable YAML format
+**example_config.json** - JSON format for programmatic generation
+**settings.json** - Minimal example configuration
+
+## Test Execution Flow
+
+### 1. Local Development
+```bash
+# Direct test execution
+python perf_test_example.py -c config.json
+```
+
+### 2. Distributed Execution
+```bash
+# Full three-host orchestration
+python3 perf_test_run.py --sim-config config.yaml
+```
+
+### 3. Sequential Test Execution
+
+Tests run sequentially in the order they appear in the configuration:
+
+```
+Time:     0s ────────> 60s ────────> 180s ────────> 190s
+Test1:    [=========]
+Test2:                 [==================]
+Padding:                                    [====]
+```
+
+## Creating New Test Cases
+
+1. Create a new class inheriting from `TestCase` in `perf_test_cases.py`:
+
+```python
+class MyNewTest(TestCase):
+    def __init__(self, name: str, gtad_config: GtadConfig, 
+                 duration_seconds: int = 60, **kwargs):
+        super().__init__(name, gtad_config)
+        self.duration_seconds = duration_seconds
+    
+    def setup(self):
+        # Initialize resources
+        pass
+    
+    def run(self):
+        # Execute test logic
+        start_time = time.time()
+        while (time.time() - start_time) < self.duration_seconds:
+            # Test actions
+            pass
+    
+    def teardown(self):
+        # Cleanup resources
+        pass
+```
+
+2. The test is automatically discovered - no registration needed!
+
+3. Add it to your configuration:
+
+```yaml
+tests:
+  MyNewTest:
+    pattern: "SOME_PATTERN"
+    duration: 120
+```
+
+## Best Practices
+
+### Configuration Management
+- Use YAML for human-edited configs
+- Use JSON for programmatically generated configs
+- Always specify duration for each test
+- Reference instruments by name in patterns
+
+### Test Design
+- Keep setup/teardown operations fast
+- Use the provided duration_seconds parameter
+- Clean up all resources in teardown
+- Handle failures gracefully
+
+### Performance Considerations
+- Market data generation runs in a separate thread
+- Order handling runs in a separate thread
+- Tests execute sequentially to avoid resource conflicts
+- Add sufficient padding for startup/shutdown overhead
+
+## Troubleshooting
+
+### Common Issues
+
+1. **Test not found**: Ensure test class is concrete (implements all abstract methods)
+2. **Instrument reference error**: Check instrument name matches between definition and pattern
+3. **Duration mismatch**: Remember total duration = sum of all tests + padding
+4. **SSH connection failures**: Verify SSH key permissions and host accessibility
+
+### Debug Tips
+
+- Use `--list` to verify test discovery
+- Check remote host logs in `/tmp/<tag>_<role>.out`
+- Validate JSON/YAML syntax before running
+- Monitor process timeouts match expected duration 
