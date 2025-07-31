@@ -1,0 +1,406 @@
+#!/usr/bin/env python3
+"""
+Benchmark orchestration for ATP three-host setup.
+
+Execution Model:
+- Tests defined in config run SEQUENTIALLY on the simulator
+- Total duration = sum of all test durations + padding
+- All three hosts (app/sim/capture) run for the entire duration
+
+Sequence:
+  1) Application host (nyzls410d) - runs for total duration
+  2) Simulator host (nyzls411d) - runs tests sequentially
+  3) Capture host (nyzls593d) - captures for total duration
+
+- All three are started with nohup + timeout so they auto-stop after total duration.
+- Artifacts:
+    - PCAP from capture host (/apps/home/songjoon/pme_test.pcap)
+    - Dropcopy archive from application host (most recent dropcopy_mseu_*)
+    - Execution logs from all three hosts (stdout/stderr output)
+    - All saved under artifacts/<timestamp>/
+
+Usage example:
+  python3 run_benchmark.py \
+      --sim-config ./my_sim_config.yaml \
+      --ssh-key /lxhome/ssh_key \
+      --outdir ./artifacts
+"""
+
+import argparse
+import base64
+import datetime as dt
+import json
+import os
+import pathlib
+import sys
+import time
+from typing import Tuple
+import shlex
+
+import paramiko
+
+
+# Hosts / user / key
+APP_HOST = "nyzls410d"
+SIM_HOST = "nyzls411d"
+CAP_HOST = "nyzls593d"
+REMOTE_USER = "sp_hfts"
+SSH_KEY_DEFAULT = "/lxhome/ssh_key"
+
+# Base commands
+APP_CMD = (
+    'onload --profile /lxhome/songjoon/gtadconfig/gtastart_itest/onload_profile.opf '
+    '/opt/op/gtad/10.2/bin/gtad '
+    '-c /lxhome/songjoon/gtadconfig/gtastart_itest/gtad.gta_its_test1_main.xml '
+    '| grep -v "ThreadGuard" | tee /apps/sp_hfts/gtad_log'
+)
+
+SIM_BASE_CMD = "/lxhome/songjoon/gtad_new/gtad/tests/ez_test/run"
+
+CAP_PCAP_PATH = '/apps/home/songjoon/pme_test.pcap'
+CAP_CMD = (
+    'solar_capture interface=sfc0 '
+    f'output="{CAP_PCAP_PATH}" '
+    'format=pcap-ns '
+    'join_streams="udp:239.254.64.2:31103;tcp:192.168.163.5:2528;" '
+    'arista_ts="kf_ip_dest=255.255.255.255;kf_eth_dhost=ff:ff:ff:ff:ff:ff"'
+)
+
+DROPCOPY_GLOB = "/apps/sp_hfts/gtad_store/dropcopy_mseu_*"
+
+
+class SSH:
+    """Lightweight SSH wrapper using paramiko."""
+
+    def __init__(self, host: str, user: str, keyfile: str, timeout: int = 20):
+        self.host = host
+        self.user = user
+        self.keyfile = keyfile
+        self.timeout = timeout
+        self.client = None
+        self.sftp = None
+
+    def __enter__(self):
+        self.client = paramiko.SSHClient()
+        self.client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        self.client.connect(
+            self.host,
+            username=self.user,
+            key_filename=self.keyfile,
+            look_for_keys=False,
+            allow_agent=False,
+            timeout=self.timeout,
+        )
+        self.sftp = self.client.open_sftp()
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        try:
+            if self.sftp:
+                self.sftp.close()
+        finally:
+            if self.client:
+                self.client.close()
+
+    def run(self, command: str) -> Tuple[int, str, str]:
+        """
+        Run a command under bash -lc, returning (exit_status, stdout, stderr).
+        """
+        quoted = shlex.quote(command)
+        stdin, stdout, stderr = self.client.exec_command(f"bash -lc {quoted}")
+        out = stdout.read().decode("utf-8", errors="replace")
+        err = stderr.read().decode("utf-8", errors="replace")
+        code = stdout.channel.recv_exit_status()
+        return code, out, err
+
+    def get(self, remote_path: str, local_path: str):
+        pathlib.Path(local_path).parent.mkdir(parents=True, exist_ok=True)
+        self.sftp.get(remote_path, local_path)
+
+
+def start_background_with_timeout(ssh: SSH, raw_cmd: str, duration_s: int, tag: str, role: str):
+    """
+    Start a remote command in background, capped by `timeout`.
+    Output is redirected to a per-host log file in /tmp.
+
+    If duration_s <= 0, starts without timeout (must be stopped manually).
+    """
+    remote_log = f"/tmp/{tag}_{role}.out"
+
+    if duration_s > 0:
+        cmd = f"nohup timeout {duration_s}s sh -c {shlex.quote(raw_cmd)} >{remote_log} 2>&1 < /dev/null &"
+    else:
+        cmd = f"nohup sh -c {shlex.quote(raw_cmd)} >{remote_log} 2>&1 < /dev/null &"
+
+    code, out, err = ssh.run(cmd)
+    if code != 0:
+        raise RuntimeError(
+            f"[{ssh.host}] failed to start '{role}' (exit {code}).\nSTDOUT:\n{out}\nSTDERR:\n{err}"
+        )
+    return remote_log
+
+
+def stage_latest_dropcopy_tar(ssh: SSH, tag: str) -> str:
+    """
+    On the application host, find the most recent dropcopy_mseu_* and tar.gz it to /tmp.
+    Returns the created tar path (raises if none found).
+    """
+    tar_path = f"/tmp/dropcopy_latest_{tag}.tgz"
+    cmd = r"""
+set -euo pipefail
+latest=$(ls -1dt """ + DROPCOPY_GLOB + r""" 2>/dev/null | head -1 || true)
+if [ -z "${latest:-}" ]; then
+  echo "NO_DROPCOPY" ; exit 5
+fi
+base=$(basename "$latest")
+dir=$(dirname "$latest")
+rm -f """ + shlex.quote(tar_path) + r"""
+tar -C "$dir" -czf """ + shlex.quote(tar_path) + r""" "$base"
+echo """ + shlex.quote(tar_path) + r"""
+"""
+    code, out, err = ssh.run(cmd)
+    if code != 0:
+        if "NO_DROPCOPY" in out:
+            raise FileNotFoundError("Could not locate any dropcopy_mseu_* on application host.")
+        raise RuntimeError(f"[{ssh.host}] dropcopy tar failed (exit {code}).\nSTDOUT:\n{out}\nSTDERR:\n{err}")
+    return out.strip().splitlines()[-1].strip()
+
+
+def stage_capture_pcap_copy(ssh: SSH, tag: str) -> str:
+    """
+    On the capture host, copy the pcap to /tmp with a unique name.
+    Returns staged path.
+    """
+    staged = f"/tmp/pme_test_{tag}.pcap"
+    cmd = f"""
+set -e
+if [ ! -f {shlex.quote(CAP_PCAP_PATH)} ]; then
+  echo "MISSING_PCAP"
+  exit 6
+fi
+cp -f {shlex.quote(CAP_PCAP_PATH)} {shlex.quote(staged)}
+echo {shlex.quote(staged)}
+"""
+    code, out, err = ssh.run(cmd)
+    if code != 0:
+        if "MISSING_PCAP" in out:
+            raise FileNotFoundError(f"{CAP_PCAP_PATH} not found on capture host.")
+        raise RuntimeError(f"[{ssh.host}] staging PCAP failed (exit {code}).\nSTDOUT:\n{out}\nSTDERR:\n{err}")
+    return out.strip().splitlines()[-1].strip()
+
+
+def load_and_encode_sim_config(config_path: str) -> Tuple[str, int]:
+    """
+    Read the local JSON/YAML config file, validate it parses correctly, and return a base64-encoded JSON string
+    along with the total duration (sum of all test durations).
+    The simulator on 411d accepts JSON directly or base64-encoded JSON via -c/--config.
+    We use base64 to avoid shell quoting issues.
+    
+    Supports both .json and .yaml/.yml files.
+    Returns: (base64_encoded_config, total_duration_seconds)
+    """
+    p = pathlib.Path(config_path)
+    if not p.is_file():
+        raise FileNotFoundError(f"Simulator config file not found: {config_path}")
+
+    raw = p.read_text(encoding="utf-8")
+    
+    # Parse based on file extension
+    ext = p.suffix.lower()
+    if ext in ('.yaml', '.yml'):
+        try:
+            import yaml
+        except ImportError:
+            raise ImportError("PyYAML is required to parse YAML config files. Install with: pip install pyyaml")
+        
+        try:
+            parsed = yaml.safe_load(raw)
+        except Exception as exc:
+            raise ValueError(f"Simulator config is not valid YAML: {exc}") from exc
+    elif ext == '.json':
+        try:
+            parsed = json.loads(raw)
+        except Exception as exc:
+            raise ValueError(f"Simulator config is not valid JSON: {exc}") from exc
+    else:
+        # Try JSON first, then YAML
+        try:
+            parsed = json.loads(raw)
+        except:
+            try:
+                import yaml
+                parsed = yaml.safe_load(raw)
+            except Exception as exc:
+                raise ValueError(f"Simulator config is neither valid JSON nor YAML: {exc}") from exc
+    
+    # Calculate total duration (sum of all test durations)
+    total_duration = 0
+    tests = parsed.get("tests", {})
+    if tests:
+        for test_name, test_cfg in tests.items():
+            if isinstance(test_cfg, dict) and "duration" in test_cfg:
+                total_duration += test_cfg["duration"]
+    
+    if total_duration == 0:
+        total_duration = 60  # default fallback
+    
+    # Convert to minified JSON for transmission
+    minified = json.dumps(parsed, separators=(",", ":"))
+    encoded = base64.b64encode(minified.encode("utf-8")).decode("ascii")
+    return encoded, total_duration
+
+
+def build_sim_cmd(sim_config_b64: str, extra_args: str | None = None) -> str:
+    """
+    Build the simulator command line:
+      /.../run -c <base64(JSON)> [extra_args]
+    """
+    parts = [SIM_BASE_CMD, "-c", sim_config_b64]
+    if extra_args:
+        parts.append(extra_args.strip())
+    return " ".join(parts)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Run ATP benchmark across 410d/411d/593d and collect artifacts.")
+    parser.add_argument("--ssh-key", default=SSH_KEY_DEFAULT, help="Path to SSH private key (default: /lxhome/ssh_key)")
+    parser.add_argument("--duration", type=int, default=None, 
+                        help="Override test duration in seconds (default: use value from config file, or 60 if not specified)")
+    parser.add_argument("--outdir", default="./artifacts", help="Local directory to store results (default: ./artifacts)")
+    parser.add_argument("--sleep-gap", type=float, default=2.0, help="Seconds to wait between starting each role (default: 2.0)")
+
+    # NEW: Simulator configuration
+    parser.add_argument("--sim-config", required=True,
+                        help="Path to local JSON/YAML file containing {instruments:{}, patterns:{}, tests:{TestName:{pattern:P,duration:N}}} to pass to 411d via -c (base64-encoded).")
+    parser.add_argument("--sim-args", default="",
+                        help="Optional extra arguments appended to the simulator command on 411d.")
+
+    args = parser.parse_args()
+
+    keyfile = args.ssh_key
+    gap = max(0.0, args.sleep_gap)
+
+    # Tag for this run
+    tag = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+    outdir = pathlib.Path(args.outdir) / tag
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    print(f"[INFO] Run tag: {tag}")
+    print(f"[INFO] Artifacts will be saved under: {outdir}")
+
+    # Prepare simulator config (read + base64)
+    try:
+        sim_cfg_b64, config_duration = load_and_encode_sim_config(args.sim_config)
+    except Exception as exc:
+        print(f"[ERROR] Failed to load simulator config: {exc}")
+        sys.exit(2)
+    
+    # Determine actual duration to use
+    if args.duration is not None:
+        duration = args.duration
+        print(f"[INFO] Using duration override from CLI: {duration} seconds")
+    elif config_duration is not None:
+        # Add padding for startup/shutdown overhead
+        padding = 10  # seconds
+        duration = config_duration + padding
+        print(f"[INFO] Total test duration from config: {config_duration} seconds")
+        print(f"[INFO] Adding {padding}s padding for startup/shutdown")
+        print(f"[INFO] Total process duration: {duration} seconds")
+    else:
+        duration = 60  # default
+        print(f"[INFO] No duration specified in tests, using default: {duration} seconds")
+
+    print(f"[INFO] Process timeout duration: {duration if duration > 0 else 'INDEFINITE'} seconds")
+
+    # 1) Launch application (410d)
+    app_log = None
+    with SSH(APP_HOST, REMOTE_USER, keyfile) as app_ssh:
+        print(f"[{APP_HOST}] starting APPLICATION ...")
+        app_log = start_background_with_timeout(app_ssh, APP_CMD, duration, tag, "app")
+        print(f"[{APP_HOST}] started; remote log -> {app_log}")
+
+    time.sleep(gap)
+
+    # 2) Launch simulator (411d) with encoded config
+    sim_cmd = build_sim_cmd(sim_cfg_b64, args.sim_args)
+    sim_log = None
+    with SSH(SIM_HOST, REMOTE_USER, keyfile) as sim_ssh:
+        print(f"[{SIM_HOST}] starting SIMULATOR ...")
+        sim_log = start_background_with_timeout(sim_ssh, sim_cmd, duration, tag, "sim")
+        print(f"[{SIM_HOST}] started; remote log -> {sim_log}")
+        print(f"[{SIM_HOST}] config: base64(JSON), length={len(sim_cfg_b64)}"
+              + (f"; extra args: {args.sim_args}" if args.sim_args else ""))
+
+    time.sleep(gap)
+
+    # 3) Launch capture (593d)
+    cap_log = None
+    with SSH(CAP_HOST, REMOTE_USER, keyfile) as cap_ssh:
+        print(f"[{CAP_HOST}] starting CAPTURE ...")
+        cap_log = start_background_with_timeout(cap_ssh, CAP_CMD, duration, tag, "cap")
+        print(f"[{CAP_HOST}] started; remote log -> {cap_log}")
+
+    # Wait for the run to complete (if finite)
+    if duration > 0:
+        wait_s = duration + 5  # grace period
+        print(f"\n[INFO] Waiting {wait_s} seconds for run completion ...")
+        time.sleep(wait_s)
+    else:
+        print("\n[WARN] Duration set to 0 -> commands are running indefinitely.\n"
+              "       Press Ctrl+C to stop this script, then stop remote processes manually.\n")
+        return 0
+
+    # Stage and download artifacts
+    local_pcap = outdir / f"pme_test_{tag}.pcap"
+    local_dropcopy = outdir / f"dropcopy_latest_{tag}.tgz"
+
+    # Capture PCAP
+    with SSH(CAP_HOST, REMOTE_USER, keyfile) as cap_ssh:
+        print(f"[{CAP_HOST}] staging PCAP for download ...")
+        staged_pcap = stage_capture_pcap_copy(cap_ssh, tag)
+        print(f"[{CAP_HOST}] staged PCAP at {staged_pcap}. Downloading ...")
+        cap_ssh.get(staged_pcap, str(local_pcap))
+        print(f"[LOCAL] PCAP saved to {local_pcap}")
+
+    # Dropcopy archive
+    with SSH(APP_HOST, REMOTE_USER, keyfile) as app_ssh:
+        print(f"[{APP_HOST}] archiving latest dropcopy_mseu_* ...")
+        staged_tar = stage_latest_dropcopy_tar(app_ssh, tag)
+        print(f"[{APP_HOST}] staged tar at {staged_tar}. Downloading ...")
+        app_ssh.get(staged_tar, str(local_dropcopy))
+        print(f"[LOCAL] Dropcopy archive saved to {local_dropcopy}")
+
+    # Download remote logs
+    print("\n[INFO] Downloading remote execution logs...")
+    log_downloads = [
+        (APP_HOST, app_log, "app"),
+        (SIM_HOST, sim_log, "sim"),
+        (CAP_HOST, cap_log, "cap")
+    ]
+    
+    for host, remote_log, role in log_downloads:
+        if remote_log:
+            local_log = outdir / f"{tag}_{role}.log"
+            try:
+                with SSH(host, REMOTE_USER, keyfile) as ssh:
+                    print(f"[{host}] downloading {role} log...")
+                    ssh.get(remote_log, str(local_log))
+                    print(f"[LOCAL] {role} log saved to {local_log}")
+            except Exception as e:
+                print(f"[WARN] Failed to download {role} log from {host}: {e}")
+
+    print("\n[DONE] Artifacts:")
+    print(f"  - PCAP:          {local_pcap}")
+    print(f"  - Dropcopy:      {local_dropcopy}")
+    print(f"  - App log:       {outdir / f'{tag}_app.log'}")
+    print(f"  - Simulator log: {outdir / f'{tag}_sim.log'}")
+    print(f"  - Capture log:   {outdir / f'{tag}_cap.log'}")
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        print("\n[INTERRUPTED] Exiting.")
+        sys.exit(130)
